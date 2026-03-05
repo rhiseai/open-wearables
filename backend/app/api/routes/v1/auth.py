@@ -74,11 +74,7 @@ async def change_password(
         )
 
     # Update using existing developer_service logic
-    developer_service.update_developer_info(
-        db,
-        developer.id,
-        DeveloperUpdate(password=payload.new_password)
-    )
+    developer_service.update_developer_info(db, developer.id, DeveloperUpdate(password=payload.new_password))
 
     return {"message": "Password updated successfully"}
 

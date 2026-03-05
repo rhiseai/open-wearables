@@ -156,7 +156,7 @@ class TestChangePassword:
         payload = {
             "current_password": "OldPassword123",
             "new_password": "NewPassword456",
-            "confirm_password": "NewPassword456"
+            "confirm_password": "NewPassword456",
         }
 
         # Act
@@ -173,7 +173,7 @@ class TestChangePassword:
         payload = {
             "current_password": "WrongOld123",
             "new_password": "NewPassword789",
-            "confirm_password": "NewPassword789"
+            "confirm_password": "NewPassword789",
         }
 
         response = client.post(f"{api_v1_prefix}/auth/change-password", json=payload, headers=headers)
@@ -189,7 +189,7 @@ class TestChangePassword:
         payload = {
             "current_password": "OldPassword123",
             "new_password": "OnlyLetters",
-            "confirm_password": "OnlyLetters"
+            "confirm_password": "OnlyLetters",
         }
 
         response = client.post(f"{api_v1_prefix}/auth/change-password", json=payload, headers=headers)
@@ -205,7 +205,7 @@ class TestChangePassword:
         payload = {
             "current_password": "OldPassword123",
             "new_password": "NewPassword123",
-            "confirm_password": "DifferentPassword123"
+            "confirm_password": "DifferentPassword123",
         }
 
         response = client.post(f"{api_v1_prefix}/auth/change-password", json=payload, headers=headers)
