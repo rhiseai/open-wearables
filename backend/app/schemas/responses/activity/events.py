@@ -58,6 +58,18 @@ class Measurement(BaseModel):
     values: dict[str, float | str] = Field(..., description="Measurement-specific values", example={"weight_kg": 72.5})
 
 
+class SleepScoreComponent(BaseModel):
+    weight: str = Field(description="Percentage weight, e.g. '40%'")
+    score: int = Field(ge=0, le=100)
+
+
+class SleepScoreBreakdown(BaseModel):
+    duration: SleepScoreComponent
+    stages: SleepScoreComponent
+    consistency: SleepScoreComponent
+    interruptions: SleepScoreComponent
+
+
 class SleepSession(BaseModel):
     id: UUID
     start_time: datetime
@@ -66,6 +78,8 @@ class SleepSession(BaseModel):
     source: SourceMetadata
     duration_seconds: int
     efficiency_percent: float | None = None
+    sleep_score: int | None = Field(None, ge=0, le=100, description="Overall sleep quality score (0–100)")
+    sleep_score_breakdown: SleepScoreBreakdown | None = None
     stages: SleepStagesSummary | None = None
     sleep_stage_intervals: list[SleepStage] | None = None
     is_nap: bool = False

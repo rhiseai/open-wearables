@@ -36,6 +36,7 @@ export const SLEEP_STAGE_LABELS: Record<SleepStageKey, string> = {
 export const SLEEP_METRIC_CHART_COLORS = {
   efficiency: '#10b981',
   duration: '#6366f1',
+  score: '#f59e0b',
 } as const;
 
 /**
@@ -103,6 +104,7 @@ export function getSleepStageData(
 export interface SleepStats {
   avgDuration: number | null;
   avgEfficiency: number | null;
+  avgSleepScore: number | null;
   nightsTracked: number;
   avgBedtime: number | null;
   stages: SleepStagesSummary | null;
@@ -126,6 +128,9 @@ export function calculateSleepStats(
   const efficiencies = summaries
     .map((s) => s.efficiency_percent)
     .filter((e): e is number => e !== null);
+  const sleepScores = summaries
+    .map((s) => s.sleep_score)
+    .filter((s): s is number => s !== null);
 
   // Aggregate sleep stages (calculate averages)
   const totalDeep = summaries.reduce(
@@ -178,6 +183,10 @@ export function calculateSleepStats(
       efficiencies.length > 0
         ? efficiencies.reduce((a, b) => a + b, 0) / efficiencies.length
         : null,
+    avgSleepScore:
+      sleepScores.length > 0
+        ? sleepScores.reduce((a, b) => a + b, 0) / sleepScores.length
+        : null,
     nightsTracked: summaries.length,
     avgBedtime: avgBedtimeMinutes,
     // Use SleepStagesSummary format so we can reuse SleepStagesBar
@@ -208,6 +217,14 @@ interface SleepFieldDefinition {
  * Configuration for sleep session detail fields
  */
 const SLEEP_FIELD_DEFINITIONS: SleepFieldDefinition[] = [
+  {
+    key: 'sleepScore',
+    label: 'Sleep Score',
+    getValue: (s) =>
+      s.sleep_score !== null && s.sleep_score !== undefined
+        ? `${Math.round(s.sleep_score)} / 100`
+        : null,
+  },
   {
     key: 'deepSleep',
     label: 'Deep Sleep',

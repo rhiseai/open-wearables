@@ -233,13 +233,27 @@ export interface SleepStage {
   duration_seconds?: number;
 }
 
+export interface SleepScoreComponent {
+  weight: string;
+  score: number;
+}
+
+export interface SleepScoreBreakdown {
+  duration: SleepScoreComponent;
+  stages: SleepScoreComponent;
+  consistency: SleepScoreComponent;
+  interruptions: SleepScoreComponent;
+}
+
 export interface SleepSession {
   id: string;
   start_time: string;
   end_time: string;
-  source: SourceMetadata;
+  source: DataSource;
   duration_seconds: number;
   efficiency_percent: number | null;
+  sleep_score: number | null;
+  sleep_score_breakdown: SleepScoreBreakdown | null;
   stages: SleepStagesSummary | null;
   sleep_stage_intervals: SleepStage[] | null;
   is_nap: boolean;
@@ -261,6 +275,7 @@ export interface SleepSummary {
   duration_minutes: number | null;
   time_in_bed_minutes: number | null;
   efficiency_percent: number | null;
+  sleep_score: number | null;
   stages: SleepStagesSummary | null;
   interruptions_count: number | null;
   nap_count: number | null;

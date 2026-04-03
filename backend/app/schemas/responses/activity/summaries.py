@@ -55,6 +55,7 @@ class SleepSummary(BaseModel):
     duration_minutes: int | None = Field(None, description="Total sleep duration excluding naps", example=450)
     time_in_bed_minutes: int | None = Field(None, description="Total time in bed excluding naps", example=480)
     efficiency_percent: float | None = Field(None, ge=0, le=100, example=89.5)
+    sleep_score: float | None = Field(None, ge=0, le=100, description="Overall sleep quality score (0–100)")
     stages: SleepStagesSummary | None = None
     interruptions_count: int | None = None
     nap_count: int | None = Field(None, description="Number of naps taken", example=1)

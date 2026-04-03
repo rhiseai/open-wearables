@@ -633,3 +633,26 @@ class EventRecordRepository(
             .with_for_update()
             .first()
         )
+
+    @handle_exceptions
+    def get_sleep_bedtimes(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        before_datetime: datetime,
+        limit: int = 30,
+    ) -> list[datetime]:
+        """Return up to *limit* sleep start_datetimes before *before_datetime*, newest first."""
+        rows = (
+            db_session.query(self.model.start_datetime)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                self.model.category == "sleep",
+                self.model.start_datetime < before_datetime,
+            )
+            .order_by(self.model.start_datetime.desc())
+            .limit(limit)
+            .all()
+        )
+        return [r.start_datetime for r in rows]

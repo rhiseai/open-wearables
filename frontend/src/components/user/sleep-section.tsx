@@ -16,6 +16,7 @@ import {
   BedDouble,
   ChevronDown,
   ChevronUp,
+  Star,
 } from 'lucide-react';
 import {
   useSleepSessions,
@@ -57,6 +58,7 @@ import {
 import { prepareHrChartData } from '@/lib/utils/timeseries';
 import { HR_CHART_CONFIG } from '@/lib/utils/chart-config';
 import type {
+  SleepScoreBreakdown,
   SleepSession,
   SleepStagesSummary,
   SleepSummary,
@@ -71,7 +73,7 @@ interface SleepSectionProps {
 const SESSIONS_PER_PAGE = 10;
 
 // Metric definitions for clickable sleep cards (kept here due to Lucide icon imports)
-type SleepMetricKey = 'efficiency' | 'duration';
+type SleepMetricKey = 'efficiency' | 'duration' | 'score';
 
 interface SleepMetricDefinition {
   key: SleepMetricKey;
@@ -113,6 +115,19 @@ const SLEEP_METRICS: SleepMetricDefinition[] = [
     formatValue: (v) => formatMinutes(v),
     getChartValue: (s) => s.duration_minutes || 0,
     unit: 'min',
+  },
+  {
+    key: 'score',
+    label: 'Avg Sleep Score',
+    shortLabel: 'Sleep Score',
+    icon: Star,
+    color: 'text-amber-400',
+    bgColor: 'bg-amber-500/10',
+    glowColor: 'shadow-[0_0_15px_rgba(245,158,11,0.5)]',
+    getValue: (stats) => stats.avgSleepScore,
+    formatValue: (v) => (v !== null ? `${Math.round(v)}` : '-'),
+    getChartValue: (s) => s.sleep_score || 0,
+    unit: '',
   },
 ];
 
@@ -157,6 +172,53 @@ function SleepStagesBar({
             </Tooltip>
           )
       )}
+    </div>
+  );
+}
+
+const BREAKDOWN_ITEMS: {
+  key: keyof SleepScoreBreakdown;
+  label: string;
+  color: string;
+}[] = [
+  { key: 'duration', label: 'Duration', color: 'bg-indigo-500' },
+  { key: 'stages', label: 'Stages', color: 'bg-purple-500' },
+  { key: 'consistency', label: 'Consistency', color: 'bg-sky-500' },
+  { key: 'interruptions', label: 'Interruptions', color: 'bg-emerald-500' },
+];
+
+function SleepScoreBreakdownBar({
+  breakdown,
+}: {
+  breakdown: SleepScoreBreakdown;
+}) {
+  return (
+    <div>
+      <h4 className="text-xs font-medium text-zinc-400 mb-3 uppercase tracking-wider">
+        Sleep Score Breakdown
+      </h4>
+      <div className="space-y-2">
+        {BREAKDOWN_ITEMS.map(({ key, label, color }) => {
+          const component = breakdown[key];
+          return (
+            <div key={key} className="flex items-center gap-3">
+              <span className="text-xs text-zinc-400 w-24 shrink-0">{label}</span>
+              <div className="flex-1 h-2 bg-zinc-800 rounded-full overflow-hidden">
+                <div
+                  className={`h-full ${color} rounded-full transition-all`}
+                  style={{ width: `${component.score}%` }}
+                />
+              </div>
+              <span className="text-xs font-medium text-white w-14 text-right shrink-0">
+                {component.score}/100
+                <span className="text-zinc-500 font-normal ml-1">
+                  ({component.weight})
+                </span>
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -241,6 +303,19 @@ function SleepSessionRow({
                 <p className="text-xs text-zinc-500">Efficiency</p>
               </div>
             </div>
+
+            {/* Sleep Score */}
+            {session.sleep_score !== null && (
+              <div className="flex items-center gap-2">
+                <Star className="h-4 w-4 text-amber-400" />
+                <div>
+                  <p className="text-sm font-medium text-white">
+                    {Math.round(session.sleep_score)}
+                  </p>
+                  <p className="text-xs text-zinc-500">Score</p>
+                </div>
+              </div>
+            )}
 
             {/* Duration */}
             <div className="flex items-center gap-2">
@@ -348,6 +423,13 @@ function SleepSessionRow({
               </p>
             )}
           </div>
+
+          {/* Score Breakdown */}
+          {session.sleep_score_breakdown && (
+            <div className="pt-2 border-t border-zinc-800/50">
+              <SleepScoreBreakdownBar breakdown={session.sleep_score_breakdown} />
+            </div>
+          )}
 
           {/* Detail Fields */}
           {detailFields.length > 0 && (
@@ -541,7 +623,7 @@ export function SleepSection({
           ) : (
             <div className="space-y-6">
               {/* Summary Stats - Top Row */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                 {/* Nights Tracked - non-clickable */}
                 <MetricCard
                   icon={BedDouble}

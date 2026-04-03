@@ -43,6 +43,7 @@ from app.schemas.utils import (
     TimeseriesMetadata,
 )
 from app.utils.exceptions import handle_exceptions
+from app.utils.sleep_score import calculate_overall_sleep_score
 from app.utils.pagination import (
     decode_activity_cursor,
     encode_activity_cursor,
@@ -291,7 +292,9 @@ class SummariesService:
                 first_date_midnight = datetime.combine(first_date, datetime.min.time()).replace(tzinfo=timezone.utc)
                 previous_cursor = encode_cursor(first_date_midnight, first_id, "prev")
 
-        # Transform to schema
+        # Transform to schema — accumulate bedtimes for consistency scoring
+        # (results are ordered newest-first after _filter_by_priority)
+        accumulated_bedtimes: list[str] = []
         data = []
         for result in results:
             # Build sleep stages if any stage data is available
@@ -333,6 +336,26 @@ class SummariesService:
                         sleep_end=sleep_end,
                     )
 
+            # Compute 4-component sleep score for this summary day
+            sleep_start_dt = result.get("min_start_time")
+            sleep_end_dt = result.get("max_end_time")
+            summary_score: int | None = None
+            if sleep_start_dt and sleep_end_dt and result.get("total_duration_minutes"):
+                start_iso = sleep_start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                end_iso = sleep_end_dt.strftime("%Y-%m-%dT%H:%M:%S")
+                total_awake = float(result.get("awake_minutes") or 0)
+                score_result = calculate_overall_sleep_score(
+                    session_start=start_iso,
+                    session_end=end_iso,
+                    deep_minutes=float(result.get("deep_minutes") or 0),
+                    rem_minutes=float(result.get("rem_minutes") or 0),
+                    historical_bedtimes=list(accumulated_bedtimes),
+                    total_awake_minutes=total_awake,
+                    awakening_durations=[total_awake] if total_awake > 0 else [],
+                )
+                summary_score = score_result["overall_score"]
+                accumulated_bedtimes.append(start_iso)
+
             summary = SleepSummary(
                 date=result["sleep_date"],
                 source=SourceMetadata(provider=result["source"] or "unknown", device=result.get("device_model")),
@@ -341,6 +364,7 @@ class SummariesService:
                 duration_minutes=result["total_duration_minutes"],
                 time_in_bed_minutes=result.get("time_in_bed_minutes"),
                 efficiency_percent=result.get("efficiency_percent"),
+                sleep_score=summary_score,
                 stages=stages,
                 nap_count=result.get("nap_count"),
                 nap_duration_minutes=result.get("nap_duration_minutes"),

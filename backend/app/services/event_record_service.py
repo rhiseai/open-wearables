@@ -28,6 +28,8 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.schemas.responses.activity import SleepSession, SleepStagesSummary, Workout, WorkoutDetailed
+from app.schemas.responses.activity.events import SleepScoreBreakdown, SleepScoreComponent
+from app.utils.sleep_score import calculate_overall_sleep_score, parse_wearable_stages_for_interruptions
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -547,9 +549,60 @@ class EventRecordService(
                     first_record, _ = records[0]
                     previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
 
+        # Fetch historical bedtimes once for the earliest session on this page.
+        # Each session uses only bedtimes that predate its own start.
+        earliest_start = min(r.start_datetime for r, _ in records) if records else None
+        all_historical_bedtimes: list[datetime] = (
+            self.crud.get_sleep_bedtimes(db_session, user_id, earliest_start, limit=60)
+            if earliest_start
+            else []
+        )
+        # Also include bedtimes from sessions on this page (sorted newest-first)
+        page_bedtimes = sorted(
+            [r.start_datetime for r, _ in records], reverse=True
+        )
+
         data = []
         for record, data_source in records:
             details: SleepDetails | None = record.detail if isinstance(record.detail, SleepDetails) else None
+
+            # Historical bedtimes = page sessions + DB history, all strictly before this session
+            historical_iso = [
+                dt.strftime("%Y-%m-%dT%H:%M:%S")
+                for dt in (page_bedtimes + all_historical_bedtimes)
+                if dt < record.start_datetime
+            ]
+
+            # Parse sleep stages for WASO if available, else fall back to aggregate
+            if details and details.sleep_stages:
+                waso = parse_wearable_stages_for_interruptions(details.sleep_stages)
+                total_awake = waso["total_awake_minutes"]
+                awakening_durations = waso["awakening_durations"]
+            else:
+                total_awake = float(details.sleep_awake_minutes or 0) if details else 0.0
+                awakening_durations = [total_awake] if total_awake > 0 else []
+
+            score_result = None
+            if details and details.sleep_total_duration_minutes:
+                score_result = calculate_overall_sleep_score(
+                    session_start=record.start_datetime.strftime("%Y-%m-%dT%H:%M:%S"),
+                    session_end=record.end_datetime.strftime("%Y-%m-%dT%H:%M:%S"),
+                    deep_minutes=float(details.sleep_deep_minutes or 0),
+                    rem_minutes=float(details.sleep_rem_minutes or 0),
+                    historical_bedtimes=historical_iso,
+                    total_awake_minutes=total_awake,
+                    awakening_durations=awakening_durations,
+                )
+
+            breakdown = None
+            if score_result:
+                bd = score_result["breakdown"]
+                breakdown = SleepScoreBreakdown(
+                    duration=SleepScoreComponent(**bd["duration"]),
+                    stages=SleepScoreComponent(**bd["stages"]),
+                    consistency=SleepScoreComponent(**bd["consistency"]),
+                    interruptions=SleepScoreComponent(**bd["interruptions"]),
+                )
 
             session = SleepSession(
                 id=record.id,
@@ -561,6 +614,8 @@ class EventRecordService(
                 efficiency_percent=float(details.sleep_efficiency_score)
                 if details and details.sleep_efficiency_score
                 else None,
+                sleep_score=score_result["overall_score"] if score_result else None,
+                sleep_score_breakdown=breakdown,
                 is_nap=details.is_nap if (details and details.is_nap is not None) else False,
                 sleep_stage_intervals=details.sleep_stages if details else None,
                 stages=SleepStagesSummary(
