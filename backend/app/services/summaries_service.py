@@ -43,18 +43,18 @@ from app.schemas.utils import (
     TimeseriesMetadata,
 )
 from app.utils.exceptions import handle_exceptions
-from app.utils.sleep_score import calculate_overall_sleep_score
 from app.utils.pagination import (
     decode_activity_cursor,
     encode_activity_cursor,
     encode_cursor,
 )
+from app.utils.sleep_score import calculate_overall_sleep_score
 from app.utils.structured_logging import log_structured
 
 # Series types needed for sleep physiological metrics
-# TODO: Add HRV, respiratory rate, and SpO2 when ready
 SLEEP_PHYSIO_SERIES_TYPES = [
     SeriesType.heart_rate,
+    SeriesType.heart_rate_variability_sdnn,
 ]
 
 # Activity summary constants
@@ -310,9 +310,9 @@ class SummariesService:
                     awake_minutes=result.get("awake_minutes"),
                 )
 
-            # Fetch average heart rate during the sleep period
-            # TODO: Add HRV, respiratory rate, and SpO2 when ready
+            # Fetch average heart rate and HRV during the sleep period
             avg_hr: int | None = None
+            hrv_avg: float | None = None
 
             sleep_start = result.get("min_start_time")
             sleep_end = result.get("max_end_time")
@@ -327,7 +327,9 @@ class SummariesService:
                     )
                     hr_avg = physio_averages.get(SeriesType.heart_rate)
                     avg_hr = int(round(hr_avg)) if hr_avg is not None else None
+                    hrv_avg = physio_averages.get(SeriesType.heart_rate_variability_sdnn)
                 except Exception as e:
+                    hrv_avg = None
                     log_structured(
                         self.logger,
                         "warning",
@@ -370,7 +372,7 @@ class SummariesService:
                 nap_duration_minutes=result.get("nap_duration_minutes"),
                 avg_heart_rate_bpm=avg_hr,
                 # TODO: Implement these when ready
-                avg_hrv_sdnn_ms=None,
+                avg_hrv_sdnn_ms=round(hrv_avg, 1) if hrv_avg is not None else None,
                 avg_respiratory_rate=None,
                 avg_spo2_percent=None,
             )

@@ -170,7 +170,7 @@ interface ResilienceSectionProps {
 
 export function ResilienceSection({ userId }: ResilienceSectionProps) {
   const today = startOfDay(new Date());
-  const startDate = subDays(today, 30).toISOString();
+  const startDate = subDays(today, 180).toISOString();
   const endDate = today.toISOString();
 
   const { data: sleepSummaries, isLoading } = useSleepSummaries(userId, {

@@ -26,10 +26,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ResilienceConfig:
     min_nights: int = 5
-    cv_ceiling_pct: float = 7.0    # CV <= this -> score 100 (elite)
-    cv_floor_pct: float = 40.0     # CV >= this -> score 0   (severe volatility)
-    elite_threshold_pct: float = 10.0    # CV <= this -> "Elite Stability"
-    volatile_threshold_pct: float = 25.0   # CV >  this -> "Volatile"
+    cv_ceiling_pct: float = 7.0  # CV <= this -> score 100 (elite)
+    cv_floor_pct: float = 40.0  # CV >= this -> score 0   (severe volatility)
+    elite_threshold_pct: float = 10.0  # CV <= this -> "Elite Stability"
+    volatile_threshold_pct: float = 25.0  # CV >  this -> "Volatile"
 
 
 RESILIENCE_CONFIG = ResilienceConfig()

@@ -46,6 +46,7 @@ _FMT = "%Y-%m-%dT%H:%M:%S"
 # Component 1: Duration
 # ---------------------------------------------------------------------------
 
+
 def calculate_duration_score(day_start_iso: str, day_end_iso: str) -> dict:
     """0-100 duration score using sigmoid curves around the 7–9 h ideal."""
     start_time = datetime.strptime(day_start_iso[:19], _FMT)
@@ -78,6 +79,7 @@ def calculate_duration_score(day_start_iso: str, day_end_iso: str) -> dict:
 # Component 2: Sleep stages (deep + REM)
 # ---------------------------------------------------------------------------
 
+
 def calculate_stage_score(
     stage_duration_minutes: float,
     optimal_target_minutes: float = 90.0,
@@ -101,6 +103,7 @@ def calculate_total_stages_score(deep_minutes: float, rem_minutes: float) -> int
 # Component 3: Bedtime consistency
 # ---------------------------------------------------------------------------
 
+
 def _time_to_hours_past_noon(dt: datetime) -> float:
     hours = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
     if hours < 12.0:
@@ -117,10 +120,7 @@ def calculate_bedtime_consistency_score(
     if not historical_bedtimes_iso:
         return int(config["base_score"])
 
-    historical_hours = [
-        _time_to_hours_past_noon(datetime.strptime(bt[:19], _FMT))
-        for bt in historical_bedtimes_iso
-    ]
+    historical_hours = [_time_to_hours_past_noon(datetime.strptime(bt[:19], _FMT)) for bt in historical_bedtimes_iso]
     median_hours = statistics.median(historical_hours)
 
     tonight_dt = datetime.strptime(tonight_bedtime_iso[:19], _FMT)
@@ -149,6 +149,7 @@ def calculate_bedtime_consistency_score(
 # Component 4: Interruptions (WASO)
 # ---------------------------------------------------------------------------
 
+
 def calculate_interruptions_score(
     total_awake_minutes: float,
     awakening_durations: list[float],
@@ -173,6 +174,7 @@ def calculate_interruptions_score(
 # ---------------------------------------------------------------------------
 # Stage-interval parser (strips sleep latency + morning lie-in)
 # ---------------------------------------------------------------------------
+
 
 def parse_wearable_stages_for_interruptions(raw_stage_blocks: list[dict]) -> dict:
     """Extract true WASO from a stage timeline, ignoring latency and lie-in.
@@ -201,9 +203,7 @@ def parse_wearable_stages_for_interruptions(raw_stage_blocks: list[dict]) -> dic
 
     awake_stages = {"awake", "in_bed"}
 
-    first_sleep_idx = next(
-        (i for i, b in enumerate(blocks) if b["stage"] not in awake_stages), 0
-    )
+    first_sleep_idx = next((i for i, b in enumerate(blocks) if b["stage"] not in awake_stages), 0)
     last_sleep_idx = next(
         (i for i in range(len(blocks) - 1, -1, -1) if blocks[i]["stage"] not in awake_stages),
         len(blocks) - 1,
@@ -224,6 +224,7 @@ def parse_wearable_stages_for_interruptions(raw_stage_blocks: list[dict]) -> dic
 # ---------------------------------------------------------------------------
 # Overall score
 # ---------------------------------------------------------------------------
+
 
 def calculate_overall_sleep_score(
     session_start: str,

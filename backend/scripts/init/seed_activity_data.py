@@ -474,12 +474,28 @@ def seed_activity_data() -> None:
                 if workout_num % 20 == 0:
                     print(f"  Created {workout_num}/80 workouts for user {user_num}")
 
-            # Create 20 sleep records for this user
+            # Create 20 sleep records for this user, each with HRV time-series samples
             for sleep_num in range(1, 21):
                 record, detail = generate_sleep(user.id, fake, provider_sync_times)
                 event_record_service.create(db, record)
                 event_detail_repo.create(db, detail, detail_type="sleep")
                 sleeps_created += 1
+
+                # Generate HRV samples for every sleep window so the resilience
+                # score has enough data. Sleep-derived HRV is the core input.
+                samples = generate_time_series_samples(
+                    record.start_datetime,
+                    record.end_datetime,
+                    fake,
+                    user_id=user.id,
+                    source=record.source or "unknown",
+                    device_model=record.device_model,
+                    provider=record.provider,
+                    software_version=record.software_version,
+                )
+                if samples:
+                    timeseries_service.bulk_create_samples(db, samples)
+                    time_series_samples_created += len(samples)
 
                 if sleep_num % 10 == 0:
                     print(f"  Created {sleep_num}/20 sleep records for user {user_num}")

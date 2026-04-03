@@ -29,7 +29,6 @@ from app.schemas.model_crud.activities import (
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.schemas.responses.activity import SleepSession, SleepStagesSummary, Workout, WorkoutDetailed
 from app.schemas.responses.activity.events import SleepScoreBreakdown, SleepScoreComponent
-from app.utils.sleep_score import calculate_overall_sleep_score, parse_wearable_stages_for_interruptions
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -41,6 +40,7 @@ from app.schemas.utils import (
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
+from app.utils.sleep_score import calculate_overall_sleep_score, parse_wearable_stages_for_interruptions
 
 
 class EventRecordService(
@@ -553,14 +553,10 @@ class EventRecordService(
         # Each session uses only bedtimes that predate its own start.
         earliest_start = min(r.start_datetime for r, _ in records) if records else None
         all_historical_bedtimes: list[datetime] = (
-            self.crud.get_sleep_bedtimes(db_session, user_id, earliest_start, limit=60)
-            if earliest_start
-            else []
+            self.crud.get_sleep_bedtimes(db_session, user_id, earliest_start, limit=60) if earliest_start else []
         )
         # Also include bedtimes from sessions on this page (sorted newest-first)
-        page_bedtimes = sorted(
-            [r.start_datetime for r, _ in records], reverse=True
-        )
+        page_bedtimes = sorted([r.start_datetime for r, _ in records], reverse=True)
 
         data = []
         for record, data_source in records:
