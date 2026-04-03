@@ -15,6 +15,7 @@ import {
   Smartphone,
   Copy,
   Ellipsis,
+  ShieldCheck,
   type LucideIcon,
 } from 'lucide-react';
 import {
@@ -32,6 +33,7 @@ import { SleepSection } from '@/components/user/sleep-section';
 import { ActivitySection } from '@/components/user/activity-section';
 import { BodySection } from '@/components/user/body-section';
 import { WorkoutSection } from '@/components/user/workout-section';
+import { ResilienceSection } from '@/components/user/resilience-section';
 import type { DateRangeValue } from '@/components/ui/date-range-selector';
 import {
   AlertDialog,
@@ -157,6 +159,12 @@ function UserDetailPage() {
         label: 'Body',
         icon: Scale,
         content: <BodySection userId={userId} />,
+      },
+      {
+        id: 'resilience',
+        label: 'Resilience',
+        icon: ShieldCheck,
+        content: <ResilienceSection userId={userId} />,
       },
     ],
     [userId, workoutDateRange, activityDateRange, sleepDateRange]
