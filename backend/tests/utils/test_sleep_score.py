@@ -227,8 +227,8 @@ class TestInterruptionsScore:
         assert calculate_interruptions_score(0.0, []) == 100
 
     def test_max_duration_penalty_removes_80_points(self) -> None:
-        """90 min WASO (20 grace + 70 window) → duration score hits 0 → only freq remains."""
-        score = calculate_interruptions_score(90.0, [45.0, 45.0])
+        """90 min WASO (20 grace + 70 window fully consumed) → duration hits 0; 1 sig wake → full freq."""
+        score = calculate_interruptions_score(90.0, [45.0])
         assert score == int(INTERRUPTIONS_CONFIG["frequency_weight_points"])
 
     def test_four_or_more_significant_wakes_removes_freq_points(self) -> None:
@@ -247,10 +247,26 @@ class TestInterruptionsScore:
         score = calculate_interruptions_score(15.0, [3.0, 3.0, 3.0, 3.0, 3.0])
         assert score == 100
 
-    def test_halfway_duration_penalty(self) -> None:
-        """55 min WASO: 35 excess / 70 window = 50% penalty on 80 pts = 40 pts off → 40 + 20 = 60."""
-        score = calculate_interruptions_score(55.0, [15.0, 10.0])
-        assert score == 60
+    def test_duration_penalty_is_convex(self) -> None:
+        """Quadratic curve: penalty at 35 min excess is only 25% of max (not 50%)."""
+        # 35 min excess = ratio 0.5 → quadratic penalty = 0.25 * 80 = 20 → duration = 60
+        score = calculate_interruptions_score(55.0, [])  # no sig wakes → full freq
+        assert score == int(60 + INTERRUPTIONS_CONFIG["frequency_weight_points"])
+
+    def test_frequency_tier_two_wakes(self) -> None:
+        """2 significant awakenings → 15/20 frequency points."""
+        score = calculate_interruptions_score(0.0, [6.0, 6.0])
+        assert score == int(INTERRUPTIONS_CONFIG["duration_weight_points"] + 15)
+
+    def test_frequency_tier_three_wakes(self) -> None:
+        """3 significant awakenings → 10/20 frequency points."""
+        score = calculate_interruptions_score(0.0, [6.0, 6.0, 6.0])
+        assert score == int(INTERRUPTIONS_CONFIG["duration_weight_points"] + 10)
+
+    def test_frequency_tier_one_wake(self) -> None:
+        """1 significant awakening → full 20/20 frequency points."""
+        score = calculate_interruptions_score(0.0, [6.0])
+        assert score == 100
 
 
 # ---------------------------------------------------------------------------

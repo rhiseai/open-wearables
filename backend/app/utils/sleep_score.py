@@ -32,7 +32,6 @@ INTERRUPTIONS_CONFIG = {
     "grace_period_mins": 20.0,
     "max_penalty_window_mins": 70.0,
     "significant_wake_threshold_mins": 5.0,
-    "max_allowed_wakes_count": 4,
 }
 
 _FMT = "%Y-%m-%dT%H:%M:%S"
@@ -124,16 +123,29 @@ def calculate_interruptions_score(
     awakening_durations: list[float],
     config: dict = INTERRUPTIONS_CONFIG,
 ) -> int:
-    """0-100 interruptions score: WASO duration + significant awakening count."""
+    """0-100 interruptions score: WASO duration (80%) + significant awakening count (20%).
+
+    Duration penalty is quadratic — minor overruns incur small penalties that
+    accelerate as total awake time grows further past the grace period.
+
+    Frequency tiers (awakenings > significant_wake_threshold_mins):
+      0–1 → full 20 pts, 2 → 15 pts, 3 → 10 pts, 4+ → 0 pts.
+    """
     duration_score = config["duration_weight_points"]
     if total_awake_minutes > config["grace_period_mins"]:
         excess = total_awake_minutes - config["grace_period_mins"]
-        penalty = (excess / config["max_penalty_window_mins"]) * config["duration_weight_points"]
-        duration_score = max(0.0, config["duration_weight_points"] - penalty)
+        ratio = min(excess / config["max_penalty_window_mins"], 1.0)
+        duration_score = config["duration_weight_points"] * (1 - ratio**2)
 
-    freq_score = config["frequency_weight_points"]
-    significant = [d for d in awakening_durations if d > config["significant_wake_threshold_mins"]]
-    if len(significant) >= config["max_allowed_wakes_count"]:
+    sig_count = sum(1 for d in awakening_durations if d > config["significant_wake_threshold_mins"])
+    fw = config["frequency_weight_points"]
+    if sig_count <= 1:
+        freq_score = fw
+    elif sig_count == 2:
+        freq_score = fw * 0.75  # 15/20
+    elif sig_count == 3:
+        freq_score = fw * 0.50  # 10/20
+    else:
         freq_score = 0.0
 
     return int(duration_score + freq_score)
