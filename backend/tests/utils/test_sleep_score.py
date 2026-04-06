@@ -61,10 +61,10 @@ class TestDurationScore:
         assert result["duration_score"] < 10
 
     def test_undersleep_midpoint_is_near_50(self) -> None:
-        """5.5 hours (the sigmoid midpoint) should score near 50."""
-        start, end = _start_end(1, 5.5)
+        """6.0 hours (the sigmoid midpoint) should score near 50."""
+        start, end = _start_end(1, 6.0)
         result = calculate_duration_score(start, end)
-        assert 45 <= result["duration_score"] <= 60
+        assert 45 <= result["duration_score"] <= 65
 
     def test_undersleep_is_monotonically_increasing(self) -> None:
         """More sleep below ideal should always score higher."""

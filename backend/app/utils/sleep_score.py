@@ -54,9 +54,9 @@ def calculate_duration_score(day_start_iso: str, day_end_iso: str) -> dict:
     if 7.0 <= duration_hours <= 9.0:
         score = 100
     elif duration_hours < 7.0:
-        # k=1.8, midpoint=5.5h: ensures 6h scores clearly lower than 10h,
-        # penalising undersleeping more harshly than oversleeping.
-        score = _sigmoid_score(duration_hours, k=-1.8, midpoint=5.5, boundary=7.0)
+        # k=2.5, midpoint=6h: 6h → ~54, 5.5h → ~24, 5h → ~8.
+        # Midpoint at 6h means losing just 1 hour of sleep cuts the score roughly in half.
+        score = _sigmoid_score(duration_hours, k=-2.5, midpoint=6.0, boundary=7.0)
     else:
         # Gentle drop with a 50-point floor — oversleeping is not heavily penalised.
         score = _sigmoid_score(duration_hours, k=0.8, midpoint=11.0, boundary=9.0, clamp_min=50)
