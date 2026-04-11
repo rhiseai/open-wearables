@@ -11,10 +11,6 @@ __pycache__/
 celerybeat-schedule
 celerybeat-schedule-shm
 celerybeat-schedule-wal
-output.json
-ultrahuman-payloads/
-payloads/
-data/
 
 *.log
 *.tmp
