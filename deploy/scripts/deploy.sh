@@ -180,8 +180,8 @@ roll_service() {
 log "Pulling new images..."
 "${COMPOSE[@]}" pull "${ROLLING_SERVICES[@]}" "${SINGLETON_SERVICES[@]}"
 
-log "Ensuring stateful services are running (db, redis, traefik)..."
-"${COMPOSE[@]}" up -d db redis traefik
+log "Ensuring stateful services are running (db, redis, traefik, svix-server)..."
+"${COMPOSE[@]}" up -d db redis traefik svix-server
 
 log "Waiting for database..."
 for i in $(seq 1 30); do
