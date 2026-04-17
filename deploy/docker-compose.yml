@@ -86,16 +86,6 @@ services:
     image: svix/svix-server:v1
     container_name: svix-server
     restart: unless-stopped
-    # Derive SVIX_JWT_SECRET from the app's SECRET_KEY so both sides agree
-    # without a second secret to manage.
-    entrypoint:
-      - sh
-      - -c
-      - |
-        : "$${SVIX_JWT_SECRET:=$$SECRET_KEY}"
-        export SVIX_JWT_SECRET
-        exec svix-server "$$@"
-      - --
     command: ["--run-migrations"]
     env_file:
       - /app/ow.env
