@@ -185,10 +185,12 @@ jobs:
           # Optional
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SVIX_JWT_SECRET: ${{ secrets.SVIX_JWT_SECRET }}
         run: |
           cat > ow.env.deploy <<EOF
           # Core
           SECRET_KEY=${OW_SECRET_KEY}
+          SVIX_JWT_SECRET=${SVIX_JWT_SECRET}
           ADMIN_EMAIL=${OW_ADMIN_EMAIL}
           ADMIN_PASSWORD=${OW_ADMIN_PASSWORD}
           OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY}

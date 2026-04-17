@@ -78,6 +78,40 @@ services:
       - ow-network
 
   # ---------------------------------------------------------------------------
+  # Svix — outgoing webhooks server (internal only)
+  # OW app talks to it at http://svix-server:8071 (default svix_server_url).
+  # Shares JWT secret with the app via SECRET_KEY in /app/ow.env.
+  # ---------------------------------------------------------------------------
+  svix-server:
+    image: svix/svix-server:v1
+    container_name: svix-server
+    restart: unless-stopped
+    command: ["--run-migrations"]
+    env_file:
+      - /app/ow.env
+    environment:
+      SVIX_DB_DSN: postgresql://${OW_DB_USER:-open-wearables}:${OW_DB_PASSWORD}@db:5432/svix
+      SVIX_QUEUE_TYPE: redis
+      SVIX_REDIS_DSN: redis://redis:6379/1
+      SVIX_CACHE_TYPE: redis
+      SVIX_LOG_LEVEL: info
+    expose:
+      - "8071"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "svix-server", "healthcheck", "http://localhost:8071"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - ow-network
+
+  # ---------------------------------------------------------------------------
   # Backend API — routed by Traefik on port 8000
   # container_name intentionally omitted so the deploy script can scale to 2
   # replicas for zero-downtime rollouts.
@@ -111,6 +145,7 @@ services:
     depends_on:
       db: {condition: service_healthy}
       redis: {condition: service_healthy}
+      svix-server: {condition: service_healthy}
     networks:
       - ow-network
     labels:
