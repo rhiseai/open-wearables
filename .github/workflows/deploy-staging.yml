@@ -295,11 +295,25 @@ jobs:
             --cloud-watch-output-config 'CloudWatchOutputEnabled=true' \
             --query 'Command.CommandId' --output text)
           echo "deploy CommandId: $CMD_ID"
-          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$CMD_ID" || true
+
+          set +e
+          aws ssm wait command-executed --instance-id "$INSTANCE_ID" --command-id "$CMD_ID"
+          WAIT_RC=$?
+          set -e
+
           aws ssm get-command-invocation \
             --instance-id "$INSTANCE_ID" \
             --command-id "$CMD_ID" \
             --query '{Status:Status,stdout:StandardOutputContent,stderr:StandardErrorContent}' --output text
+
+          STATUS=$(aws ssm get-command-invocation \
+            --instance-id "$INSTANCE_ID" \
+            --command-id "$CMD_ID" \
+            --query 'Status' --output text)
+          if [[ "$STATUS" != "Success" ]]; then
+            echo "::error::deploy.sh ended with Status=$STATUS (wait rc=$WAIT_RC)"
+            exit 1
+          fi
 
       - name: Summary
         env:
