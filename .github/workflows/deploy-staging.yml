@@ -112,7 +112,7 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
           build-args: |
-            VITE_API_URL=https://ow-staging.getlucie.ai/api
+            VITE_API_URL=https://ow-staging.getlucie.ai
           tags: |
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:staging
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:sha-${{ steps.tags.outputs.sha_short }}
@@ -200,8 +200,8 @@ jobs:
           # Encrypt at ``ow-staging.getlucie.ai``; ``/api/*`` is stripped
           # and forwarded to ow-api, ``/*`` serves the dashboard.
           # Whoop/Oura receive redirect_uri rooted at ``/api`` below.
-          API_BASE_URL=https://ow-staging.getlucie.ai/api
-          SERVER_HOST=https://ow-staging.getlucie.ai/api
+          API_BASE_URL=https://ow-staging.getlucie.ai
+          SERVER_HOST=https://ow-staging.getlucie.ai
           FRONTEND_URL=https://ow-staging.getlucie.ai
           CORS_ORIGINS=["https://ow-staging.getlucie.ai"]
 
