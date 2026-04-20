@@ -195,14 +195,14 @@ jobs:
           ADMIN_PASSWORD=${OW_ADMIN_PASSWORD}
           OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY}
           # API_BASE_URL drives OAuth redirect_uri generation. Whoop/Oura
-          # require HTTPS, so it points at the CloudFront distribution
-          # (dblsjq323zkkx.cloudfront.net → EC2 :8000 origin, HTTP).
+          # require HTTPS, so we terminate TLS at CloudFront behind the
+          # ``ow-staging.getlucie.ai`` DNS record.
           # Clients may still hit the EC2 directly via SERVER_HOST for lower
           # latency on non-OAuth traffic.
-          API_BASE_URL=https://dblsjq323zkkx.cloudfront.net
+          API_BASE_URL=https://ow-staging.getlucie.ai
           SERVER_HOST=http://${OW_PUBLIC_HOST}:8000
           FRONTEND_URL=http://${OW_PUBLIC_HOST}
-          CORS_ORIGINS=["http://${OW_PUBLIC_HOST}","https://dblsjq323zkkx.cloudfront.net"]
+          CORS_ORIGINS=["http://${OW_PUBLIC_HOST}","https://ow-staging.getlucie.ai"]
 
           # Email
           RESEND_API_KEY=${RESEND_API_KEY}
