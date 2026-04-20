@@ -160,12 +160,12 @@ services:
     networks:
       - ow-network
     labels:
+      # Backend routes already include the ``/api`` prefix (FastAPI app is
+      # mounted at ``/api/v1/...``), so no stripPrefix middleware here.
       - "traefik.enable=true"
       - "traefik.http.routers.ow-api.rule=Host(`${OW_DOMAIN}`) && PathPrefix(`/api`)"
       - "traefik.http.routers.ow-api.entrypoints=websecure"
       - "traefik.http.routers.ow-api.tls.certresolver=letsencrypt"
-      - "traefik.http.routers.ow-api.middlewares=ow-api-strip"
-      - "traefik.http.middlewares.ow-api-strip.stripprefix.prefixes=/api"
       - "traefik.http.services.ow-api.loadbalancer.server.port=8000"
 
   celery-worker:

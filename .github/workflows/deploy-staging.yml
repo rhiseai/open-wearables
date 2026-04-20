@@ -196,12 +196,13 @@ jobs:
           ADMIN_EMAIL=${OW_ADMIN_EMAIL}
           ADMIN_PASSWORD=${OW_ADMIN_PASSWORD}
           OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY}
-          # Single-domain path routing. Traefik terminates TLS via Let's
-          # Encrypt at ``ow-staging.getlucie.ai``; ``/api/*`` is stripped
-          # and forwarded to ow-api, ``/*`` serves the dashboard.
-          # Whoop/Oura receive redirect_uri rooted at ``/api`` below.
-          API_BASE_URL=https://ow-staging.getlucie.ai/api
-          SERVER_HOST=https://ow-staging.getlucie.ai/api
+          # Single-domain path routing via Traefik + Let's Encrypt.
+          # ``/api/*`` → ow-api (FastAPI mounts routes under /api/v1/...)
+          # ``/*``     → ow-dashboard
+          # ``API_BASE_URL`` is the host root — backend appends its own
+          # ``/api/v1/...`` path when generating OAuth redirect_uri.
+          API_BASE_URL=https://ow-staging.getlucie.ai
+          SERVER_HOST=https://ow-staging.getlucie.ai
           FRONTEND_URL=https://ow-staging.getlucie.ai
           CORS_ORIGINS=["https://ow-staging.getlucie.ai"]
 
