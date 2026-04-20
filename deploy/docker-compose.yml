@@ -97,7 +97,10 @@ services:
     image: svix/svix-server:v1
     container_name: svix-server
     restart: unless-stopped
-    command: ["--run-migrations"]
+    # The image has no ENTRYPOINT; default Cmd is /usr/local/bin/launch-svix-server.
+    # Override Cmd to prepend the binary so --run-migrations is parsed as a flag
+    # rather than treated as the executable.
+    command: ["/usr/local/bin/launch-svix-server", "--run-migrations"]
     env_file:
       - /app/ow.env
     environment:
