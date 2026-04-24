@@ -191,7 +191,10 @@ jobs:
           OURA_WEBHOOK_VERIFICATION_TOKEN: ${{ secrets.OURA_WEBHOOK_VERIFICATION_TOKEN }}
           WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
           WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}
+          SUUNTO_CLIENT_ID: ${{ secrets.SUUNTO_CLIENT_ID }}
+          SUUNTO_CLIENT_SECRET: ${{ secrets.SUUNTO_CLIENT_SECRET }}
           # Optional
+
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           SVIX_JWT_SECRET: ${{ secrets.SVIX_JWT_SECRET }}
@@ -241,6 +244,10 @@ jobs:
           WHOOP_CLIENT_ID=${WHOOP_CLIENT_ID}
           WHOOP_CLIENT_SECRET=${WHOOP_CLIENT_SECRET}
           WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout read:body_measurement
+
+          # Suunto
+          SUUNTO_CLIENT_ID=${SUUNTO_CLIENT_ID}
+          SUUNTO_CLIENT_SECRET=${SUUNTO_CLIENT_SECRET}
 
           # Sync
           SYNC_INTERVAL_SECONDS=3600
