@@ -109,7 +109,7 @@ class EventRecordService(
         detail: EventRecordDetailCreate,
         detail_type: str = "workout",
     ) -> EventRecordDetail:
-        result = self.event_record_detail_repo.create(db_session, detail, detail_type=detail_type)  # type: ignore[return-value]
+        result = self.event_record_detail_repo.create(db_session, detail, detail_type=detail_type)
         record = db_session.get(EventRecord, detail.record_id)
         if record is not None and record.data_source_id is not None:
             data_source = db_session.get(DataSource, record.data_source_id)
@@ -778,6 +778,23 @@ class EventRecordService(
                 end_time=params.end_datetime,
             ),
         )
+
+    def delete_event_record(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        record_id: UUID,
+        category: str,
+    ) -> bool:
+        """Delete an event record by id and category. Returns False if not found or not owned by user."""
+        record = self.crud.get_record_with_details(db_session, record_id, category)
+        if not record:
+            return False
+        data_source = self.data_source_repo.get(db_session, record.data_source_id)
+        if not data_source or data_source.user_id != user_id:
+            return False
+        self.crud.delete(db_session, record)
+        return True
 
 
 event_record_service = EventRecordService(log=getLogger(__name__))
