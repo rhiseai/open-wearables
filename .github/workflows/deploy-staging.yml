@@ -193,6 +193,8 @@ jobs:
           WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}
           SUUNTO_CLIENT_ID: ${{ secrets.SUUNTO_CLIENT_ID }}
           SUUNTO_CLIENT_SECRET: ${{ secrets.SUUNTO_CLIENT_SECRET }}
+          POLAR_CLIENT_ID: ${{ secrets.POLAR_CLIENT_ID }}
+          POLAR_CLIENT_SECRET: ${{ secrets.POLAR_CLIENT_SECRET }}
           # Optional
 
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -248,6 +250,10 @@ jobs:
           # Suunto
           SUUNTO_CLIENT_ID=${SUUNTO_CLIENT_ID}
           SUUNTO_CLIENT_SECRET=${SUUNTO_CLIENT_SECRET}
+
+          # Polar
+          POLAR_CLIENT_ID=${POLAR_CLIENT_ID}
+          POLAR_CLIENT_SECRET=${POLAR_CLIENT_SECRET}
 
           # Sync
           SYNC_INTERVAL_SECONDS=3600
