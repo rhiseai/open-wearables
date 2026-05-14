@@ -1,8 +1,10 @@
-# Production Deploy — main → ECR + S3 → ECS
+# Production Deploy — main → ECR → ECS
 #
 # Triggered on every push to main. Build matrix produces:
-#   - backend container image → ECR lucie/ow-backend (tagged :latest + :sha-<short>)
-#   - frontend SPA bundle → workflow artifact (consumed by deploy-frontend job)
+#   - backend container image → ECR lucie/ow-backend
+#   - frontend container image → ECR lucie/ow-frontend (TanStack Start + Nitro
+#     Node server, NOT a static SPA)
+# Both tagged :latest + :sha-<short>.
 #
 # Then runs alembic migrator, then rolls services in order:
 #   migrate → (deploy-frontend ‖ deploy-svix → deploy-app)
@@ -26,8 +28,7 @@ env:
   AWS_REGION: us-east-1
   ECS_CLUSTER: lucie-prod
   BACKEND_REPO: lucie/ow-backend
-  FRONTEND_BUCKET: lucie-prod-ow-frontend
-  CLOUDFRONT_DIST_ID: EGJ176KVVGWFL
+  FRONTEND_REPO: lucie/ow-frontend
   OW_API_BASE_URL: https://ow.getlucie.ai
   ROLE_ARN: arn:aws:iam::031244176128:role/ow-deploy-prod
 
@@ -41,10 +42,10 @@ jobs:
         include:
           - name: backend
             context: ./backend
-            target: ecr
+            repo: lucie/ow-backend
           - name: frontend
             context: ./frontend
-            target: artifact
+            repo: lucie/ow-frontend
     outputs:
       sha_short: ${{ steps.tag.outputs.sha_short }}
     steps:
@@ -62,57 +63,25 @@ jobs:
         run: echo "sha_short=${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
 
       - name: Login to ECR
-        if: matrix.target == 'ecr'
         id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Set up Docker Buildx
-        if: matrix.target == 'ecr'
         uses: docker/setup-buildx-action@v3
 
-      - name: Build + push backend image
-        if: matrix.target == 'ecr'
+      - name: Build + push image
         uses: docker/build-push-action@v6
         with:
-          context: ./backend
+          context: ${{ matrix.context }}
           push: true
           platforms: linux/amd64
-          cache-from: type=gha,scope=backend
-          cache-to: type=gha,scope=backend,mode=max
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          build-args: |
+            VITE_API_URL=${{ env.OW_API_BASE_URL }}
           tags: |
-            ${{ steps.ecr.outputs.registry }}/${{ env.BACKEND_REPO }}:latest
-            ${{ steps.ecr.outputs.registry }}/${{ env.BACKEND_REPO }}:sha-${{ steps.tag.outputs.sha_short }}
-
-      - name: Setup pnpm
-        if: matrix.target == 'artifact'
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Setup Node
-        if: matrix.target == 'artifact'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: frontend/pnpm-lock.yaml
-
-      - name: pnpm install + build
-        if: matrix.target == 'artifact'
-        working-directory: ./frontend
-        env:
-          VITE_API_URL: ${{ env.OW_API_BASE_URL }}
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm build
-
-      - name: Upload frontend dist
-        if: matrix.target == 'artifact'
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-dist
-          path: frontend/dist
-          retention-days: 7
+            ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:latest
+            ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:sha-${{ steps.tag.outputs.sha_short }}
 
   migrate:
     needs: build
@@ -175,27 +144,32 @@ jobs:
           role-session-name: ow-deploy-frontend
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Download frontend artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: frontend-dist
-          path: dist/
-
-      - name: S3 sync
+      - name: Force new deployment (ow-frontend)
         run: |
-          aws s3 sync dist/ "s3://${FRONTEND_BUCKET}/" \
-            --delete \
-            --cache-control "public, max-age=31536000, immutable" \
-            --exclude "index.html"
-          aws s3 cp dist/index.html "s3://${FRONTEND_BUCKET}/index.html" \
-            --cache-control "public, max-age=60"
+          aws ecs update-service --cluster "${ECS_CLUSTER}" \
+            --service ow-frontend --force-new-deployment \
+            --query 'service.serviceName' --output text
 
-      - name: CloudFront invalidation
+      - name: Wait + confirm frontend rollout
         run: |
-          aws cloudfront create-invalidation \
-            --distribution-id "${CLOUDFRONT_DIST_ID}" \
-            --paths "/*" \
-            --query 'Invalidation.{id:Id,status:Status}' --output table
+          set -e
+          DEADLINE=$(( $(date +%s) + 1800 ))
+          while true; do
+            R=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services ow-frontend \
+              --query 'services[0].deployments[0].rolloutState' --output text)
+            echo "[ow-frontend] rolloutState=$R"
+            case "$R" in COMPLETED|FAILED) break ;; esac
+            if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+              echo "::error::ow-frontend rollout did not reach terminal state within 30 min"
+              exit 1
+            fi
+            sleep 20
+          done
+          if [ "$R" != "COMPLETED" ]; then
+            echo "::error::ow-frontend deployment failed"
+            aws logs tail /ecs/ow-frontend --since 5m --region "${AWS_REGION}" || true
+            exit 1
+          fi
 
   deploy-svix:
     needs: migrate
@@ -303,9 +277,7 @@ jobs:
             echo "| Property | Value |"
             echo "|---|---|"
             echo "| Cluster | \`${ECS_CLUSTER}\` |"
-            echo "| Services rolled | ow-svix-server, ow-backend, ow-celery-worker, ow-celery-beat |"
-            echo "| Frontend bucket | \`${FRONTEND_BUCKET}\` |"
-            echo "| CloudFront | \`${CLOUDFRONT_DIST_ID}\` |"
+            echo "| Services rolled | ow-frontend, ow-svix-server, ow-backend, ow-celery-worker, ow-celery-beat |"
             echo "| Image tag | \`latest\` + \`sha-${COMMIT_SHA:0:7}\` |"
             echo "| Commit | \`${COMMIT_SHA}\` |"
             echo "| URL | https://ow.getlucie.ai |"
