@@ -40,6 +40,9 @@ RUN if [ -d /app/.output/public ]; then \
 # Production stage
 FROM node:22-alpine
 
+# curl required by ECS container-level healthcheck.
+RUN apk add --no-cache curl
+
 WORKDIR /app
 # Copy built assets from builder
 COPY --from=builder /app/build-output /usr/share/nginx/html
