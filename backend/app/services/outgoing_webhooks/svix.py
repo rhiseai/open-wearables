@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from jose import jwt
@@ -329,7 +329,7 @@ def send_test_message(app_id: str, endpoint_id: str, event_type: str) -> Message
             MessageIn(
                 event_type=event_type,
                 payload=get_test_payload(event_type),
-                event_id=f"test.{endpoint_id}.{event_type}",
+                event_id=f"test.{endpoint_id}.{event_type}.{uuid4().hex}",
             ),
         )
     except Exception:
