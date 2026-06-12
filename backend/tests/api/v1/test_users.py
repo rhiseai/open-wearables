@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
-from tests.utils import api_key_headers, developer_auth_headers
+from tests.utils import api_key_headers
 
 
 class TestListUsers:
