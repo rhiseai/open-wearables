@@ -11,7 +11,7 @@ from app.schemas.model_crud.user_management import (
     UserUpdate,
 )
 from app.schemas.utils import OldPaginatedResponse
-from app.services import ApiKeyDep, DeveloperDep, user_service
+from app.services import ApiKeyDep, user_service
 
 router = APIRouter()
 
