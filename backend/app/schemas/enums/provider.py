@@ -43,9 +43,12 @@ class ProviderName(str, Enum):
 
 
 DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
-    ProviderName.APPLE: 1,
-    ProviderName.GARMIN: 2,
-    ProviderName.POLAR: 3,
-    ProviderName.SUUNTO: 4,
-    ProviderName.WHOOP: 5,
+    ProviderName.OURA: 1,
+    ProviderName.WHOOP: 2,
+    ProviderName.GARMIN: 3,
+    ProviderName.POLAR: 4,
+    ProviderName.SUUNTO: 5,
+    ProviderName.FITBIT: 6,
+    ProviderName.ULTRAHUMAN: 7,
+    ProviderName.APPLE: 8,
 }

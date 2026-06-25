@@ -27,7 +27,7 @@ class TestProviderPriorityRepository:
         # Assert
         assert priority is not None
         assert priority.provider == provider
-        assert priority.priority == 1  # Default priority
+        assert priority.priority == 8  # Apple default priority (lowest of the dedicated providers)
 
         # Verify in database
         db_priority = db.query(ProviderPriority).filter_by(provider=provider).first()
