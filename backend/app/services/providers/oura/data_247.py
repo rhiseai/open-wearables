@@ -823,7 +823,62 @@ class Oura247Data(Base247DataTemplate):
                         trace_id=trace_id,
                     )
 
+            self._persist_resting_heart_rate(db, user_id, normalized_sleep, end_dt, zone_offset, log_ctx)
+
         return count
+
+    def _persist_resting_heart_rate(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        normalized_sleep: dict[str, Any],
+        recorded_at: datetime,
+        zone_offset: str | None,
+        log_ctx: LogContext | None = None,
+    ) -> None:
+        """Emit a resting_heart_rate data point from the sleep session.
+
+        Oura exposes no dedicated resting-HR endpoint; the lowest sustained
+        heart rate during a full sleep session is the sports-science
+        equivalent (average sleep HR is the fallback). Naps are excluded
+        since their HR floor is not representative of daily RHR.
+        """
+        provider_user_id, trace_id = log_ctx or LogContext()
+        if normalized_sleep.get("is_nap", False):
+            return
+        rhr = normalized_sleep.get("lowest_heart_rate")
+        if rhr is None:
+            rhr = normalized_sleep.get("average_heart_rate")
+        if rhr is None:
+            return
+
+        oura_sleep_id = normalized_sleep.get("oura_sleep_id")
+        sample = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user_id,
+            source=self.provider_name,
+            recorded_at=recorded_at,
+            zone_offset=zone_offset,
+            value=Decimal(str(rhr)),
+            series_type=SeriesType.resting_heart_rate,
+            external_id=str(oura_sleep_id) if oura_sleep_id else None,
+        )
+        try:
+            timeseries_service.bulk_create_samples(db, [sample])
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            log_structured(
+                self.logger,
+                "error",
+                "Failed to persist resting_heart_rate from sleep",
+                action="oura_resting_heart_rate_save_error",
+                sleep_id=str(normalized_sleep.get("id")),
+                error=str(e),
+                user_id=str(user_id),
+                provider_user_id=provider_user_id,
+                trace_id=trace_id,
+            )
 
     # -------------------------------------------------------------------------
     # Daily Sleep Score - /v2/usercollection/daily_sleep

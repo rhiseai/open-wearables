@@ -1,9 +1,14 @@
 """Tests for Oura247Data normalization."""
 
+from collections.abc import Generator
+from datetime import datetime, timezone
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
 
+from app.schemas.enums import SeriesType
 from app.services.providers.oura.data_247 import Oura247Data
 from app.services.providers.oura.strategy import OuraStrategy
 
@@ -104,6 +109,115 @@ class TestOura247SleepNormalization:
         assert result["average_heart_rate"] == 55.0
         assert result["average_hrv"] == 45
         assert result["lowest_heart_rate"] == 48
+
+
+class TestOura247RestingHeartRatePersistence:
+    """Test resting_heart_rate emission from sleep sessions."""
+
+    @pytest.fixture
+    def data_247(self) -> Oura247Data:
+        strategy = OuraStrategy()
+        return strategy.data_247
+
+    @pytest.fixture
+    def base_sleep(self) -> dict:
+        return {
+            "id": uuid4(),
+            "user_id": uuid4(),
+            "provider": "oura",
+            "is_nap": False,
+            "lowest_heart_rate": 48,
+            "average_heart_rate": 55.0,
+            "oura_sleep_id": "sleep-abc123",
+        }
+
+    @pytest.fixture
+    def timeseries_service_mock(self) -> Generator[MagicMock, None, None]:
+        with patch("app.services.providers.oura.data_247.timeseries_service") as mock:
+            yield mock
+
+    def test_emits_rhr_from_lowest_heart_rate(
+        self,
+        data_247: Oura247Data,
+        base_sleep: dict,
+        timeseries_service_mock: MagicMock,
+    ) -> None:
+        db = MagicMock()
+        recorded_at = datetime(2024, 1, 15, 7, 0, tzinfo=timezone.utc)
+
+        data_247._persist_resting_heart_rate(db, base_sleep["user_id"], base_sleep, recorded_at, "+00:00")
+
+        timeseries_service_mock.bulk_create_samples.assert_called_once()
+        samples = timeseries_service_mock.bulk_create_samples.call_args[0][1]
+        assert len(samples) == 1
+        sample = samples[0]
+        assert sample.series_type == SeriesType.resting_heart_rate
+        assert sample.value == Decimal("48")
+        assert sample.recorded_at == recorded_at
+        assert sample.zone_offset == "+00:00"
+        assert sample.user_id == base_sleep["user_id"]
+        assert sample.source == "oura"
+        assert sample.external_id == "sleep-abc123"
+        db.commit.assert_called_once()
+
+    def test_falls_back_to_average_heart_rate(
+        self,
+        data_247: Oura247Data,
+        base_sleep: dict,
+        timeseries_service_mock: MagicMock,
+    ) -> None:
+        base_sleep["lowest_heart_rate"] = None
+
+        data_247._persist_resting_heart_rate(
+            MagicMock(), base_sleep["user_id"], base_sleep, datetime.now(timezone.utc), None
+        )
+
+        samples = timeseries_service_mock.bulk_create_samples.call_args[0][1]
+        assert samples[0].value == Decimal("55.0")
+
+    def test_skips_nap_sessions(
+        self,
+        data_247: Oura247Data,
+        base_sleep: dict,
+        timeseries_service_mock: MagicMock,
+    ) -> None:
+        base_sleep["is_nap"] = True
+
+        data_247._persist_resting_heart_rate(
+            MagicMock(), base_sleep["user_id"], base_sleep, datetime.now(timezone.utc), None
+        )
+
+        timeseries_service_mock.bulk_create_samples.assert_not_called()
+
+    def test_skips_when_no_heart_rate_available(
+        self,
+        data_247: Oura247Data,
+        base_sleep: dict,
+        timeseries_service_mock: MagicMock,
+    ) -> None:
+        base_sleep["lowest_heart_rate"] = None
+        base_sleep["average_heart_rate"] = None
+
+        data_247._persist_resting_heart_rate(
+            MagicMock(), base_sleep["user_id"], base_sleep, datetime.now(timezone.utc), None
+        )
+
+        timeseries_service_mock.bulk_create_samples.assert_not_called()
+
+    def test_swallows_service_errors_and_rolls_back(
+        self,
+        data_247: Oura247Data,
+        base_sleep: dict,
+        timeseries_service_mock: MagicMock,
+    ) -> None:
+        timeseries_service_mock.bulk_create_samples.side_effect = RuntimeError("db down")
+        db = MagicMock()
+
+        data_247._persist_resting_heart_rate(db, base_sleep["user_id"], base_sleep, datetime.now(timezone.utc), None)
+
+        timeseries_service_mock.bulk_create_samples.assert_called_once()
+        db.rollback.assert_called_once()
+        db.commit.assert_not_called()
 
 
 class TestOura247ReadinessNormalization:
