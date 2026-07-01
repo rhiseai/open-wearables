@@ -1,9 +1,13 @@
 """Tests for Oura webhook schemas and service."""
 
+from unittest.mock import MagicMock
+from uuid import uuid4
+
 import pytest
 from pydantic import ValidationError
 
 from app.schemas.providers.oura import OuraWebhookNotification
+from app.services.providers.oura.webhook_handler import OuraWebhookHandler
 
 
 class TestOuraWebhookNotification:
@@ -73,3 +77,38 @@ class TestOuraWebhookNotification:
                 user_id="test-user",
             )
             assert notification.data_type == dt
+
+
+class TestOuraWebhookDispatch:
+    """Regression: each data_type must route to its correct save path.
+
+    ``daily_sleep`` is Oura's daily sleep *score* — it must go through
+    ``normalize_daily_sleep_scores``/``save_daily_sleep_scores``, NOT the
+    sleep-*session* path (``normalize_sleeps``), which silently drops the
+    score and leaves the user with no ``oura`` sleep health_score.
+    """
+
+    def _handler(self) -> tuple[OuraWebhookHandler, MagicMock]:
+        data_247 = MagicMock()
+        data_247._make_api_request.return_value = {"id": "obj-1", "day": "2026-06-30", "score": 81}
+        return OuraWebhookHandler(data_247, MagicMock()), data_247
+
+    def _notif(self, data_type: str) -> OuraWebhookNotification:
+        return OuraWebhookNotification(
+            event_type="create", data_type=data_type, user_id="oura-user-1", object_id="obj-1"
+        )
+
+    def test_daily_sleep_routes_to_score_path(self) -> None:
+        handler, data_247 = self._handler()
+        handler._dispatch_data_type(MagicMock(), self._notif("daily_sleep"), uuid4(), "trace-1")
+        data_247.normalize_daily_sleep_scores.assert_called_once()
+        data_247.save_daily_sleep_scores.assert_called_once()
+        # must NOT be treated as a sleep session
+        data_247.normalize_sleeps.assert_not_called()
+        data_247.save_sleep_data.assert_not_called()
+
+    def test_sleep_session_routes_to_session_path(self) -> None:
+        handler, data_247 = self._handler()
+        handler._dispatch_data_type(MagicMock(), self._notif("sleep"), uuid4(), "trace-1")
+        data_247.save_sleep_data.assert_called_once()
+        data_247.save_daily_sleep_scores.assert_not_called()
