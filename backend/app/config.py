@@ -91,7 +91,8 @@ class Settings(BaseSettings):
     # Time to live for sleep state in Redis
     redis_sleep_ttl_seconds: int = 24 * 3600  # 24 hours
 
-    # Time between sleep phases to conclude end of sleep session
+    # Gap between sleep phases that closes a sleep session (session boundary /
+    # adjacency merge threshold). Not a Postgres write delay — Apple flushes each batch.
     sleep_end_gap_minutes: int = 120  # 2 hours
 
     # SYNC SETTINGS

@@ -142,7 +142,7 @@ def _apply_transition(
         delta_seconds = (start_time - state.end_time).total_seconds()
 
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
-        finish_sleep(db_session, user_id, state)
+        persist_sleep(db_session, user_id, state, close=True)
         state = _create_new_sleep_state(start_time, end_time, uuid, provider, source_name, device_model, zone_offset)
 
     if zone_offset and not state.zone_offset:
@@ -201,21 +201,24 @@ def handle_sleep_data(
     """
     Process SDK sleep data and track sleep sessions using Redis state.
 
-    Sleep sessions are tracked in Redis and automatically finalized to the database when
-    a gap of more than 2 hours (configurable) is detected between consecutive sleep records.
+    Stages accumulate in Redis across SDK batches. After each batch the current
+    session is flushed to Postgres via ``create_or_merge_sleep`` (same path as
+    cloud providers) so summaries are available immediately — including while
+    the night is still in progress. Redis state is only deleted when a session
+    boundary is detected (inter-sample gap or wall-clock quiet gap >
+    ``sleep_end_gap_minutes``).
 
     A per-user Redis lock serializes concurrent calls so that parallel Celery tasks
     (e.g. from a bulk historical upload) accumulate stages into the same session instead
     of overwriting each other's state.
 
-    Stale detection uses ``end_time`` (the last sleep-sample timestamp).  When a bulk
-    historical upload finalizes a session whose ``end_time`` is in the past, the new
-    session is merged with any adjacent record already in the database, so consecutive
-    payloads within the same night are combined into a single session rather than being
-    stored as separate fragments.
+    Repeated flushes use a stable ``external_id`` (``state.uuid``) so the DB row is
+    updated in place rather than double-counting. When a new Redis session starts
+    after the previous one closed, ``create_or_merge_sleep`` still merges with an
+    adjacent DB record when payloads for the same night arrive as separate batches.
 
     Args:
-        db_session: Database session for persisting finalized sleep records
+        db_session: Database session for persisting sleep records
         request: Parsed SDKSyncRequest containing sleep records
         user_id: User identifier for associating sleep data
 
@@ -224,9 +227,10 @@ def handle_sleep_data(
         - Deduplicate incoming data based on start/end/stage/source
         - If no active session exists: Create new session in Redis (only for valid start states)
         - If active session exists: Check gap between new sample and the session window
-          * Gap > 2 hours: Finalize existing session, start new one
+          * Gap > 2 hours: Persist+close existing session, start new one
           * Otherwise: Accumulate sleep stage durations in existing session
-        - Persist state once after the whole batch; dispatch the stale-sleep task
+        - Save Redis state once; flush to Postgres; close Redis if quiet gap elapsed
+        - Dispatch the stale-sleep housekeeping task
     """
     redis_client = get_redis_client()
     lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=15)
@@ -294,21 +298,18 @@ def handle_sleep_data(
                 sjson.zoneOffset,
             )
 
-        # Persist the accumulated state to Redis only once after processing the entire batch
+        # Persist the accumulated state to Redis only once after processing the entire batch,
+        # then flush to Postgres immediately so summaries are visible without waiting for
+        # the quiet-gap finalize. Close Redis only when the session is already stale
+        # (historical uploads / post-wake quiet gap).
         if current_state:
             save_sleep_state(user_id, current_state)
 
-        # Finalise synchronously if the session is already stale.  Historical
-        # uploads have end_time far in the past so this fires immediately, but
-        # finish_sleep now merges the result with any adjacent record already in
-        # the DB — so each payload extends the growing record rather than
-        # creating a separate session.
-        if current_state:
             session_end = current_state.end_time
             if session_end.tzinfo is None:
                 session_end = session_end.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes):
-                finish_sleep(db_session, user_id, current_state)
+            close = datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes)
+            persist_sleep(db_session, user_id, current_state, close=close)
 
     finally:
         with contextlib.suppress(Exception):
@@ -422,21 +423,29 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     return metrics, cleaned_stages
 
 
-def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
-    """Finish a sleep session and save the record to the database.
+def persist_sleep(
+    db_session: DbSession,
+    user_id: str,
+    state: SleepState,
+    *,
+    close: bool = False,
+) -> None:
+    """Flush the current Redis sleep state to Postgres.
 
-    Before creating a new record the function checks whether an existing adjacent
-    sleep session is already in the database (gap ≤ ``sleep_end_gap_minutes``).
-    When found, the two sessions are merged: the existing record is deleted and a
-    new record is created from the combined stages.  This handles the Apple SDK
-    pattern of sending one night's sleep as many consecutive small payloads — each
-    payload is finalized immediately (historical data is available right away) and
-    each merge step extends the accumulated DB record until the whole night is
-    represented as a single session.
+    Uses the shared ``create_or_merge_sleep`` path so Apple sessions behave like
+    other providers: the first flush creates the row, subsequent flushes with the
+    same ``state.uuid`` as ``external_id`` update it in place (no double-counting).
+    Adjacent sessions from a different Redis uuid (historical multi-payload nights)
+    are still merged by ``create_or_merge_sleep``.
+
+    Args:
+        db_session: Database session
+        user_id: User identifier
+        state: In-progress sleep state from Redis
+        close: When True, delete the Redis state after a successful write (session
+            boundary / quiet-gap finalization). When False, Redis keeps accumulating
+            stages for the next batch.
     """
-
-    # Recalculate metrics from stages to handle overlaps/duplicates
-    # state.stages is a list[SleepStateStage]
     metrics, cleaned_stages = _calculate_final_metrics(state.stages)
 
     if cleaned_stages:
@@ -446,41 +455,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         end_time = state.end_time
         start_time = state.start_time
 
-    # --- Merge with an adjacent existing session if one exists ---
     source_for_lookup = state.source_name if state.source_name != "unknown" else None
-    adjacent = event_record_service.find_adjacent_sleep_record(
-        db_session,
-        UUID(user_id),
-        start_time,
-        end_time,
-        settings.sleep_end_gap_minutes,
-        source=source_for_lookup,
-        provider=state.provider,
-    )
-
-    if adjacent is not None:
-        # Deserialise the stored stages back to SleepStateStage so we can feed
-        # them into _calculate_final_metrics together with the new stages.
-        existing_state_stages: list[SleepStateStage] = []
-        if adjacent.sleep_detail and adjacent.sleep_detail.sleep_stages:
-            for s in adjacent.sleep_detail.sleep_stages:
-                with contextlib.suppress(Exception):
-                    existing_state_stages.append(SleepStateStage.model_validate(s))
-
-        # Recalculate from the union of both stage lists.
-        metrics, cleaned_stages = _calculate_final_metrics(existing_state_stages + state.stages)
-
-        # Expand the session window to cover both records.
-        start_time = min(adjacent.start_datetime, start_time)
-        end_time = max(adjacent.end_datetime, end_time)
-        if cleaned_stages:
-            start_time = min(start_time, cleaned_stages[0].start_time)
-            end_time = max(end_time, cleaned_stages[-1].end_time)
-
-        # Remove the old record before creating the merged one (cascade deletes detail).
-        event_record_service.delete(db_session, adjacent.id)
-
-    # ---
 
     total_duration = (end_time - start_time).total_seconds()
     total_sleep_seconds = (
@@ -521,13 +496,17 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
     )
 
     try:
-        created_or_existing_record = event_record_service.create(db_session, sleep_record)
-        # Always use the returned record's ID (whether newly created or existing)
-        detail_for_record = detail.model_copy(update={"record_id": created_or_existing_record.id})
-        event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
-        # Delete from Redis only after a successful DB write so a transient error
-        # keeps the session available for the next periodic finalization attempt.
-        delete_sleep_state(user_id)
+        event_record_service.create_or_merge_sleep(
+            db_session,
+            UUID(user_id),
+            sleep_record,
+            detail,
+            settings.sleep_end_gap_minutes,
+        )
+        # Only drop Redis after a successful DB write so a transient error keeps the
+        # session available for the next flush / periodic finalization attempt.
+        if close:
+            delete_sleep_state(user_id)
     except Exception as e:
         log_structured(
             logger,
@@ -539,3 +518,8 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
             sleep_record_id=sleep_record.id,
             error=str(e),
         )
+
+
+def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
+    """Finalize a sleep session: persist to Postgres and close the Redis state."""
+    persist_sleep(db_session, user_id, state, close=True)

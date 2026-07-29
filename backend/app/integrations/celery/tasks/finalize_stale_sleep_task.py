@@ -20,6 +20,12 @@ logger = getLogger(__name__)
 
 @shared_task
 def finalize_stale_sleeps() -> None:
+    """Housekeeping: close Redis sleep sessions that have gone quiet.
+
+    Sessions are already flushed to Postgres on every SDK batch. This task only
+    needs to persist+close Redis state once ``sleep_end_gap_minutes`` of quiet
+    time has elapsed (or re-flush if an earlier write failed).
+    """
     now = datetime.now(timezone.utc)
     redis_client = get_redis_client()
 
