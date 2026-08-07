@@ -154,26 +154,20 @@ export interface ChangePasswordRequest {
   confirm_password: string;
 }
 
-export interface CountWithGrowth {
-  count: number;
-  weekly_growth: number;
-}
-
-export interface SeriesTypeMetric {
-  series_type: string;
-  count: number;
-}
-
-export interface WorkoutTypeMetric {
-  workout_type: string | null;
+export interface MetricCount {
   count: number;
 }
 
 export interface DataPointsInfo {
   count: number;
-  weekly_growth: number;
-  top_series_types: SeriesTypeMetric[];
-  top_workout_types: WorkoutTypeMetric[];
+  archived: number;
+}
+
+export interface EventRecordsInfo {
+  count: number;
+  workouts: number;
+  sleep: number;
+  menstrual_cycles: number;
 }
 
 export interface ProviderConnectionCount {
@@ -188,9 +182,10 @@ export interface ConnectionsCoverage {
 }
 
 export interface DashboardStats {
-  total_users: CountWithGrowth;
-  active_conn: CountWithGrowth;
+  total_users: MetricCount;
+  active_conn: MetricCount;
   data_points: DataPointsInfo;
+  event_records: EventRecordsInfo;
   connections_coverage: ConnectionsCoverage;
 }
 
@@ -481,6 +476,23 @@ export interface ApiKeyCreate {
 
 export interface ApiKeyUpdate {
   name?: string | null;
+}
+
+/** SDK application credentials for mobile app authentication. */
+export interface Application {
+  id: string;
+  app_id: string;
+  name: string;
+  created_at: string;
+}
+
+export interface ApplicationCreate {
+  name: string;
+}
+
+/** Returned only on create / rotate-secret — secret cannot be retrieved again. */
+export interface ApplicationWithSecret extends Application {
+  app_secret: string;
 }
 
 export interface Automation {

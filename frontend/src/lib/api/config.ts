@@ -47,6 +47,12 @@ export const API_ENDPOINTS = {
   apiKeyDetail: (id: string) => `/api/v1/developer/api-keys/${id}`,
   apiKeyRotate: (id: string) => `/api/v1/developer/api-keys/${id}/rotate`,
 
+  // SDK Applications endpoints (mobile app credentials)
+  applications: '/api/v1/applications',
+  applicationDetail: (appId: string) => `/api/v1/applications/${appId}`,
+  applicationRotateSecret: (appId: string) =>
+    `/api/v1/applications/${appId}/rotate-secret`,
+
   // Provider workouts endpoints
   providerSynchronization: (provider: string, userId: string) =>
     `/api/v1/providers/${provider}/users/${userId}/sync`,
