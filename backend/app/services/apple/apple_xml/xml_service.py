@@ -196,6 +196,11 @@ class XMLService:
             self.stats.records.skip(f"missing_startDate:{metric_type}")
             return None
 
+        # Mindful minutes are derived from session duration; skip if endDate is missing.
+        if metric_type in _MINDFUL_TYPES and "endDate" not in document:
+            self.stats.records.skip(f"missing_endDate:{metric_type}")
+            return None
+
         raw_value = parse_apple_raw_value(document.get("value"), metric_type)
         # MindfulSession XML values are often enum names; duration is the real metric.
         if raw_value is None and metric_type not in _MINDFUL_TYPES:

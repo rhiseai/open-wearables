@@ -995,3 +995,46 @@ class TestAppleMenstrualCycleAssembly:
             .all()
         )
         assert [c.external_id for c in cycles] == ["apple-menstrual-2025-05-01"]
+
+    def test_none_only_payload_clears_orphan_periods(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """A sync of only HK 'none' flow (OW 0) clears previously assembled periods in-window."""
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        import_service.load_data(
+            db,
+            {
+                **SDK_ENVELOPE,
+                "data": {"records": [_flow("2025-06-01", 3, cycle_start=True), _flow("2025-06-02", 2)]},
+            },
+            user_id,
+        )
+        assert db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").count() == 1
+
+        # Re-send the same timestamps as HK none (5 → OW 0). Active flow_days become empty.
+        import_service.load_data(
+            db,
+            {
+                **SDK_ENVELOPE,
+                "data": {"records": [_flow("2025-06-01", 5), _flow("2025-06-02", 5)]},
+            },
+            user_id,
+        )
+        db.expire_all()
+        assert db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").count() == 0

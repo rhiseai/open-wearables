@@ -77,7 +77,30 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
     window_end = max(payload_dates) + timedelta(days=_LOOKBACK_DAYS)
 
     flow_days = _load_flow_days(db_session, UUID(user_id), window_start, window_end)
+    user_uuid = UUID(user_id)
     if not flow_days:
+        # Payload touched this window but no active flow remains — clear stale events.
+        orphans_deleted = _delete_orphan_periods(
+            db_session,
+            user_uuid,
+            window_start=window_start,
+            window_end=window_end,
+            kept_external_ids=set(),
+        )
+        if orphans_deleted:
+            db_session.commit()
+            log_structured(
+                logger,
+                "info",
+                "Apple menstrual cycle orphans cleared (no active flow)",
+                provider=request.provider or "apple",
+                action="apple_menstrual_assemble",
+                user_id=user_id,
+                periods_upserted=0,
+                orphans_deleted=orphans_deleted,
+                cycle_starts_from_payload=len(cycle_starts),
+                flow_days=0,
+            )
         return 0
 
     periods = _assemble_periods(sorted(flow_days), cycle_starts)
@@ -88,7 +111,6 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
     device_model, software_version, original_source_name = extract_device_info(menstrual_records[0].source)
     source_name = original_source_name or "Apple Health"
     provider = request.provider or "apple"
-    user_uuid = UUID(user_id)
     now = datetime.now(timezone.utc)
 
     upserted = 0
