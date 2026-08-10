@@ -159,6 +159,33 @@ The `types` parameter in the timeseries endpoint accepts the following values:
 | `garmin_fitness_age` | years | Fitness age estimate |
 | `garmin_body_battery` | % | Body battery (0-100) |
 
+### Nutrition
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `dietary_energy_consumed` | kcal | Dietary energy consumed |
+| `dietary_protein` | g | Protein consumed |
+| `dietary_carbohydrates` | g | Carbohydrates consumed |
+| `dietary_fat_total` | g | Total fat consumed |
+| `dietary_fiber` | g | Fiber consumed |
+| `dietary_sugar` | g | Sugar consumed |
+| `dietary_caffeine` | mg | Caffeine consumed |
+
+### Reproductive Health
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `menstrual_flow` | score | Menstrual flow intensity (0=none … 4=heavy) |
+| `cervical_mucus_quality` | score | Cervical mucus quality (HealthKit enum) |
+| `ovulation_test_result` | score | Ovulation test result (HealthKit enum) |
+| `basal_body_temperature` | °C | Basal body temperature (separate from `body_temperature`) |
+
+### Mindfulness
+
+| Type | Unit | Description |
+|------|------|-------------|
+| `mindful_minutes` | minutes | Mindful session duration |
+
 ### Other
 
 | Type | Unit | Description |
@@ -170,7 +197,7 @@ The `types` parameter in the timeseries endpoint accepts the following values:
 | `number_of_times_fallen` | count | Fall count |
 | `number_of_alcoholic_beverages` | count | Alcoholic beverages |
 | `nike_fuel` | count | Nike Fuel |
-| `hydration` | mL | Hydration |
+| `hydration` | mL | Hydration / dietary water |
 
 ---
 

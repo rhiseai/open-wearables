@@ -40,17 +40,15 @@ from app.schemas.providers.mobile_sdk.sync_request import (
     Workout,
 )
 from app.schemas.responses.upload import UploadDataResponse
+from app.services.apple.sample_normalization import normalize_apple_sample_value
 from app.services.event_record_service import event_record_service
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 from .device_resolution import extract_device_info
+from .menstrual_service import handle_menstrual_data
 from .sleep_service import handle_sleep_data
-
-# Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
-# in mg/dL round-trip with a ~0.1% offset under this factor.
-MMOL_L_TO_MG_DL = Decimal("18.0182")
 
 _SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
 
@@ -191,25 +189,6 @@ class ImportService:
 
             yield record, detail, time_series_samples
 
-    def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
-        match series_type:
-            # meters → cm
-            case SeriesType.height | SeriesType.walking_step_length:
-                return value * 100
-            # 0-1 fraction → percent (body_fat only for Apple; Health Connect already reports percent)
-            case SeriesType.body_fat_percentage if provider == "apple":
-                return value * 100
-            # HealthKit walking metrics returned as 0-1 fraction, DB stores percent
-            # apple-only metrics, so no need to check if provider is apple
-            case (
-                SeriesType.walking_double_support_percentage
-                | SeriesType.walking_asymmetry_percentage
-                | SeriesType.walking_steadiness
-            ):
-                return value * 100
-            case _:
-                return value
-
     def _build_statistic_bundles(
         self,
         request: SDKSyncRequest,
@@ -220,18 +199,21 @@ class ImportService:
         provider = request.provider
 
         for rjson in request.data.records:
-            value = Decimal(str(rjson.value))
-
             record_type = rjson.type or ""
             series_type = get_series_type_from_metric_type(record_type)
 
             if not series_type:
                 continue
-            value = self._normalize_unit(series_type, value, provider)
 
-            # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
-            if series_type == SeriesType.blood_glucose and (rjson.unit or "").lower().startswith("mmol"):
-                value = value * MMOL_L_TO_MG_DL
+            value = normalize_apple_sample_value(
+                series_type=series_type,
+                value=Decimal(str(rjson.value)),
+                metric_type=record_type,
+                unit=rjson.unit,
+                start=rjson.startDate,
+                end=rjson.endDate,
+                provider=provider,
+            )
 
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
@@ -396,6 +378,10 @@ class ImportService:
         if request.data.sleep:
             handle_sleep_data(db_session, request, user_id)
             sleep_saved = len(request.data.sleep)
+
+        # Assemble menstrual_cycle events from menstrual_flow samples + payload cycle-start flags.
+        # Samples are already committed above; cycle-start metadata is not persisted on timeseries rows.
+        handle_menstrual_data(db_session, request, user_id)
 
         return {
             "workouts_saved": workouts_saved,
