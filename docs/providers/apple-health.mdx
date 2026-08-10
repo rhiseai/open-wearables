@@ -79,10 +79,16 @@ Apple Health provides the widest range of health data types:
 - **Heart**: Heart rate, resting HR, HRV, VO2 max
 - **Sleep**: Sleep sessions with stages (flushed to the database on every SDK sync batch; Redis only holds the in-progress accumulator until a 2-hour quiet gap closes the session)
 - **Workouts**: All workout types with detailed metrics
-- **Body**: Weight, height, body fat percentage
-- **Nutrition**: Dietary intake tracking
+- **Body**: Weight, height, body fat percentage, basal body temperature
+- **Nutrition**: Dietary energy, protein, carbohydrates, fat, fiber, sugar, caffeine, water (→ `hydration`)
+- **Women's Health**: Menstrual flow samples assembled into `/events/menstrual-cycles` (period/cycle length); cervical mucus and ovulation test results as timeseries
+- **Mindfulness**: Mindful session duration as `mindful_minutes`
 
 See the [Flutter SDK documentation](/sdk/flutter#supported-health-data-types) for the complete list of supported types.
+
+<Note>
+  Cycle-start flags (`HKMenstrualCycleStart`) are taken from the in-flight SDK payload only — timeseries rows do not store HealthKit metadata. Re-grouping across historical syncs therefore relies on a gap &gt; 1 day heuristic; rare back-to-back periods with no gap may merge until a later sync carries an explicit cycle-start flag.
+</Note>
 
 ## Apple Health as a Data Bridge
 

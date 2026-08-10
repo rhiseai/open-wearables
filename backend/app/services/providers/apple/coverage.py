@@ -3,7 +3,9 @@ from app.constants.series_types.sdk.workout_statistics import WORKOUT_STATISTIC_
 from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
 
-# Apple HealthKit emits only HKQuantityTypeIdentifier... metrics (SDNN, not RMSSD).
+# Apple HealthKit emits only HKQuantityTypeIdentifier... metrics (SDNN, not RMSSD),
+# plus selected HKCategoryTypeIdentifier... samples mapped into timeseries
+# (menstrual_flow, mindful_minutes, etc.).
 TIMESERIES: frozenset[SeriesType] = frozenset(
     {
         *APPLE_METRIC_TYPE_TO_SERIES_TYPE.values(),
@@ -42,6 +44,17 @@ SLEEP_FIELDS: frozenset[str] = frozenset(
         "sleep_awake_minutes",
         "is_nap",
         "sleep_stages",
+    }
+)
+
+# EventRecordDetail fields populated by healthkit/menstrual_service.py
+MENSTRUAL_CYCLE_FIELDS: frozenset[str] = frozenset(
+    {
+        "period_length",
+        "cycle_length",
+        "has_specified_period_length",
+        "has_specified_cycle_length",
+        "last_updated_at",
     }
 )
 

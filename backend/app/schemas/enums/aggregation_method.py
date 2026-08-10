@@ -105,6 +105,21 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     SeriesType.garmin_skin_temperature: AggregationMethod.AVG,
     SeriesType.garmin_fitness_age: AggregationMethod.AVG,
     SeriesType.garmin_body_battery: AggregationMethod.AVG,
+    # ── Nutrition ──
+    SeriesType.dietary_energy_consumed: AggregationMethod.SUM,
+    SeriesType.dietary_protein: AggregationMethod.SUM,
+    SeriesType.dietary_carbohydrates: AggregationMethod.SUM,
+    SeriesType.dietary_fat_total: AggregationMethod.SUM,
+    SeriesType.dietary_fiber: AggregationMethod.SUM,
+    SeriesType.dietary_sugar: AggregationMethod.SUM,
+    SeriesType.dietary_caffeine: AggregationMethod.SUM,
+    # ── Reproductive Health ──
+    SeriesType.menstrual_flow: AggregationMethod.AVG,
+    SeriesType.cervical_mucus_quality: AggregationMethod.AVG,
+    SeriesType.ovulation_test_result: AggregationMethod.AVG,
+    SeriesType.basal_body_temperature: AggregationMethod.AVG,
+    # ── Mindfulness ──
+    SeriesType.mindful_minutes: AggregationMethod.SUM,
     # ── Other ──
     SeriesType.electrodermal_activity: AggregationMethod.AVG,
     SeriesType.push_count: AggregationMethod.SUM,
@@ -113,6 +128,7 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     SeriesType.number_of_times_fallen: AggregationMethod.SUM,
     SeriesType.number_of_alcoholic_beverages: AggregationMethod.SUM,
     SeriesType.nike_fuel: AggregationMethod.SUM,
+    SeriesType.hydration: AggregationMethod.SUM,
 }
 
 

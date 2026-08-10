@@ -130,6 +130,22 @@ class SDKMetricType(StrEnum):
     NUMBER_OF_ALCOHOLIC_BEVERAGES = "HKQuantityTypeIdentifierNumberOfAlcoholicBeverages"
     ANDROID_HYDRATION = "HYDRATION"
 
+    # Nutrition (Apple HealthKit)
+    APPLE_DIETARY_ENERGY_CONSUMED = "HKQuantityTypeIdentifierDietaryEnergyConsumed"
+    APPLE_DIETARY_PROTEIN = "HKQuantityTypeIdentifierDietaryProtein"
+    APPLE_DIETARY_CARBOHYDRATES = "HKQuantityTypeIdentifierDietaryCarbohydrates"
+    APPLE_DIETARY_FAT_TOTAL = "HKQuantityTypeIdentifierDietaryFatTotal"
+    APPLE_DIETARY_WATER = "HKQuantityTypeIdentifierDietaryWater"
+    APPLE_DIETARY_FIBER = "HKQuantityTypeIdentifierDietaryFiber"
+    APPLE_DIETARY_SUGAR = "HKQuantityTypeIdentifierDietarySugar"
+    APPLE_DIETARY_CAFFEINE = "HKQuantityTypeIdentifierDietaryCaffeine"
+
+    # Reproductive / Mindfulness category samples (arrive in data.records)
+    APPLE_MENSTRUAL_FLOW = "HKCategoryTypeIdentifierMenstrualFlow"
+    APPLE_CERVICAL_MUCUS_QUALITY = "HKCategoryTypeIdentifierCervicalMucusQuality"
+    APPLE_OVULATION_TEST_RESULT = "HKCategoryTypeIdentifierOvulationTestResult"
+    APPLE_MINDFUL_SESSION = "HKCategoryTypeIdentifierMindfulSession"
+
     # Electrodermal
     ELECTRODERMAL_ACTIVITY = "HKQuantityTypeIdentifierElectrodermalActivity"
 
@@ -194,7 +210,7 @@ METRIC_TYPE_TO_SERIES_TYPE: dict[SDKMetricType, SeriesType] = {
     SDKMetricType.ANDROID_BLOOD_PRESSURE_DIASTOLIC: SeriesType.blood_pressure_diastolic,
     SDKMetricType.APPLE_RESPIRATORY_RATE: SeriesType.respiratory_rate,
     SDKMetricType.ANDROID_RESPIRATORY_RATE: SeriesType.respiratory_rate,
-    SDKMetricType.BASAL_BODY_TEMPERATURE: SeriesType.body_temperature,
+    SDKMetricType.BASAL_BODY_TEMPERATURE: SeriesType.basal_body_temperature,
     SDKMetricType.SLEEPING_BREATHING_DISTURBANCES: SeriesType.sleeping_breathing_disturbances,
     # Blood & Respiratory - Extended
     SDKMetricType.BLOOD_ALCOHOL_CONTENT: SeriesType.blood_alcohol_content,
@@ -287,6 +303,20 @@ METRIC_TYPE_TO_SERIES_TYPE: dict[SDKMetricType, SeriesType] = {
     SDKMetricType.INHALER_USAGE: SeriesType.inhaler_usage,
     SDKMetricType.NUMBER_OF_ALCOHOLIC_BEVERAGES: SeriesType.number_of_alcoholic_beverages,
     SDKMetricType.ANDROID_HYDRATION: SeriesType.hydration,
+    # Nutrition
+    SDKMetricType.APPLE_DIETARY_ENERGY_CONSUMED: SeriesType.dietary_energy_consumed,
+    SDKMetricType.APPLE_DIETARY_PROTEIN: SeriesType.dietary_protein,
+    SDKMetricType.APPLE_DIETARY_CARBOHYDRATES: SeriesType.dietary_carbohydrates,
+    SDKMetricType.APPLE_DIETARY_FAT_TOTAL: SeriesType.dietary_fat_total,
+    SDKMetricType.APPLE_DIETARY_WATER: SeriesType.hydration,
+    SDKMetricType.APPLE_DIETARY_FIBER: SeriesType.dietary_fiber,
+    SDKMetricType.APPLE_DIETARY_SUGAR: SeriesType.dietary_sugar,
+    SDKMetricType.APPLE_DIETARY_CAFFEINE: SeriesType.dietary_caffeine,
+    # Reproductive / Mindfulness (category → numeric series)
+    SDKMetricType.APPLE_MENSTRUAL_FLOW: SeriesType.menstrual_flow,
+    SDKMetricType.APPLE_CERVICAL_MUCUS_QUALITY: SeriesType.cervical_mucus_quality,
+    SDKMetricType.APPLE_OVULATION_TEST_RESULT: SeriesType.ovulation_test_result,
+    SDKMetricType.APPLE_MINDFUL_SESSION: SeriesType.mindful_minutes,
     # Electrodermal
     SDKMetricType.ELECTRODERMAL_ACTIVITY: SeriesType.electrodermal_activity,
     # Ultraviolet Exposure

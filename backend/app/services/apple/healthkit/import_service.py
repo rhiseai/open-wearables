@@ -15,6 +15,11 @@ from app.constants.series_types.sdk import (
     get_series_type_from_metric_type,
     get_series_type_from_workout_statistic_type,
 )
+from app.constants.series_types.sdk.category_types import (
+    AppleCategoryType,
+    recode_menstrual_flow_value,
+)
+from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
 from app.database import DbSession
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -46,6 +51,7 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 from .device_resolution import extract_device_info
+from .menstrual_service import handle_menstrual_data
 from .sleep_service import handle_sleep_data
 
 # Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
@@ -220,18 +226,36 @@ class ImportService:
         provider = request.provider
 
         for rjson in request.data.records:
-            value = Decimal(str(rjson.value))
-
             record_type = rjson.type or ""
             series_type = get_series_type_from_metric_type(record_type)
 
             if not series_type:
                 continue
+
+            # MindfulSession: HK category value is always 0; use session duration.
+            if record_type == AppleCategoryType.MINDFUL_SESSION or record_type == SDKMetricType.APPLE_MINDFUL_SESSION:
+                duration_seconds = (rjson.endDate - rjson.startDate).total_seconds()
+                value = Decimal(str(max(duration_seconds / 60.0, 0.0)))
+            else:
+                value = Decimal(str(rjson.value))
+
+            if series_type == SeriesType.menstrual_flow:
+                value = Decimal(recode_menstrual_flow_value(int(value)))
+
             value = self._normalize_unit(series_type, value, provider)
 
             # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
             if series_type == SeriesType.blood_glucose and (rjson.unit or "").lower().startswith("mmol"):
                 value = value * MMOL_L_TO_MG_DL
+
+            # Apple dietary water arrives in liters; series unit is mL.
+            unit_lower = (rjson.unit or "").lower()
+            if series_type == SeriesType.hydration and unit_lower in {"l", "liter", "liters"}:
+                value = value * Decimal("1000")
+
+            # Dietary caffeine: HealthKit mass is often grams; series unit is mg.
+            if series_type == SeriesType.dietary_caffeine and unit_lower in {"g", "gram", "grams"}:
+                value = value * Decimal("1000")
 
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
@@ -396,6 +420,10 @@ class ImportService:
         if request.data.sleep:
             handle_sleep_data(db_session, request, user_id)
             sleep_saved = len(request.data.sleep)
+
+        # Assemble menstrual_cycle events from menstrual_flow samples + payload cycle-start flags.
+        # Samples are already committed above; cycle-start metadata is not persisted on timeseries rows.
+        handle_menstrual_data(db_session, request, user_id)
 
         return {
             "workouts_saved": workouts_saved,

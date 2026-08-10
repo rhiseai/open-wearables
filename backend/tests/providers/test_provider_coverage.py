@@ -43,6 +43,8 @@ SDK_SHARED_FILES = (
     Path("app/services/apple/healthkit/sleep_service.py"),
     Path("app/services/apple/apple_xml/xml_service.py"),
 )
+# Apple-only: menstrual cycle assembly from HealthKit category samples.
+APPLE_ONLY_SHARED_FILES = (Path("app/services/apple/healthkit/menstrual_service.py"),)
 
 # EventRecordDetail fields that are NOT part of the coverage matrix (structural
 # or composite objects rather than scalar metric coverage).
@@ -79,6 +81,8 @@ def _impl_source(provider: str) -> str:
     paths = [PROVIDERS_DIR / provider / fname for fname in IMPL_FILES]
     if provider in SDK_PROVIDERS:
         paths += list(SDK_SHARED_FILES)
+    if provider == "apple":
+        paths += list(APPLE_ONLY_SHARED_FILES)
     return "\n".join(p.read_text() for p in paths if p.exists())
 
 
