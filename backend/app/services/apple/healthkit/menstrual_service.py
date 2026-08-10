@@ -23,7 +23,7 @@ from app.constants.series_types.sdk.category_types import (
 )
 from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.database import DbSession
-from app.models import DataPointSeries, DataSource
+from app.models import DataPointSeries, DataSource, EventRecord
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import EventRecordCreate, MenstrualCycleDetailCreate
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
@@ -34,6 +34,7 @@ from app.utils.structured_logging import log_structured
 logger = getLogger(__name__)
 
 _LOOKBACK_DAYS = 45
+_EXTERNAL_ID_PREFIX = "apple-menstrual-"
 _MENSTRUAL_RECORD_TYPES = {
     AppleCategoryType.MENSTRUAL_FLOW.value,
     SDKMetricType.APPLE_MENSTRUAL_FLOW.value,
@@ -51,11 +52,15 @@ class _Period:
 
     @property
     def external_id(self) -> str:
-        return f"apple-menstrual-{self.start.isoformat()}"
+        return f"{_EXTERNAL_ID_PREFIX}{self.start.isoformat()}"
 
 
 def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_id: str) -> int:
     """Rebuild menstrual_cycle events for the window touched by this sync.
+
+    Upserts assembled periods by ``external_id``, then deletes orphan
+    ``apple-menstrual-*`` events in the same window whose grouping no longer
+    matches (merge/split/lookback clipping).
 
     Returns the number of periods upserted.
     """
@@ -140,6 +145,14 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
         event_record_service.bulk_create_details(db_session, [detail], detail_type="menstrual_cycle")
         upserted += 1
 
+    orphans_deleted = _delete_orphan_periods(
+        db_session,
+        user_uuid,
+        window_start=window_start,
+        window_end=window_end,
+        kept_external_ids={p.external_id for p in periods},
+    )
+
     db_session.commit()
 
     log_structured(
@@ -150,10 +163,45 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
         action="apple_menstrual_assemble",
         user_id=user_id,
         periods_upserted=upserted,
+        orphans_deleted=orphans_deleted,
         cycle_starts_from_payload=len(cycle_starts),
         flow_days=len(flow_days),
     )
     return upserted
+
+
+def _delete_orphan_periods(
+    db_session: DbSession,
+    user_id: UUID,
+    *,
+    window_start: date,
+    window_end: date,
+    kept_external_ids: set[str],
+) -> int:
+    """Remove stale apple-menstrual-* events in the assembly window not in ``kept``."""
+    start_dt = datetime(window_start.year, window_start.month, window_start.day, tzinfo=timezone.utc)
+    end_dt = datetime(window_end.year, window_end.month, window_end.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+    existing = (
+        db_session.query(EventRecord)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(
+            DataSource.user_id == user_id,
+            EventRecord.category == "menstrual_cycle",
+            EventRecord.external_id.like(f"{_EXTERNAL_ID_PREFIX}%"),
+            EventRecord.start_datetime >= start_dt,
+            EventRecord.start_datetime < end_dt,
+        )
+        .all()
+    )
+
+    deleted = 0
+    for record in existing:
+        if record.external_id in kept_external_ids:
+            continue
+        event_record_service.crud.delete_flush(db_session, record)
+        deleted += 1
+    return deleted
 
 
 def _load_flow_days(

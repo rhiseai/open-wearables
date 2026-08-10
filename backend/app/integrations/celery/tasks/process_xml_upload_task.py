@@ -1,5 +1,6 @@
 import os
 import tempfile
+from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import Path
 from typing import Any
@@ -10,9 +11,11 @@ from sqlalchemy.orm import Session
 
 from app.database import SessionLocal
 from app.schemas.providers.apple.apple_xml import XMLParseStats
+from app.schemas.providers.mobile_sdk import SyncRequest, SyncRequestData
 from app.schemas.sync_status import SyncSource, SyncStatus
 from app.services import event_record_service
 from app.services.apple.apple_xml.xml_service import XMLService
+from app.services.apple.healthkit.menstrual_service import handle_menstrual_data
 from app.services.apple.healthkit.sleep_service import handle_sleep_data
 from app.services.sync_status_service import completed, failed, new_run_id, started
 from app.services.timeseries_service import timeseries_service
@@ -168,5 +171,20 @@ def _import_xml_data(db: Session, xml_path: str, user_id: str) -> XMLParseStats:
 
         if sync_request and sync_request.data.sleep:
             handle_sleep_data(db, sync_request, user_id)
+
+    # Assemble menstrual_cycle events after all flow samples are committed.
+    # Cycle-start flags come from XML MetadataEntry collected during parse.
+    if xml_service.menstrual_records:
+        menstrual_request = SyncRequest(
+            provider="apple",
+            sdkVersion="n/a",
+            syncTimestamp=datetime.now(timezone.utc),
+            data=SyncRequestData(
+                records=xml_service.menstrual_records,
+                sleep=[],
+                workouts=[],
+            ),
+        )
+        handle_menstrual_data(db, menstrual_request, user_id)
 
     return xml_service.stats

@@ -933,3 +933,65 @@ class TestAppleMenstrualCycleAssembly:
             "apple-menstrual-2025-04-01",
             "apple-menstrual-2025-04-03",
         ]
+
+    def test_merge_without_cycle_start_deletes_orphan_period(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """When a later sync drops cycle-start flags and merges periods, stale ids are removed."""
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        split = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-05-01", 3, cycle_start=True),
+                    _flow("2025-05-02", 2),
+                    _flow("2025-05-03", 3, cycle_start=True),
+                    _flow("2025-05-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, split, user_id)
+        assert {
+            c.external_id for c in db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").all()
+        } == {
+            "apple-menstrual-2025-05-01",
+            "apple-menstrual-2025-05-03",
+        }
+
+        # Same days, no cycle-start flags → gap heuristic merges into one period.
+        merged = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-05-01", 3),
+                    _flow("2025-05-02", 2),
+                    _flow("2025-05-03", 3),
+                    _flow("2025-05-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, merged, user_id)
+        db.expire_all()
+        cycles = (
+            db.query(EventRecord)
+            .filter(EventRecord.category == "menstrual_cycle")
+            .order_by(EventRecord.start_datetime)
+            .all()
+        )
+        assert [c.external_id for c in cycles] == ["apple-menstrual-2025-05-01"]

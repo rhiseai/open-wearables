@@ -1,6 +1,7 @@
 """Unit tests for Apple menstrual / dietary / mindful series mapping helpers."""
 
-from datetime import date
+from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -15,6 +16,10 @@ from app.constants.series_types.sdk.metric_types import (
 from app.schemas.enums import AggregationMethod, SeriesType
 from app.schemas.enums.aggregation_method import get_aggregation_method
 from app.services.apple.healthkit.menstrual_service import _assemble_periods, _Period
+from app.services.apple.sample_normalization import (
+    normalize_apple_sample_value,
+    parse_apple_raw_value,
+)
 
 
 @pytest.mark.parametrize(
@@ -111,3 +116,57 @@ def test_assemble_periods_gap_and_cycle_start() -> None:
 def test_period_external_id() -> None:
     assert _Period(start=date(2025, 3, 1), end=date(2025, 3, 4)).external_id == "apple-menstrual-2025-03-01"
     assert _Period(start=date(2025, 3, 1), end=date(2025, 3, 4)).period_length == 4
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("HKCategoryValueMenstrualFlowLight", Decimal("2")),
+        ("HKCategoryValueMenstrualFlowHeavy", Decimal("4")),
+        ("3", Decimal("3")),
+        ("HKCategoryValueMindfulSession", None),
+    ],
+)
+def test_parse_apple_raw_value_xml_enums(raw: str, expected: Decimal | None) -> None:
+    assert parse_apple_raw_value(raw, "HKCategoryTypeIdentifierMenstrualFlow") == expected
+
+
+def test_normalize_xml_style_values() -> None:
+    start = datetime(2025, 4, 10, 8, 0, tzinfo=timezone.utc)
+    end = datetime(2025, 4, 10, 8, 12, tzinfo=timezone.utc)
+
+    mindful = normalize_apple_sample_value(
+        series_type=SeriesType.mindful_minutes,
+        value=Decimal("0"),
+        metric_type="HKCategoryTypeIdentifierMindfulSession",
+        start=start,
+        end=end,
+        provider="apple",
+    )
+    assert mindful == Decimal("12")
+
+    water = normalize_apple_sample_value(
+        series_type=SeriesType.hydration,
+        value=Decimal("0.5"),
+        metric_type="HKQuantityTypeIdentifierDietaryWater",
+        unit="L",
+        provider="apple",
+    )
+    assert water == Decimal("500")
+
+    caffeine = normalize_apple_sample_value(
+        series_type=SeriesType.dietary_caffeine,
+        value=Decimal("0.08"),
+        metric_type="HKQuantityTypeIdentifierDietaryCaffeine",
+        unit="g",
+        provider="apple",
+    )
+    assert caffeine == Decimal("80")
+
+    flow = normalize_apple_sample_value(
+        series_type=SeriesType.menstrual_flow,
+        value=Decimal("5"),
+        metric_type="HKCategoryTypeIdentifierMenstrualFlow",
+        provider="apple",
+    )
+    assert flow == Decimal("0")

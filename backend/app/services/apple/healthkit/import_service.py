@@ -15,11 +15,6 @@ from app.constants.series_types.sdk import (
     get_series_type_from_metric_type,
     get_series_type_from_workout_statistic_type,
 )
-from app.constants.series_types.sdk.category_types import (
-    AppleCategoryType,
-    recode_menstrual_flow_value,
-)
-from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.constants.workout_types import get_unified_apple_workout_type_sdk
 from app.database import DbSession
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -45,6 +40,7 @@ from app.schemas.providers.mobile_sdk.sync_request import (
     Workout,
 )
 from app.schemas.responses.upload import UploadDataResponse
+from app.services.apple.sample_normalization import normalize_apple_sample_value
 from app.services.event_record_service import event_record_service
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -53,10 +49,6 @@ from app.utils.structured_logging import log_structured
 from .device_resolution import extract_device_info
 from .menstrual_service import handle_menstrual_data
 from .sleep_service import handle_sleep_data
-
-# Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
-# in mg/dL round-trip with a ~0.1% offset under this factor.
-MMOL_L_TO_MG_DL = Decimal("18.0182")
 
 _SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
 
@@ -197,25 +189,6 @@ class ImportService:
 
             yield record, detail, time_series_samples
 
-    def _normalize_unit(self, series_type: SeriesType, value: Decimal, provider: str | None = None) -> Decimal:
-        match series_type:
-            # meters → cm
-            case SeriesType.height | SeriesType.walking_step_length:
-                return value * 100
-            # 0-1 fraction → percent (body_fat only for Apple; Health Connect already reports percent)
-            case SeriesType.body_fat_percentage if provider == "apple":
-                return value * 100
-            # HealthKit walking metrics returned as 0-1 fraction, DB stores percent
-            # apple-only metrics, so no need to check if provider is apple
-            case (
-                SeriesType.walking_double_support_percentage
-                | SeriesType.walking_asymmetry_percentage
-                | SeriesType.walking_steadiness
-            ):
-                return value * 100
-            case _:
-                return value
-
     def _build_statistic_bundles(
         self,
         request: SDKSyncRequest,
@@ -232,30 +205,15 @@ class ImportService:
             if not series_type:
                 continue
 
-            # MindfulSession: HK category value is always 0; use session duration.
-            if record_type == AppleCategoryType.MINDFUL_SESSION or record_type == SDKMetricType.APPLE_MINDFUL_SESSION:
-                duration_seconds = (rjson.endDate - rjson.startDate).total_seconds()
-                value = Decimal(str(max(duration_seconds / 60.0, 0.0)))
-            else:
-                value = Decimal(str(rjson.value))
-
-            if series_type == SeriesType.menstrual_flow:
-                value = Decimal(recode_menstrual_flow_value(int(value)))
-
-            value = self._normalize_unit(series_type, value, provider)
-
-            # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
-            if series_type == SeriesType.blood_glucose and (rjson.unit or "").lower().startswith("mmol"):
-                value = value * MMOL_L_TO_MG_DL
-
-            # Apple dietary water arrives in liters; series unit is mL.
-            unit_lower = (rjson.unit or "").lower()
-            if series_type == SeriesType.hydration and unit_lower in {"l", "liter", "liters"}:
-                value = value * Decimal("1000")
-
-            # Dietary caffeine: HealthKit mass is often grams; series unit is mg.
-            if series_type == SeriesType.dietary_caffeine and unit_lower in {"g", "gram", "grams"}:
-                value = value * Decimal("1000")
+            value = normalize_apple_sample_value(
+                series_type=series_type,
+                value=Decimal(str(rjson.value)),
+                metric_type=record_type,
+                unit=rjson.unit,
+                start=rjson.startDate,
+                end=rjson.endDate,
+                provider=provider,
+            )
 
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
