@@ -2,14 +2,19 @@
 
 import logging
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
 import httpx
 from fastapi import HTTPException, status
+from redis.exceptions import RedisError
 
 from app.database import DbSession
+from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories import UserConnectionRepository
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
@@ -19,6 +24,67 @@ logger = logging.getLogger(__name__)
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 15.0  # Base delay for exponential backoff (seconds): 15s, 30s, 60s
+
+# Refresh the token this long before it actually expires
+TOKEN_EXPIRY_BUFFER = timedelta(minutes=5)
+# Lock lifetime must outlive one refresh round-trip (httpx timeout is 30s)
+TOKEN_REFRESH_LOCK_TIMEOUT = 45
+# How long a caller waits for the worker that is already refreshing
+TOKEN_REFRESH_LOCK_BLOCKING_TIMEOUT = 40
+
+
+def _needs_refresh(connection: UserConnection) -> bool:
+    """Whether the stored access token is expired or about to expire."""
+    return bool(
+        connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + TOKEN_EXPIRY_BUFFER,
+    )
+
+
+@contextmanager
+def _token_refresh_lock(user_id: UUID, provider_name: str) -> Iterator[None]:
+    """Serialize token refreshes for one user+provider across workers.
+
+    Providers that rotate refresh tokens on every refresh (Whoop) invalidate the
+    previous one, so two workers refreshing at once make the loser look revoked.
+    Redis being unavailable must not block data syncs, so the body still runs
+    (unlocked) when the lock cannot be taken.
+    """
+    lock = None
+    acquired = False
+    try:
+        lock = get_redis_client().lock(
+            f"oauth:token_refresh:{user_id}:{provider_name}",
+            timeout=TOKEN_REFRESH_LOCK_TIMEOUT,
+            blocking_timeout=TOKEN_REFRESH_LOCK_BLOCKING_TIMEOUT,
+        )
+        acquired = bool(lock.acquire())
+    except RedisError as e:
+        log_structured(
+            logger,
+            "warning",
+            f"Redis unavailable for token refresh lock, proceeding unlocked: {e}",
+            provider_name=provider_name,
+            user_id=str(user_id),
+        )
+
+    if not acquired:
+        log_structured(
+            logger,
+            "warning",
+            "Could not acquire token refresh lock, proceeding unlocked",
+            provider_name=provider_name,
+            user_id=str(user_id),
+        )
+
+    try:
+        yield
+    finally:
+        if acquired and lock is not None:
+            try:
+                lock.release()
+            except RedisError:
+                # Lock already expired (LockError) or Redis went away; TTL reclaims it
+                logger.warning("Failed to release token refresh lock for %s/%s", user_id, provider_name)
 
 
 def _get_valid_token(
@@ -46,17 +112,37 @@ def _get_valid_token(
             detail=f"No access token available for {provider_name} (SDK-based provider?)",
         )
 
-    # Check if token is expired (with 5 minute buffer)
-    if connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + timedelta(minutes=5):
+    if not _needs_refresh(connection):
+        return connection.access_token
+
+    with _token_refresh_lock(user_id, provider_name):
+        # Another worker may have refreshed while we waited for the lock, so re-read
+        # the connection from the database instead of trusting the loaded state
+        connection = connection_repo.get_by_user_and_provider_fresh(db, user_id, provider_name)
+        if not connection or not connection.access_token:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"User not connected to {provider_name}",
+            )
+
+        if not _needs_refresh(connection):
+            log_structured(
+                logger,
+                "info",
+                "Token already refreshed by a concurrent worker, skipping refresh",
+                provider_name=provider_name,
+                user_id=str(user_id),
+            )
+            return connection.access_token
+
         if not connection.refresh_token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Token expired and no refresh token available for {provider_name}",
             )
+
         token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
         return token_response.access_token
-
-    return connection.access_token
 
 
 def make_authenticated_request(

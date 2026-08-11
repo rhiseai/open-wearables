@@ -178,8 +178,21 @@ class BaseOAuthTemplate(ABC):
                 user_id=str(user_id),
                 status_code=e.response.status_code,
             )
-            # 400/401 = refresh token is dead so revoke + notify
+            # 400/401 = refresh token is dead so revoke + notify, unless a concurrent
+            # refresh already rotated it (single-use refresh tokens, e.g. Whoop)
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
+                rotated_token = self._get_rotated_token(db, user_id, refresh_token)
+                if rotated_token:
+                    log_structured(
+                        logger,
+                        "info",
+                        "Refresh token was rotated by a concurrent refresh; skipping revocation",
+                        provider=self.provider_name,
+                        task="refresh_access_token",
+                        user_id=str(user_id),
+                    )
+                    return rotated_token
+
                 self._revoke_connection(db, user_id, reason="refresh_failed")
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
@@ -197,9 +210,44 @@ class BaseOAuthTemplate(ABC):
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
 
+    def _get_rotated_token(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        failed_refresh_token: str,
+    ) -> OAuthTokenResponse | None:
+        """Return the stored token pair when a concurrent refresh already rotated it.
+
+        Providers that issue single-use refresh tokens (Whoop rotates on every
+        refresh) reject the loser of a refresh race with a 400 even though the
+        winner has just stored a perfectly valid token pair.  A stored refresh
+        token that differs from the rejected one is proof of such a rotation, so
+        the connection must not be revoked.  Returns None when the stored token
+        is the very one the provider rejected, i.e. it is genuinely dead.
+        """
+        connection = self.connection_repo.get_by_user_and_provider_fresh(db, user_id, self.provider_name)
+        if not connection or connection.status == ConnectionStatus.REVOKED:
+            return None
+        if not connection.access_token or not connection.refresh_token:
+            return None
+        if connection.refresh_token == failed_refresh_token:
+            return None
+
+        expires_in = 0
+        if connection.token_expires_at:
+            remaining = connection.token_expires_at - datetime.now(timezone.utc)
+            expires_in = max(int(remaining.total_seconds()), 0)
+
+        return OAuthTokenResponse(
+            access_token=connection.access_token,
+            token_type="Bearer",
+            refresh_token=connection.refresh_token,
+            expires_in=expires_in,
+        )
+
     def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
         """Mark the connection revoked and emit a connection.revoked webhook."""
-        connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
+        connection = self.connection_repo.get_by_user_and_provider_fresh(db, user_id, self.provider_name)
         if not connection or connection.status == ConnectionStatus.REVOKED:
             return
         self.connection_repo.mark_as_revoked(db, connection)

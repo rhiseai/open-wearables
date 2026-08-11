@@ -97,6 +97,31 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .one_or_none()
         )
 
+    def get_by_user_and_provider_fresh(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+    ) -> UserConnection | None:
+        """Get connection for specific user and provider, bypassing the identity map.
+
+        ``populate_existing()`` overwrites attributes of an already-loaded instance
+        with the current database state, so tokens rotated and committed by a
+        concurrent worker are visible instead of the stale values this session
+        loaded earlier.
+        """
+        return (
+            db_session.query(self.model)
+            .populate_existing()
+            .filter(
+                and_(
+                    self.model.user_id == user_id,
+                    self.model.provider == provider,
+                ),
+            )
+            .one_or_none()
+        )
+
     def get_active_connection(
         self,
         db_session: DbSession,
