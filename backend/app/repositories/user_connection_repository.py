@@ -325,6 +325,46 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.refresh(connection)
         return connection
 
+    def revoke_if_refresh_token_matches(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        provider: str,
+        refresh_token: str,
+    ) -> UserConnection | None:
+        """Revoke a connection in a single UPDATE, but only while it still holds *refresh_token*.
+
+        Guarding the UPDATE on the refresh token makes the check and the revoke one
+        atomic statement.  Without it a concurrent refresh could rotate the token
+        pair in between and the connection would be revoked despite holding valid
+        tokens — the failure mode of providers with single-use refresh tokens.
+
+        Returns the revoked connection, or None when nothing was revoked (the token
+        was rotated, or the connection is already revoked or gone).
+        """
+        result = cast(
+            CursorResult[tuple[()]],
+            db_session.execute(
+                update(UserConnection)
+                .where(
+                    and_(
+                        UserConnection.user_id == user_id,
+                        UserConnection.provider == provider,
+                        UserConnection.refresh_token == refresh_token,
+                        UserConnection.status != ConnectionStatus.REVOKED,
+                    ),
+                )
+                .values(
+                    status=ConnectionStatus.REVOKED,
+                    updated_at=datetime.now(timezone.utc),
+                ),
+            ),
+        )
+        db_session.commit()
+        if not result.rowcount:
+            return None
+        return self.get_by_user_and_provider_fresh(db_session, user_id, provider)
+
     def update_scope(self, db_session: DbSession, connection: UserConnection, scope: str | None) -> UserConnection:
         """Update connection scope (e.g. when user changes permissions on Garmin Connect)."""
         connection.scope = scope

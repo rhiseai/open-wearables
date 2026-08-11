@@ -182,6 +182,13 @@ class BaseOAuthTemplate(ABC):
             # refresh already rotated it (single-use refresh tokens, e.g. Whoop)
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
                 rotated_token = self._get_rotated_token(db, user_id, refresh_token)
+                if rotated_token is None:
+                    # The revoke is guarded on the same rotation condition, so a rotation
+                    # that commits after the check above still cannot revoke the connection
+                    revoked = self._revoke_connection(db, user_id, refresh_token=refresh_token, reason="refresh_failed")
+                    if not revoked:
+                        rotated_token = self._get_rotated_token(db, user_id, refresh_token)
+
                 if rotated_token:
                     log_structured(
                         logger,
@@ -193,7 +200,6 @@ class BaseOAuthTemplate(ABC):
                     )
                     return rotated_token
 
-                self._revoke_connection(db, user_id, reason="refresh_failed")
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
@@ -245,12 +251,22 @@ class BaseOAuthTemplate(ABC):
             expires_in=expires_in,
         )
 
-    def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
-        """Mark the connection revoked and emit a connection.revoked webhook."""
-        connection = self.connection_repo.get_by_user_and_provider_fresh(db, user_id, self.provider_name)
-        if not connection or connection.status == ConnectionStatus.REVOKED:
-            return
-        self.connection_repo.mark_as_revoked(db, connection)
+    def _revoke_connection(self, db: DbSession, user_id: UUID, *, refresh_token: str, reason: str) -> bool:
+        """Mark the connection revoked and emit a connection.revoked webhook.
+
+        Revocation is conditional on *refresh_token* still being the stored one, so
+        the check and the mark-as-revoked happen in a single atomic statement.
+        Returns False when nothing was revoked, i.e. the token was rotated by a
+        concurrent refresh or the connection is already revoked or gone.
+        """
+        connection = self.connection_repo.revoke_if_refresh_token_matches(
+            db,
+            user_id,
+            self.provider_name,
+            refresh_token,
+        )
+        if not connection:
+            return False
         on_connection_revoked(
             user_id=user_id,
             provider=self.provider_name,
@@ -258,6 +274,7 @@ class BaseOAuthTemplate(ABC):
             reason=reason,
             revoked_at=connection.updated_at.isoformat(),
         )
+        return True
 
     def _build_auth_url(self, state: str) -> tuple[str, dict[str, Any] | None]:
         """Builds the authorization URL.

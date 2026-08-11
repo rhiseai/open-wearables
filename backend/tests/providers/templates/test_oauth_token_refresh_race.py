@@ -115,6 +115,51 @@ class TestRefreshTokenRotationGuard:
 
     @patch("app.services.providers.templates.base_oauth.on_connection_revoked")
     @patch("httpx.post")
+    def test_rotation_between_check_and_revoke_does_not_revoke(
+        self,
+        mock_post: MagicMock,
+        mock_on_revoked: MagicMock,
+        whoop_oauth: WhoopOAuth,
+        db: Session,
+    ) -> None:
+        """Should not revoke when the rotation commits after the check but before the revoke."""
+        # Arrange
+        user = UserFactory()
+        connection = UserConnectionFactory(
+            user=user,
+            provider="whoop",
+            access_token="stale_access_token",
+            refresh_token="racing_refresh_token",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+        mock_post.return_value.raise_for_status.side_effect = _http_error(400)
+
+        real_get_rotated_token = whoop_oauth._get_rotated_token
+        checks: list[int] = []
+
+        def rotate_after_first_check(*args: object, **kwargs: object) -> OAuthTokenResponse | None:
+            """First check sees the rejected token, then the winner commits its rotation."""
+            if checks:
+                return real_get_rotated_token(db, user.id, "racing_refresh_token")
+            checks.append(1)
+            connection.access_token = "winner_access_token"
+            connection.refresh_token = "rotated_refresh_token"
+            connection.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+            db.add(connection)
+            db.commit()
+            return None
+
+        # Act
+        with patch.object(whoop_oauth, "_get_rotated_token", side_effect=rotate_after_first_check):
+            token_response = whoop_oauth.refresh_access_token(db, user.id, "racing_refresh_token")
+
+        # Assert - the guarded revoke matched no rows, so the connection survived
+        assert token_response.access_token == "winner_access_token"
+        assert connection.status == ConnectionStatus.ACTIVE
+        mock_on_revoked.assert_not_called()
+
+    @patch("app.services.providers.templates.base_oauth.on_connection_revoked")
+    @patch("httpx.post")
     def test_already_revoked_connection_is_not_revoked_twice(
         self,
         mock_post: MagicMock,
