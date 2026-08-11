@@ -423,6 +423,18 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     return metrics, cleaned_stages
 
 
+def _in_bed_bounds(stages: list[SleepStateStage]) -> tuple[datetime, datetime] | None:
+    """Bounds of the in_bed union: earliest in_bed start and latest in_bed end.
+
+    Returns None when the session has no in_bed samples.
+    """
+    in_bed = [s for s in stages if s.stage == SleepStageType.IN_BED]
+    if not in_bed:
+        return None
+
+    return min(s.start_time for s in in_bed), max(s.end_time for s in in_bed)
+
+
 def persist_sleep(
     db_session: DbSession,
     user_id: str,
@@ -451,6 +463,14 @@ def persist_sleep(
     if cleaned_stages:
         start_time = cleaned_stages[0].start_time
         end_time = cleaned_stages[-1].end_time
+        # The hypnogram can cover only part of the night while in_bed samples cover
+        # all of it (e.g. a Whoop night relayed through Apple Health with asleep
+        # stages for a sub-window only).  Widen the event window to the in-bed union
+        # so the record is never shorter than the time-in-bed it reports.
+        in_bed_bounds = _in_bed_bounds(state.stages)
+        if in_bed_bounds:
+            start_time = min(start_time, in_bed_bounds[0])
+            end_time = max(end_time, in_bed_bounds[1])
     else:
         end_time = state.end_time
         start_time = state.start_time

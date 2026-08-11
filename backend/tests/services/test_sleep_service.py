@@ -28,6 +28,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.apple.healthkit.sleep_service import (
     _calculate_final_metrics,
+    _in_bed_bounds,
     handle_sleep_data,
     persist_sleep,
 )
@@ -390,8 +391,190 @@ class TestCalculateFinalMetrics:
         assert stage_types == {SleepStageType.DEEP, SleepStageType.LIGHT}
 
 
+class TestInBedBounds:
+    """Tests for _in_bed_bounds, which drives the persisted event window."""
+
+    def test_no_in_bed_samples(self) -> None:
+        """Sessions without in_bed samples have no in-bed bounds."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.LIGHT,
+                start_time=_dt("2026-05-01T23:00:00Z"),
+                end_time=_dt("2026-05-02T01:00:00Z"),
+            ),
+        ]
+
+        assert _in_bed_bounds(stages) is None
+
+    def test_bounds_span_all_in_bed_intervals(self) -> None:
+        """Bounds are the earliest in_bed start and the latest in_bed end."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-01T23:30:00Z"),
+                end_time=_dt("2026-05-02T02:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-01T22:55:00Z"),
+                end_time=_dt("2026-05-01T23:20:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-02T02:30:00Z"),
+                end_time=_dt("2026-05-02T05:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.DEEP,
+                start_time=_dt("2026-05-02T00:00:00Z"),
+                end_time=_dt("2026-05-02T01:00:00Z"),
+            ),
+        ]
+
+        bounds = _in_bed_bounds(stages)
+
+        assert bounds == (_dt("2026-05-01T22:55:00Z"), _dt("2026-05-02T05:00:00Z"))
+
+
 class TestPersistSleep:
     """Tests for persist_sleep with different stage compositions."""
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_event_window_covers_in_bed_when_hypnogram_is_shorter(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """Regression: event bounds must cover the in-bed window, not just the stages.
+
+        Mirrors a production case where a Whoop night was relayed through Apple
+        Health: HealthKit had detailed asleep-stage samples for a 3h32m sub-window
+        only, while in_bed samples covered the full 6h05m night.  Before the fix the
+        event spanned 3h32m while reporting 365 min time in bed and 55% efficiency —
+        a record shorter than its own time in bed.
+        """
+        user_id = str(uuid4())
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Whoop",
+            device_model="iPhone15,2",
+            provider="apple",
+            start_time=_dt("2026-05-01T22:55:00Z"),
+            end_time=_dt("2026-05-02T05:00:00Z"),
+            last_start_timestamp=_dt("2026-05-02T01:42:00Z"),
+            last_end_timestamp=_dt("2026-05-02T02:32:00Z"),
+            stages=[
+                # Full-night in_bed coverage (22:55 → 05:00 = 365 min)
+                SleepStateStage(
+                    stage=SleepStageType.IN_BED,
+                    start_time=_dt("2026-05-01T22:55:00Z"),
+                    end_time=_dt("2026-05-02T05:00:00Z"),
+                ),
+                # Detailed stages only for 23:00 → 02:32 (3h32m)
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-01T23:00:00Z"),
+                    end_time=_dt("2026-05-02T00:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.DEEP,
+                    start_time=_dt("2026-05-02T00:00:00Z"),
+                    end_time=_dt("2026-05-02T01:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.REM,
+                    start_time=_dt("2026-05-02T01:00:00Z"),
+                    end_time=_dt("2026-05-02T01:30:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.AWAKE,
+                    start_time=_dt("2026-05-02T01:30:00Z"),
+                    end_time=_dt("2026-05-02T01:42:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-02T01:42:00Z"),
+                    end_time=_dt("2026-05-02T02:32:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=True)
+
+        record: EventRecordCreate = mock_event_service.create_or_merge_sleep.call_args[0][2]
+        detail: EventRecordDetailCreate = mock_event_service.create_or_merge_sleep.call_args[0][3]
+
+        # Event window spans the in-bed union, not the 3h32m hypnogram window
+        assert record.start_datetime == _dt("2026-05-01T22:55:00Z")
+        assert record.end_datetime == _dt("2026-05-02T05:00:00Z")
+        assert record.duration_seconds == 365 * 60
+
+        # Metrics are unchanged by the wider window
+        assert detail.sleep_time_in_bed_minutes == 365
+        assert detail.sleep_total_duration_minutes == 200  # 60 light + 60 deep + 30 rem + 50 light
+        assert detail.sleep_awake_minutes == 12
+        assert detail.sleep_efficiency_score is not None
+        assert float(detail.sleep_efficiency_score) == pytest.approx(200 / 365 * 100, abs=0.01)
+
+        # The record is self-consistent: the window is at least the time in bed
+        assert record.duration_seconds >= detail.sleep_time_in_bed_minutes * 60
+
+        # The hypnogram itself is untouched — no stage is stretched to the new bounds
+        assert detail.sleep_stages is not None
+        assert len(detail.sleep_stages) == 5
+        assert detail.sleep_stages[0].start_time == _dt("2026-05-01T23:00:00Z")
+        assert detail.sleep_stages[-1].end_time == _dt("2026-05-02T02:32:00Z")
+        assert all(s.stage != SleepStageType.IN_BED for s in detail.sleep_stages)
+        mock_delete_state.assert_called_once_with(user_id)
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_event_window_keeps_stage_bounds_when_stages_are_wider(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """Stage samples outside the in_bed window still define the event bounds."""
+        user_id = str(uuid4())
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-05-05T22:00:00Z"),
+            end_time=_dt("2026-05-06T06:30:00Z"),
+            last_start_timestamp=_dt("2026-05-06T05:00:00Z"),
+            last_end_timestamp=_dt("2026-05-06T06:30:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.IN_BED,
+                    start_time=_dt("2026-05-05T23:00:00Z"),
+                    end_time=_dt("2026-05-06T06:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-05T22:00:00Z"),
+                    end_time=_dt("2026-05-06T02:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.DEEP,
+                    start_time=_dt("2026-05-06T02:00:00Z"),
+                    end_time=_dt("2026-05-06T06:30:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=True)
+
+        record: EventRecordCreate = mock_event_service.create_or_merge_sleep.call_args[0][2]
+
+        assert record.start_datetime == _dt("2026-05-05T22:00:00Z")
+        assert record.end_datetime == _dt("2026-05-06T06:30:00Z")
 
     @patch("app.services.apple.healthkit.sleep_service.event_record_service")
     @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
