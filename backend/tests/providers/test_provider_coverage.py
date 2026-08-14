@@ -27,6 +27,7 @@ from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
 from app.schemas.model_crud.activities import EventRecordDetailCreate
 from app.services.providers.factory import ProviderFactory
+from app.services.providers.google.health_api.metrics import METRICS as GOOGLE_HEALTH_API_METRICS
 
 PROVIDERS_DIR = Path("app/services/providers")
 
@@ -42,6 +43,8 @@ SDK_SHARED_FILES = (
     Path("app/services/apple/healthkit/sleep_service.py"),
     Path("app/services/apple/apple_xml/xml_service.py"),
 )
+# Apple-only: menstrual cycle assembly from HealthKit category samples.
+APPLE_ONLY_SHARED_FILES = (Path("app/services/apple/healthkit/menstrual_service.py"),)
 
 # EventRecordDetail fields that are NOT part of the coverage matrix (structural
 # or composite objects rather than scalar metric coverage).
@@ -78,6 +81,8 @@ def _impl_source(provider: str) -> str:
     paths = [PROVIDERS_DIR / provider / fname for fname in IMPL_FILES]
     if provider in SDK_PROVIDERS:
         paths += list(SDK_SHARED_FILES)
+    if provider == "apple":
+        paths += list(APPLE_ONLY_SHARED_FILES)
     return "\n".join(p.read_text() for p in paths if p.exists())
 
 
@@ -137,12 +142,24 @@ _SDK_METRIC_MAP = {
 }
 
 
+# SDK providers that also pull cloud series contribute extra timeseries beyond the
+# SDK maps. google is hybrid: Health Connect SDK + Health API daily rollups.
+_EXTRA_SDK_SERIES: dict[str, frozenset[SeriesType]] = {
+    "google": frozenset(s for m in GOOGLE_HEALTH_API_METRICS for s in m.series_types()),
+}
+
+
 @pytest.mark.parametrize("provider", sorted(SDK_PROVIDERS))
 def test_sdk_timeseries_match_maps(provider: str) -> None:
     cov = _load_coverage(provider)
-    expected = frozenset(_SDK_METRIC_MAP[provider].values()) | frozenset(WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE.values())
+    expected = (
+        frozenset(_SDK_METRIC_MAP[provider].values())
+        | frozenset(WORKOUT_STATISTIC_TYPE_TO_SERIES_TYPE.values())
+        | _EXTRA_SDK_SERIES.get(provider, frozenset())
+    )
     assert _timeseries(cov) == expected, (
-        f"{provider}: TIMESERIES must equal the union of the provider-specific SDK metric + workout-statistic maps"
+        f"{provider}: TIMESERIES must equal the union of the provider-specific SDK metric + "
+        f"workout-statistic maps (plus cloud rollup series for hybrid providers)"
     )
 
 

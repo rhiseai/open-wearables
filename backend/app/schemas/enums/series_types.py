@@ -156,6 +156,30 @@ class SeriesType(str, Enum):
     garmin_body_battery = "garmin_body_battery"  # Garmin body battery (0-100)
 
     # =========================================================================
+    # NUTRITION (IDs 240-259)
+    # =========================================================================
+    dietary_energy_consumed = "dietary_energy_consumed"
+    dietary_protein = "dietary_protein"
+    dietary_carbohydrates = "dietary_carbohydrates"
+    dietary_fat_total = "dietary_fat_total"
+    dietary_fiber = "dietary_fiber"
+    dietary_sugar = "dietary_sugar"
+    dietary_caffeine = "dietary_caffeine"
+
+    # =========================================================================
+    # REPRODUCTIVE HEALTH (IDs 260-279)
+    # =========================================================================
+    menstrual_flow = "menstrual_flow"
+    cervical_mucus_quality = "cervical_mucus_quality"
+    ovulation_test_result = "ovulation_test_result"
+    basal_body_temperature = "basal_body_temperature"
+
+    # =========================================================================
+    # MINDFULNESS (IDs 280-299)
+    # =========================================================================
+    mindful_minutes = "mindful_minutes"
+
+    # =========================================================================
     # OTHER (IDs 500-)
     # =========================================================================
 
@@ -298,6 +322,27 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (222, SeriesType.garmin_fitness_age, "years"),
     (223, SeriesType.garmin_body_battery, "percent"),
     # -------------------------------------------------------------------------
+    # NUTRITION (IDs 240-259)
+    # -------------------------------------------------------------------------
+    (240, SeriesType.dietary_energy_consumed, "kcal"),
+    (241, SeriesType.dietary_protein, "g"),
+    (242, SeriesType.dietary_carbohydrates, "g"),
+    (243, SeriesType.dietary_fat_total, "g"),
+    (244, SeriesType.dietary_fiber, "g"),
+    (245, SeriesType.dietary_sugar, "g"),
+    (246, SeriesType.dietary_caffeine, "mg"),
+    # -------------------------------------------------------------------------
+    # REPRODUCTIVE HEALTH (IDs 260-279)
+    # -------------------------------------------------------------------------
+    (260, SeriesType.menstrual_flow, "score"),
+    (261, SeriesType.cervical_mucus_quality, "score"),
+    (262, SeriesType.ovulation_test_result, "score"),
+    (263, SeriesType.basal_body_temperature, "celsius"),
+    # -------------------------------------------------------------------------
+    # MINDFULNESS (IDs 280-299)
+    # -------------------------------------------------------------------------
+    (280, SeriesType.mindful_minutes, "minutes"),
+    # -------------------------------------------------------------------------
     # OTHER (IDs 500-)
     # -------------------------------------------------------------------------
     (500, SeriesType.electrodermal_activity, "count"),
@@ -357,6 +402,9 @@ _CATEGORY_RANGES: list[tuple[range, str]] = [
     (range(180, 200), "Activity - Generic"),
     (range(200, 220), "Environmental"),
     (range(220, 240), "Provider-Specific"),
+    (range(240, 260), "Nutrition"),
+    (range(260, 280), "Reproductive Health"),
+    (range(280, 300), "Mindfulness"),
     (range(500, 600), "Other"),
 ]
 

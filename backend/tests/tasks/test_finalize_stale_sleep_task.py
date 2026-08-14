@@ -1,8 +1,9 @@
 """
 Tests for finalize_stale_sleeps Celery task.
 
-Tests the background task that finalizes sleep sessions that have been
-inactive in Redis for longer than the configured threshold.
+Tests the housekeeping task that closes Redis sleep sessions that have been
+quiet longer than the configured gap threshold (sessions are already flushed
+to Postgres on every SDK batch).
 """
 
 from datetime import datetime, timedelta, timezone

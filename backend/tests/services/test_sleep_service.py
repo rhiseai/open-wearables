@@ -2,14 +2,14 @@
 Tests for Apple HealthKit sleep service processing.
 
 Tests the sleep pipeline (handle_sleep_data, _apply_transition, _calculate_final_metrics,
-finish_sleep) using synthetic payloads modeled after real Apple HealthKit SDK data.
+persist_sleep) using synthetic payloads modeled after real Apple HealthKit SDK data.
 
 Apple Watch sleep data patterns:
 - Older Apple Watch (pre-watchOS 9): only "in_bed" and "sleeping" stages
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -28,8 +28,9 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.apple.healthkit.sleep_service import (
     _calculate_final_metrics,
-    finish_sleep,
+    _in_bed_bounds,
     handle_sleep_data,
+    persist_sleep,
 )
 
 
@@ -390,26 +391,205 @@ class TestCalculateFinalMetrics:
         assert stage_types == {SleepStageType.DEEP, SleepStageType.LIGHT}
 
 
-class TestFinishSleep:
-    """Tests for finish_sleep with different stage compositions."""
+class TestInBedBounds:
+    """Tests for _in_bed_bounds, which drives the persisted event window."""
+
+    def test_no_in_bed_samples(self) -> None:
+        """Sessions without in_bed samples have no in-bed bounds."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.LIGHT,
+                start_time=_dt("2026-05-01T23:00:00Z"),
+                end_time=_dt("2026-05-02T01:00:00Z"),
+            ),
+        ]
+
+        assert _in_bed_bounds(stages) is None
+
+    def test_bounds_span_all_in_bed_intervals(self) -> None:
+        """Bounds are the earliest in_bed start and the latest in_bed end."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-01T23:30:00Z"),
+                end_time=_dt("2026-05-02T02:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-01T22:55:00Z"),
+                end_time=_dt("2026-05-01T23:20:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.IN_BED,
+                start_time=_dt("2026-05-02T02:30:00Z"),
+                end_time=_dt("2026-05-02T05:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.DEEP,
+                start_time=_dt("2026-05-02T00:00:00Z"),
+                end_time=_dt("2026-05-02T01:00:00Z"),
+            ),
+        ]
+
+        bounds = _in_bed_bounds(stages)
+
+        assert bounds == (_dt("2026-05-01T22:55:00Z"), _dt("2026-05-02T05:00:00Z"))
+
+
+class TestPersistSleep:
+    """Tests for persist_sleep with different stage compositions."""
 
     @patch("app.services.apple.healthkit.sleep_service.event_record_service")
     @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
-    def test_finish_sleep_with_sleeping_stages(
+    def test_event_window_covers_in_bed_when_hypnogram_is_shorter(
         self,
         mock_delete_state: MagicMock,
         mock_event_service: MagicMock,
         db: Session,
     ) -> None:
-        """Finish sleep with old-style 'sleeping' data should set correct totals."""
+        """Regression: event bounds must cover the in-bed window, not just the stages.
+
+        Mirrors a production case where a Whoop night was relayed through Apple
+        Health: HealthKit had detailed asleep-stage samples for a 3h32m sub-window
+        only, while in_bed samples covered the full 6h05m night.  Before the fix the
+        event spanned 3h32m while reporting 365 min time in bed and 55% efficiency —
+        a record shorter than its own time in bed.
+        """
         user_id = str(uuid4())
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        mock_event_service.find_adjacent_sleep_record.return_value = None
 
         state = SleepState(
             uuid=str(uuid4()),
+            source_name="Whoop",
+            device_model="iPhone15,2",
+            provider="apple",
+            start_time=_dt("2026-05-01T22:55:00Z"),
+            end_time=_dt("2026-05-02T05:00:00Z"),
+            last_start_timestamp=_dt("2026-05-02T01:42:00Z"),
+            last_end_timestamp=_dt("2026-05-02T02:32:00Z"),
+            stages=[
+                # Full-night in_bed coverage (22:55 → 05:00 = 365 min)
+                SleepStateStage(
+                    stage=SleepStageType.IN_BED,
+                    start_time=_dt("2026-05-01T22:55:00Z"),
+                    end_time=_dt("2026-05-02T05:00:00Z"),
+                ),
+                # Detailed stages only for 23:00 → 02:32 (3h32m)
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-01T23:00:00Z"),
+                    end_time=_dt("2026-05-02T00:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.DEEP,
+                    start_time=_dt("2026-05-02T00:00:00Z"),
+                    end_time=_dt("2026-05-02T01:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.REM,
+                    start_time=_dt("2026-05-02T01:00:00Z"),
+                    end_time=_dt("2026-05-02T01:30:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.AWAKE,
+                    start_time=_dt("2026-05-02T01:30:00Z"),
+                    end_time=_dt("2026-05-02T01:42:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-02T01:42:00Z"),
+                    end_time=_dt("2026-05-02T02:32:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=True)
+
+        record: EventRecordCreate = mock_event_service.create_or_merge_sleep.call_args[0][2]
+        detail: EventRecordDetailCreate = mock_event_service.create_or_merge_sleep.call_args[0][3]
+
+        # Event window spans the in-bed union, not the 3h32m hypnogram window
+        assert record.start_datetime == _dt("2026-05-01T22:55:00Z")
+        assert record.end_datetime == _dt("2026-05-02T05:00:00Z")
+        assert record.duration_seconds == 365 * 60
+
+        # Metrics are unchanged by the wider window
+        assert detail.sleep_time_in_bed_minutes == 365
+        assert detail.sleep_total_duration_minutes == 200  # 60 light + 60 deep + 30 rem + 50 light
+        assert detail.sleep_awake_minutes == 12
+        assert detail.sleep_efficiency_score is not None
+        assert float(detail.sleep_efficiency_score) == pytest.approx(200 / 365 * 100, abs=0.01)
+
+        # The record is self-consistent: the window is at least the time in bed
+        assert record.duration_seconds >= detail.sleep_time_in_bed_minutes * 60
+
+        # The hypnogram itself is untouched — no stage is stretched to the new bounds
+        assert detail.sleep_stages is not None
+        assert len(detail.sleep_stages) == 5
+        assert detail.sleep_stages[0].start_time == _dt("2026-05-01T23:00:00Z")
+        assert detail.sleep_stages[-1].end_time == _dt("2026-05-02T02:32:00Z")
+        assert all(s.stage != SleepStageType.IN_BED for s in detail.sleep_stages)
+        mock_delete_state.assert_called_once_with(user_id)
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_event_window_keeps_stage_bounds_when_stages_are_wider(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """Stage samples outside the in_bed window still define the event bounds."""
+        user_id = str(uuid4())
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-05-05T22:00:00Z"),
+            end_time=_dt("2026-05-06T06:30:00Z"),
+            last_start_timestamp=_dt("2026-05-06T05:00:00Z"),
+            last_end_timestamp=_dt("2026-05-06T06:30:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.IN_BED,
+                    start_time=_dt("2026-05-05T23:00:00Z"),
+                    end_time=_dt("2026-05-06T06:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-05T22:00:00Z"),
+                    end_time=_dt("2026-05-06T02:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.DEEP,
+                    start_time=_dt("2026-05-06T02:00:00Z"),
+                    end_time=_dt("2026-05-06T06:30:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=True)
+
+        record: EventRecordCreate = mock_event_service.create_or_merge_sleep.call_args[0][2]
+
+        assert record.start_datetime == _dt("2026-05-05T22:00:00Z")
+        assert record.end_datetime == _dt("2026-05-06T06:30:00Z")
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_persist_sleep_with_sleeping_stages(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """Persist sleep with old-style 'sleeping' data should set correct totals."""
+        user_id = str(uuid4())
+        state_uuid = str(uuid4())
+
+        state = SleepState(
+            uuid=state_uuid,
             source_name="Apple Watch",
             device_model="Watch3,3",
             provider="apple",
@@ -437,41 +617,75 @@ class TestFinishSleep:
             ],
         )
 
-        finish_sleep(db, user_id, state)
+        persist_sleep(db, user_id, state, close=True)
 
-        # Verify create was called
-        mock_event_service.create.assert_called_once()
-        mock_event_service.create_detail.assert_called_once()
+        mock_event_service.create_or_merge_sleep.assert_called_once()
+        call_args = mock_event_service.create_or_merge_sleep.call_args
+        record: EventRecordCreate = call_args[0][2]
+        detail: EventRecordDetailCreate = call_args[0][3]
 
-        # Check the detail payload
-        detail_call = mock_event_service.create_detail.call_args
-        detail = detail_call[0][1]  # second positional arg
-
-        # Total duration should include sleeping time
+        assert record.external_id == state_uuid
         assert detail.sleep_total_duration_minutes > 0
-        # Deep/rem/light should all be 0 (no breakdown available)
         assert detail.sleep_deep_minutes == 0
         assert detail.sleep_rem_minutes == 0
         assert detail.sleep_light_minutes == 0
-        # Stages should be present
         assert detail.sleep_stages is not None
         assert len(detail.sleep_stages) == 3
         assert all(s.stage == SleepStageType.SLEEPING for s in detail.sleep_stages)
+        mock_delete_state.assert_called_once_with(user_id)
 
     @patch("app.services.apple.healthkit.sleep_service.event_record_service")
     @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
-    def test_finish_sleep_with_detailed_stages(
+    def test_persist_sleep_keeps_redis_when_not_closing(
         self,
         mock_delete_state: MagicMock,
         mock_event_service: MagicMock,
         db: Session,
     ) -> None:
-        """Finish sleep with detailed stages should set deep/rem/light correctly."""
+        """close=False flushes to DB but leaves Redis state for further accumulation."""
         user_id = str(uuid4())
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        mock_event_service.find_adjacent_sleep_record.return_value = None
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-03-10T22:15:00Z"),
+            end_time=_dt("2026-03-11T02:30:00Z"),
+            last_start_timestamp=_dt("2026-03-11T01:25:00Z"),
+            last_end_timestamp=_dt("2026-03-11T02:30:00Z"),
+            light_seconds=2700.0,
+            deep_seconds=9300.0,
+            rem_seconds=2700.0,
+            awake_seconds=600.0,
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-03-10T22:15:00Z"),
+                    end_time=_dt("2026-03-10T23:00:00Z"),
+                ),
+                SleepStateStage(
+                    stage=SleepStageType.DEEP,
+                    start_time=_dt("2026-03-10T23:00:00Z"),
+                    end_time=_dt("2026-03-11T00:30:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=False)
+
+        mock_event_service.create_or_merge_sleep.assert_called_once()
+        mock_delete_state.assert_not_called()
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_persist_sleep_with_detailed_stages(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """Persist sleep with detailed stages should set deep/rem/light correctly."""
+        user_id = str(uuid4())
 
         state = SleepState(
             uuid=str(uuid4()),
@@ -515,9 +729,9 @@ class TestFinishSleep:
             ],
         )
 
-        finish_sleep(db, user_id, state)
+        persist_sleep(db, user_id, state, close=True)
 
-        detail = mock_event_service.create_detail.call_args[0][1]
+        detail: EventRecordDetailCreate = mock_event_service.create_or_merge_sleep.call_args[0][3]
 
         assert detail.sleep_deep_minutes == 155
         assert detail.sleep_light_minutes == 45
@@ -545,6 +759,7 @@ class TestHandleSleepDataIntegration:
         - 3 sleeping segments (Watch3,3)
         - 1 in_bed segment (iPhone15,2)
         All within gap threshold → single session.
+        Historical end_time → flush with close=True.
         """
         user_id = str(uuid4())
 
@@ -552,20 +767,17 @@ class TestHandleSleepDataIntegration:
         mock_redis.get.return_value = None  # No existing state
         mock_redis_func.return_value = mock_redis
 
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        mock_event_service.find_adjacent_sleep_record.return_value = None
-
         request = SyncRequest.model_validate(OLD_WATCH_PAYLOAD)
 
         handle_sleep_data(db, request, user_id)
 
-        # Sleep state should be saved to Redis (session not yet finalized —
-        # that happens via finalize_stale_sleeps.delay())
+        # Sleep state should be saved to Redis before flush
         assert mock_redis.set.called
 
-        # The finalize task should be dispatched
+        # Eager flush to Postgres via the shared create_or_merge_sleep path
+        mock_event_service.create_or_merge_sleep.assert_called_once()
+
+        # The finalize task should be dispatched for housekeeping
         mock_finalize.delay.assert_called_once()
 
         # Verify saved state: grab the last set() call's value
@@ -602,14 +814,12 @@ class TestHandleSleepDataIntegration:
         mock_redis.get.return_value = None
         mock_redis_func.return_value = mock_redis
 
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        mock_event_service.find_adjacent_sleep_record.return_value = None
-
         request = SyncRequest.model_validate(DETAILED_STAGES_PAYLOAD)
 
         handle_sleep_data(db, request, user_id)
+
+        # Eager flush on every batch
+        mock_event_service.create_or_merge_sleep.assert_called_once()
 
         # Verify saved state
         last_set_call = mock_redis.set.call_args_list[-1]
@@ -627,6 +837,53 @@ class TestHandleSleepDataIntegration:
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.REM in stage_types
         assert SleepStageType.AWAKE in stage_types
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.persist_sleep")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_fresh_night_batch_flushes_without_closing_redis(
+        self,
+        mock_redis_func: MagicMock,
+        mock_persist: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+    ) -> None:
+        """A just-ended night (within quiet gap) flushes with close=False."""
+        user_id = str(uuid4())
+        now = datetime.now(timezone.utc)
+        start = now - timedelta(hours=1)
+        end = now - timedelta(minutes=10)
+
+        fresh_payload = {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": now.isoformat().replace("+00:00", "Z"),
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    {
+                        "id": "F001",
+                        "stage": "light",
+                        "startDate": start.isoformat().replace("+00:00", "Z"),
+                        "endDate": end.isoformat().replace("+00:00", "Z"),
+                        "source": {"device_type": "watch", "device_model": "Watch7,1"},
+                    },
+                ],
+            },
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+
+        handle_sleep_data(db, SyncRequest.model_validate(fresh_payload), user_id)
+
+        mock_persist.assert_called_once()
+        assert mock_persist.call_args.kwargs["close"] is False
+        # Redis state must remain (set was called; delete not part of persist mock)
+        assert mock_redis.set.called
+        mock_finalize.delay.assert_called_once()
 
 
 class TestSDKSyncEndpointSleep:
@@ -709,11 +966,6 @@ class TestNoIntermediateRedisSaves:
         mock_redis.get.return_value = None
         mock_redis_func.return_value = mock_redis
 
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        mock_event_service.find_adjacent_sleep_record.return_value = None
-
         request = SyncRequest.model_validate(DETAILED_STAGES_PAYLOAD)
 
         handle_sleep_data(db, request, user_id)
@@ -739,31 +991,30 @@ class TestHistoricalBulkUploadMerging:
 
     Root cause: Apple sends one night's sleep as many small consecutive payloads
     (each ending where the next begins).  When uploaded hours after recording the
-    synchronous stale-check fires on every payload (now - end_time >> 2 h),
-    immediately finalizing each payload as its own separate session.
+    quiet-gap check fires on every payload (now - end_time >> 2 h),
+    immediately closing each Redis session.
 
-    The fix: finish_sleep() queries for an adjacent existing record and merges
-    instead of always inserting.  Combined with the per-user Redis lock that
-    serializes concurrent tasks, this guarantees one DB record per night
-    regardless of how many payloads Apple sends.
+    The fix: persist_sleep() uses create_or_merge_sleep which merges adjacent
+    sessions (or updates in place for the same external_id). Combined with the
+    per-user Redis lock that serializes concurrent tasks, this guarantees one
+    DB record per night regardless of how many payloads Apple sends.
     """
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
     @patch("app.services.apple.healthkit.sleep_service.event_record_service")
     @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
-    def test_second_payload_merges_with_adjacent_db_record(
+    def test_second_payload_merges_via_create_or_merge_sleep(
         self,
         mock_redis_func: MagicMock,
         mock_event_service: MagicMock,
         mock_finalize: MagicMock,
         db: Session,
     ) -> None:
-        """When payload B arrives after payload A has already been finalized to the
-        DB, finish_sleep should find the adjacent record, delete it and create a
-        new merged record covering both sessions.
+        """When payload B arrives after payload A has already been written to the
+        DB, persist_sleep should call create_or_merge_sleep with B's stages so the
+        shared merge path can extend the adjacent record.
 
-        Payload A: 23:00–01:00 (light + deep)
-        Payload B: 01:00–06:00 (rem + light), chains directly onto A
+        Payload B: 01:00–06:00 (rem + light), chains directly onto A (23:00–01:00).
         """
 
         user_id = str(uuid4())
@@ -794,48 +1045,100 @@ class TestHistoricalBulkUploadMerging:
             },
         }
 
-        # Simulate the adjacent record that payload A already wrote to the DB
-        mock_adjacent = MagicMock()
-        mock_adjacent.id = uuid4()
-        mock_adjacent.start_datetime = _dt("2026-03-22T23:00:00Z")
-        mock_adjacent.end_datetime = _dt("2026-03-23T01:00:00Z")
-        mock_adjacent.detail = MagicMock()
-        mock_adjacent.detail.sleep_stages = [
-            {"stage": "light", "start_time": "2026-03-22T23:00:00+00:00", "end_time": "2026-03-22T23:45:00+00:00"},
-            {"stage": "deep", "start_time": "2026-03-22T23:45:00+00:00", "end_time": "2026-03-23T01:00:00+00:00"},
-        ]
-
         mock_redis = MagicMock()
         mock_redis.get.return_value = None  # No active Redis state for this user
         mock_redis_func.return_value = mock_redis
 
-        mock_record = MagicMock()
-        mock_record.id = uuid4()
-        mock_event_service.create.return_value = mock_record
-        # First call to find_adjacent returns the payload-A record; second call (if any) returns None
-        mock_event_service.find_adjacent_sleep_record.return_value = mock_adjacent
-
         handle_sleep_data(db, SyncRequest.model_validate(payload_b), user_id)
 
-        # find_adjacent_sleep_record must have been called to look for a matching record
-        mock_event_service.find_adjacent_sleep_record.assert_called_once()
+        mock_event_service.create_or_merge_sleep.assert_called_once()
+        call_args = mock_event_service.create_or_merge_sleep.call_args
+        record: EventRecordCreate = call_args[0][2]
+        detail: EventRecordDetailCreate = call_args[0][3]
 
-        # The old record must be deleted before the merged one is created
-        mock_event_service.delete.assert_called_once_with(db, mock_adjacent.id)
+        # Payload B window
+        assert record.start_datetime == _dt("2026-03-23T01:00:00Z")
+        assert record.end_datetime == _dt("2026-03-23T06:00:00Z")
+        assert record.external_id == "B003"  # first sample id becomes state.uuid
 
-        # A new (merged) record must be created
-        mock_event_service.create.assert_called_once()
-        created_record: EventRecordCreate = mock_event_service.create.call_args[0][1]
+        assert detail.sleep_stages is not None
+        stage_types = {s.stage for s in detail.sleep_stages}
+        assert SleepStageType.LIGHT in stage_types
+        assert SleepStageType.REM in stage_types
 
-        # Merged window covers both A and B
-        assert created_record.start_datetime <= _dt("2026-03-22T23:00:00Z")
-        assert created_record.end_datetime >= _dt("2026-03-23T06:00:00Z")
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_follow_up_batch_reuses_same_external_id(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+    ) -> None:
+        """A second batch for the same Redis session re-flushes with the same
+        external_id so create_or_merge_sleep replaces detail in place (no double-count).
+        """
+        user_id = str(uuid4())
+        session_uuid = str(uuid4())
+        now = datetime.now(timezone.utc)
 
-        # Detail must contain stages from both payloads
-        mock_event_service.create_detail.assert_called_once()
-        created_detail: EventRecordDetailCreate = mock_event_service.create_detail.call_args[0][1]
-        assert created_detail.sleep_stages is not None
-        stage_types = {s.stage for s in created_detail.sleep_stages}
+        # Existing Redis state from an earlier mid-night sync
+        existing_state = SleepState(
+            uuid=session_uuid,
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=now - timedelta(hours=3),
+            end_time=now - timedelta(hours=1),
+            last_start_timestamp=now - timedelta(hours=3),
+            last_end_timestamp=now - timedelta(hours=1),
+            light_seconds=3600.0,
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=now - timedelta(hours=3),
+                    end_time=now - timedelta(hours=1),
+                ),
+            ],
+        )
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = existing_state.model_dump_json()
+        mock_redis_func.return_value = mock_redis
+
+        follow_up = {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": now.isoformat().replace("+00:00", "Z"),
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    {
+                        "id": "NEW1",
+                        "stage": "deep",
+                        "startDate": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+                        "endDate": (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                        "source": {"device_type": "watch", "device_model": "Watch7,1"},
+                    },
+                ],
+            },
+        }
+
+        handle_sleep_data(db, SyncRequest.model_validate(follow_up), user_id)
+
+        mock_event_service.create_or_merge_sleep.assert_called_once()
+        record: EventRecordCreate = mock_event_service.create_or_merge_sleep.call_args[0][2]
+        detail: EventRecordDetailCreate = mock_event_service.create_or_merge_sleep.call_args[0][3]
+
+        # Same Redis session uuid → same external_id for in-place update
+        assert record.external_id == session_uuid
+        # Full accumulated stages (old light + new deep), not just the new batch
+        assert detail.sleep_stages is not None
+        stage_types = {s.stage for s in detail.sleep_stages}
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.DEEP in stage_types
-        assert SleepStageType.REM in stage_types
+        # Totals reflect union, not a double-counted sum of two separate flushes
+        assert detail.sleep_light_minutes == 120
+        assert detail.sleep_deep_minutes == 50

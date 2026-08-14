@@ -1,5 +1,5 @@
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from logging import Logger
 from pathlib import Path
 from typing import Any, Generator
@@ -8,6 +8,8 @@ from xml.etree import ElementTree as ET
 
 from app.config import settings
 from app.constants.series_types.sdk import SleepPhase, get_series_type_from_metric_type
+from app.constants.series_types.sdk.category_types import AppleCategoryType
+from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.constants.workout_types import get_unified_apple_workout_type_xml
 from app.schemas.enums import SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
@@ -25,7 +27,21 @@ from app.schemas.providers.mobile_sdk import (
     SyncRequest,
     SyncRequestData,
 )
+from app.schemas.providers.mobile_sdk.sync_request import MetricRecord
+from app.services.apple.sample_normalization import (
+    normalize_apple_sample_value,
+    parse_apple_raw_value,
+)
 from app.utils.structured_logging import log_structured
+
+_MENSTRUAL_TYPES = {
+    AppleCategoryType.MENSTRUAL_FLOW.value,
+    SDKMetricType.APPLE_MENSTRUAL_FLOW.value,
+}
+_MINDFUL_TYPES = {
+    AppleCategoryType.MINDFUL_SESSION.value,
+    SDKMetricType.APPLE_MINDFUL_SESSION.value,
+}
 
 
 class XMLService:
@@ -34,6 +50,8 @@ class XMLService:
         self.chunk_size: int = settings.xml_chunk_size
         self.log: Logger = log
         self.stats: XMLParseStats = XMLParseStats()
+        # Collected across the whole parse for menstrual_cycle assembly after import.
+        self.menstrual_records: list[MetricRecord] = []
 
     DATE_FIELDS: tuple[str, ...] = ("startDate", "endDate", "creationDate")
     RECORD_COLUMNS: tuple[str, ...] = (
@@ -85,38 +103,6 @@ class XMLService:
                     raise ValueError(f"Invalid date format for field {date_field}: {document[date_field]}") from e
         return document
 
-    def _parse_decimal_value(self, raw_value: str | None, metric_type: str) -> Decimal | None:
-        """Safely parse a decimal value from string.
-
-        Returns None if the value cannot be parsed, logging a warning with context.
-        """
-        if raw_value is None:
-            self.log.debug("Missing value for metric type %s", metric_type)
-            return None
-
-        # Handle empty strings
-        if not raw_value.strip():
-            self.log.debug("Empty value for metric type %s", metric_type)
-            return None
-
-        try:
-            return Decimal(raw_value)
-        except InvalidOperation:
-            self.log.warning(
-                "Invalid decimal value '%s' for metric type %s (conversion syntax error)",
-                raw_value[:50] if len(raw_value) > 50 else raw_value,
-                metric_type,
-            )
-            return None
-        except (ValueError, ArithmeticError) as e:
-            self.log.warning(
-                "Failed to parse decimal value '%s' for metric type %s: %s",
-                raw_value[:50] if len(raw_value) > 50 else raw_value,
-                metric_type,
-                str(e),
-            )
-            return None
-
     def _extract_device_info(self, raw_source: str | None) -> SourceInfo:
         """
         Extract device information from source info.
@@ -139,11 +125,11 @@ class XMLService:
 
         return SourceInfo(
             name=raw_fields.get("name"),
-            device_id=raw_fields.get("device"),  # ty:ignore[unknown-argument]
-            device_model=raw_fields.get("model"),  # ty:ignore[unknown-argument]
-            device_manufacturer=raw_fields.get("manufacturer"),  # ty:ignore[unknown-argument]
-            device_hardware_version=raw_fields.get("hardware"),  # ty:ignore[unknown-argument]
-            device_software_version=raw_fields.get("software"),  # ty:ignore[unknown-argument]
+            device_id=raw_fields.get("device"),
+            device_model=raw_fields.get("model"),
+            device_manufacturer=raw_fields.get("manufacturer"),
+            device_hardware_version=raw_fields.get("hardware"),
+            device_software_version=raw_fields.get("software"),
         )
 
     def _normalize_sleep_record(self, document: dict[str, Any]) -> SleepRecord | None:
@@ -166,10 +152,24 @@ class XMLService:
             source=source_info,
         )
 
+    def _extract_metadata(self, elem: ET.Element) -> dict[str, str]:
+        """Collect MetadataEntry key/value pairs nested under a Record element."""
+        metadata: dict[str, str] = {}
+        for child in elem:
+            if child.tag != "MetadataEntry":
+                continue
+            key = child.attrib.get("key")
+            if not key:
+                continue
+            metadata[key] = child.attrib.get("value", "")
+        return metadata
+
     def _create_record(
         self,
         document: dict[str, Any],
         user_id: UUID,
+        *,
+        metadata: dict[str, str] | None = None,
     ) -> HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate | None:
         """Create a time series record from an XML document.
 
@@ -182,13 +182,7 @@ class XMLService:
         if series_type is None:
             return None
 
-        # Parse the value - skip record if invalid
-        value = self._parse_decimal_value(document.get("value"), metric_type)
-        if value is None:
-            self.stats.records.skip(f"invalid_value:{metric_type}")
-            return None
-
-        # Parse date fields
+        # Parse date fields before duration-based normalization (mindful sessions).
         try:
             document = self._parse_date_fields(document)
         except ValueError as e:
@@ -202,7 +196,43 @@ class XMLService:
             self.stats.records.skip(f"missing_startDate:{metric_type}")
             return None
 
+        # Mindful minutes are derived from session duration; skip if endDate is missing.
+        if metric_type in _MINDFUL_TYPES and "endDate" not in document:
+            self.stats.records.skip(f"missing_endDate:{metric_type}")
+            return None
+
+        raw_value = parse_apple_raw_value(document.get("value"), metric_type)
+        # MindfulSession XML values are often enum names; duration is the real metric.
+        if raw_value is None and metric_type not in _MINDFUL_TYPES:
+            self.stats.records.skip(f"invalid_value:{metric_type}")
+            return None
+        if raw_value is None:
+            raw_value = Decimal("0")
+
+        value = normalize_apple_sample_value(
+            series_type=series_type,
+            value=raw_value,
+            metric_type=metric_type,
+            unit=document.get("unit"),
+            start=document.get("startDate"),
+            end=document.get("endDate"),
+            provider="apple",
+        )
+
         device_info = self._extract_device_info(document.get("device", ""))
+
+        if metric_type in _MENSTRUAL_TYPES:
+            self.menstrual_records.append(
+                MetricRecord(
+                    type=metric_type,
+                    startDate=document["startDate"],
+                    endDate=document.get("endDate", document["startDate"]),
+                    value=value,
+                    unit=document.get("unit"),
+                    source=device_info,
+                    metadata=metadata or None,
+                )
+            )
 
         sample = TimeSeriesSampleCreate(
             id=uuid4(),
@@ -211,6 +241,7 @@ class XMLService:
             source="apple_health_xml",
             device_model=device_info.device_model,
             software_version=device_info.device_software_version,
+            provider="apple",
             recorded_at=document["startDate"],
             value=value,
             series_type=series_type,
@@ -345,8 +376,9 @@ class XMLService:
 
         uuid_user = UUID(user_id)
 
-        # Reset stats for this parse run
+        # Reset stats / menstrual collectors for this parse run
         self.stats = XMLParseStats()
+        self.menstrual_records = []
 
         for event, elem in ET.iterparse(self.xml_path, events=("end",)):
             if elem.tag == "Record" and event == "end":
@@ -369,6 +401,7 @@ class XMLService:
 
                 try:
                     record: dict[str, Any] = elem.attrib.copy()
+                    metadata = self._extract_metadata(elem)
 
                     # Handle sleep records
                     if record.get("type") == "HKCategoryTypeIdentifierSleepAnalysis":
@@ -385,7 +418,7 @@ class XMLService:
                         elem.clear()
                         continue
 
-                    record_create = self._create_record(record, uuid_user)
+                    record_create = self._create_record(record, uuid_user, metadata=metadata)
                     if record_create is not None:
                         time_series_records.append(record_create)
                         self.stats.records.mark_processed()

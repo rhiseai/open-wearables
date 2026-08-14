@@ -144,6 +144,10 @@ Celery Worker
 Provider API / Webhook Delivery
 ```
 
+Apple HealthKit sleep stages also use Redis as a short-lived in-progress accumulator.
+Each SDK sync batch flushes the current session to PostgreSQL immediately (same
+`create_or_merge_sleep` path as cloud providers); the periodic
+`finalize_stale_sleeps` task only closes Redis state after a quiet gap.
 ## Deployment Architecture
 
 The platform is designed for **self-hosting** with Docker Compose:

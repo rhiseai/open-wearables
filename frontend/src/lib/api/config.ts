@@ -23,6 +23,8 @@ export const API_ENDPOINTS = {
   userConnections: (userId: string) => `/api/v1/users/${userId}/connections`,
   userConnectionDisconnect: (userId: string, provider: string) =>
     `/api/v1/users/${userId}/connections/${provider}`,
+  userConnectionPurgeData: (userId: string, provider: string) =>
+    `/api/v1/users/${userId}/connections/${provider}/data`,
   providerSetting: (provider: string) => `/api/v1/oauth/providers/${provider}`,
   userWorkouts: (userId: string) => `/api/v1/users/${userId}/events/workouts`,
   userWorkoutDetail: (userId: string, workoutId: string) =>
@@ -44,6 +46,12 @@ export const API_ENDPOINTS = {
   apiKeys: '/api/v1/developer/api-keys',
   apiKeyDetail: (id: string) => `/api/v1/developer/api-keys/${id}`,
   apiKeyRotate: (id: string) => `/api/v1/developer/api-keys/${id}/rotate`,
+
+  // SDK Applications endpoints (mobile app credentials)
+  applications: '/api/v1/applications',
+  applicationDetail: (appId: string) => `/api/v1/applications/${appId}`,
+  applicationRotateSecret: (appId: string) =>
+    `/api/v1/applications/${appId}/rotate-secret`,
 
   // Provider workouts endpoints
   providerSynchronization: (provider: string, userId: string) =>

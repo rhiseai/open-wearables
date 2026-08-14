@@ -299,6 +299,69 @@ class TestUserConnectionRepository:
         assert db_connection is not None
         assert db_connection.status == ConnectionStatus.REVOKED
 
+    def test_revoke_if_refresh_token_matches_revokes(
+        self,
+        db: Session,
+        connection_repo: UserConnectionRepository,
+    ) -> None:
+        """Test revoking a connection whose stored refresh token is the rejected one."""
+        # Arrange
+        connection = UserConnectionFactory(
+            provider="whoop",
+            refresh_token="dead_refresh",
+            status=ConnectionStatus.ACTIVE,
+        )
+
+        # Act
+        result = connection_repo.revoke_if_refresh_token_matches(db, connection.user_id, "whoop", "dead_refresh")
+
+        # Assert
+        assert result is not None
+        assert result.status == ConnectionStatus.REVOKED
+        assert connection.status == ConnectionStatus.REVOKED
+
+    def test_revoke_if_refresh_token_matches_skips_rotated_token(
+        self,
+        db: Session,
+        connection_repo: UserConnectionRepository,
+    ) -> None:
+        """Test that a rotated refresh token protects the connection from revocation."""
+        # Arrange - a concurrent refresh has already stored a rotated token
+        connection = UserConnectionFactory(
+            provider="whoop",
+            refresh_token="rotated_refresh",
+            status=ConnectionStatus.ACTIVE,
+        )
+
+        # Act
+        result = connection_repo.revoke_if_refresh_token_matches(db, connection.user_id, "whoop", "consumed_refresh")
+
+        # Assert
+        assert result is None
+        db.expire_all()
+        db_connection = connection_repo.get(db, connection.id)
+        assert db_connection is not None
+        assert db_connection.status == ConnectionStatus.ACTIVE
+
+    def test_revoke_if_refresh_token_matches_skips_already_revoked(
+        self,
+        db: Session,
+        connection_repo: UserConnectionRepository,
+    ) -> None:
+        """Test that an already revoked connection is not revoked again."""
+        # Arrange
+        connection = UserConnectionFactory(
+            provider="whoop",
+            refresh_token="dead_refresh",
+            status=ConnectionStatus.REVOKED,
+        )
+
+        # Act
+        result = connection_repo.revoke_if_refresh_token_matches(db, connection.user_id, "whoop", "dead_refresh")
+
+        # Assert
+        assert result is None
+
     def test_update_tokens(self, db: Session, connection_repo: UserConnectionRepository) -> None:
         """Test updating connection tokens."""
         # Arrange
