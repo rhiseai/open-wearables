@@ -26,8 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, selectinload
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails
-from app.models.workout_details import WorkoutDetails
+from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
@@ -258,7 +257,7 @@ class EventRecordRepository(
     ) -> EventRecord | None:
         return (
             db_session.query(EventRecord)
-            .options(selectinload(EventRecord.detail))
+            .options(*[selectinload(r) for r in EventRecord.detail_relationship(category)])
             .filter(EventRecord.id == record_id, EventRecord.category == category)
             .first()
         )
@@ -276,7 +275,7 @@ class EventRecordRepository(
                 DataSource,
                 EventRecord.data_source_id == DataSource.id,
             )
-            .options(selectinload(EventRecord.detail))
+            .options(*[selectinload(r) for r in EventRecord.detail_relationship(query_params.category)])
         )
 
         filters = [DataSource.user_id == UUID(user_id)]
@@ -475,21 +474,18 @@ class EventRecordRepository(
         )
         return [(provider, category, event_type, count) for provider, category, event_type, count in results]
 
-    def get_count_by_workout_type(self, db_session: DbSession) -> list[tuple[str | None, int]]:
-        """Get count of workouts grouped by workout type.
+    def get_category_counts(self, db_session: DbSession) -> list[tuple[str, int]]:
+        """Count event records grouped by category (workout, sleep, menstrual_cycle, ...).
 
-        Returns list of (workout_type, count) tuples ordered by count descending.
-        Only includes records with category='workout'.
+        Cheap: ``event_record`` is a small table, so this is a quick aggregate (no big scan).
+        Returns list of (category, count) tuples.
         """
-
         results = (
-            db_session.query(self.model.type, func.count(self.model.id).label("count"))
-            .filter(self.model.category == "workout")
-            .group_by(self.model.type)
-            .order_by(func.count(self.model.id).desc())
+            db_session.query(self.model.category, func.count(self.model.id).label("count"))
+            .group_by(self.model.category)
             .all()
         )
-        return [(workout_type, count) for workout_type, count in results]
+        return [(category, count) for category, count in results]
 
     def get_sleep_stage_stats_via_json(self, db_session: DbSession, record_id: UUID) -> list[dict]:
         """
@@ -535,7 +531,7 @@ class EventRecordRepository(
         # SQLAlchemy expr: SleepDetails.sleep_stages.contains([{'stage': stage_name}])
         return (
             db_session.query(EventRecord)
-            .join(EventRecord.detail.of_type(SleepDetails))
+            .join(EventRecord.sleep_detail)
             .join(DataSource, EventRecord.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
@@ -960,7 +956,7 @@ class EventRecordRepository(
         return (
             db_session.query(self.model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
-            .options(selectinload(self.model.detail))
+            .options(selectinload(self.model.sleep_detail))
             .filter(*filters)
             .order_by(self.model.start_datetime.desc())
             .with_for_update()

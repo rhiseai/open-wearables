@@ -34,6 +34,9 @@ _CATEGORY_ORDER = [
     "Activity - Generic",
     "Environmental",
     "Provider-Specific",
+    "Nutrition",
+    "Reproductive Health",
+    "Mindfulness",
     "Other",
 ]
 

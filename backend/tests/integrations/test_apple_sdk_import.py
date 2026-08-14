@@ -703,3 +703,338 @@ class TestSDKImportUnitConversion:
         assert len(samples) == 1
         assert samples[0].series_type == SeriesType.blood_glucose
         assert samples[0].value == Decimal("105")
+
+
+class TestSDKImportDietaryMindfulMenstrual:
+    """Dietary / mindful / menstrual conversions in `_build_statistic_bundles`."""
+
+    @pytest.fixture
+    def import_service(self) -> ImportService:
+        return ImportService(log=logging.getLogger("test"))
+
+    @staticmethod
+    def _record(
+        metric_type: str,
+        value: float,
+        *,
+        unit: str | None = "",
+        start: str = "2025-04-10T12:00:00Z",
+        end: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "id": f"test-{metric_type}-{start}",
+            "type": metric_type,
+            "unit": unit,
+            "value": value,
+            "startDate": start,
+            "endDate": end or start,
+            "source": {"name": "Test Device", "bundleIdentifier": "test"},
+            "metadata": metadata,
+        }
+
+    def _build_request(self, records: list[dict[str, Any]]) -> SDKSyncRequest:
+        return SDKSyncRequest(
+            **{
+                "provider": "apple",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2025-04-10T12:00:00Z",
+                "data": {"records": records},
+            }
+        )
+
+    def test_dietary_energy_and_macros(self, import_service: ImportService) -> None:
+        request = self._build_request(
+            [
+                self._record("HKQuantityTypeIdentifierDietaryEnergyConsumed", 520, unit="Cal"),
+                self._record("HKQuantityTypeIdentifierDietaryProtein", 30, unit="g"),
+                self._record("HKQuantityTypeIdentifierDietaryCarbohydrates", 55, unit="g"),
+                self._record("HKQuantityTypeIdentifierDietaryFatTotal", 18, unit="g"),
+                self._record("HKQuantityTypeIdentifierDietaryFiber", 8, unit="g"),
+                self._record("HKQuantityTypeIdentifierDietarySugar", 12, unit="g"),
+                self._record("HKQuantityTypeIdentifierDietaryCaffeine", 0.08, unit="g"),
+            ]
+        )
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        by_type = {s.series_type: s.value for s in samples}
+        assert by_type[SeriesType.dietary_energy_consumed] == Decimal("520")
+        assert by_type[SeriesType.dietary_protein] == Decimal("30")
+        assert by_type[SeriesType.dietary_carbohydrates] == Decimal("55")
+        assert by_type[SeriesType.dietary_fat_total] == Decimal("18")
+        assert by_type[SeriesType.dietary_fiber] == Decimal("8")
+        assert by_type[SeriesType.dietary_sugar] == Decimal("12")
+        assert by_type[SeriesType.dietary_caffeine] == Decimal("80")  # g → mg
+
+    def test_dietary_water_liters_to_ml(self, import_service: ImportService) -> None:
+        request = self._build_request([self._record("HKQuantityTypeIdentifierDietaryWater", 0.35, unit="L")])
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert len(samples) == 1
+        assert samples[0].series_type == SeriesType.hydration
+        assert samples[0].value == Decimal("350")
+
+    def test_android_hydration_not_scaled(self, import_service: ImportService) -> None:
+        request = SDKSyncRequest(
+            **{
+                "provider": "google",
+                "sdkVersion": "1.0.0",
+                "syncTimestamp": "2025-04-10T12:00:00Z",
+                "data": {
+                    "records": [
+                        self._record("HYDRATION", 350, unit="mL"),
+                    ]
+                },
+            }
+        )
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert samples[0].series_type == SeriesType.hydration
+        assert samples[0].value == Decimal("350")
+
+    def test_menstrual_flow_recode_none(self, import_service: ImportService) -> None:
+        # HK 5 = none → OW 0
+        request = self._build_request([self._record("HKCategoryTypeIdentifierMenstrualFlow", 5)])
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert samples[0].series_type == SeriesType.menstrual_flow
+        assert samples[0].value == Decimal("0")
+
+    def test_menstrual_flow_recode_heavy(self, import_service: ImportService) -> None:
+        request = self._build_request([self._record("HKCategoryTypeIdentifierMenstrualFlow", 4)])
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert samples[0].value == Decimal("4")
+
+    def test_basal_body_temperature_not_body_temperature(self, import_service: ImportService) -> None:
+        request = self._build_request([self._record("HKQuantityTypeIdentifierBasalBodyTemperature", 36.4, unit="degC")])
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert samples[0].series_type == SeriesType.basal_body_temperature
+        assert samples[0].value == Decimal("36.4")
+
+    def test_mindful_session_uses_duration_minutes(self, import_service: ImportService) -> None:
+        request = self._build_request(
+            [
+                self._record(
+                    "HKCategoryTypeIdentifierMindfulSession",
+                    0,
+                    start="2025-04-10T08:00:00Z",
+                    end="2025-04-10T08:15:00Z",
+                )
+            ]
+        )
+        samples = import_service._build_statistic_bundles(request, str(uuid4()))
+        assert samples[0].series_type == SeriesType.mindful_minutes
+        assert samples[0].value == Decimal("15")
+
+
+class TestAppleMenstrualCycleAssembly:
+    """End-to-end menstrual_flow → menstrual_cycle event assembly."""
+
+    @pytest.fixture
+    def import_service(self) -> ImportService:
+        return ImportService(log=logging.getLogger("test"))
+
+    def test_assembles_period_and_lengthens_on_resync(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        from app.models import MenstrualCycleDetails
+
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        first = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-03-01", 3, cycle_start=True),
+                    _flow("2025-03-02", 4),
+                    _flow("2025-03-03", 2),
+                ]
+            },
+        }
+        result = import_service.load_data(db, first, user_id)
+        assert result["records_saved"] == 3
+
+        cycles = db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").all()
+        assert len(cycles) == 1
+        assert cycles[0].external_id == "apple-menstrual-2025-03-01"
+        detail = db.query(MenstrualCycleDetails).filter(MenstrualCycleDetails.record_id == cycles[0].id).one()
+        assert detail.period_length == 3
+
+        # Re-sync with an extra bleeding day — same external_id, period lengthens.
+        second = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-03-01", 3, cycle_start=True),
+                    _flow("2025-03-02", 4),
+                    _flow("2025-03-03", 2),
+                    _flow("2025-03-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, second, user_id)
+        db.expire_all()
+        cycles = db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").all()
+        assert len(cycles) == 1
+        detail = db.query(MenstrualCycleDetails).filter(MenstrualCycleDetails.record_id == cycles[0].id).one()
+        assert detail.period_length == 4
+
+    def test_cycle_start_flag_splits_back_to_back_days(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        payload = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-04-01", 3, cycle_start=True),
+                    _flow("2025-04-02", 2),
+                    # Adjacent day but explicit new cycle start → second period
+                    _flow("2025-04-03", 3, cycle_start=True),
+                    _flow("2025-04-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, payload, user_id)
+        cycles = (
+            db.query(EventRecord)
+            .filter(EventRecord.category == "menstrual_cycle")
+            .order_by(EventRecord.start_datetime)
+            .all()
+        )
+        assert [c.external_id for c in cycles] == [
+            "apple-menstrual-2025-04-01",
+            "apple-menstrual-2025-04-03",
+        ]
+
+    def test_merge_without_cycle_start_deletes_orphan_period(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """When a later sync drops cycle-start flags and merges periods, stale ids are removed."""
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        split = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-05-01", 3, cycle_start=True),
+                    _flow("2025-05-02", 2),
+                    _flow("2025-05-03", 3, cycle_start=True),
+                    _flow("2025-05-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, split, user_id)
+        assert {
+            c.external_id for c in db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").all()
+        } == {
+            "apple-menstrual-2025-05-01",
+            "apple-menstrual-2025-05-03",
+        }
+
+        # Same days, no cycle-start flags → gap heuristic merges into one period.
+        merged = {
+            **SDK_ENVELOPE,
+            "data": {
+                "records": [
+                    _flow("2025-05-01", 3),
+                    _flow("2025-05-02", 2),
+                    _flow("2025-05-03", 3),
+                    _flow("2025-05-04", 2),
+                ]
+            },
+        }
+        import_service.load_data(db, merged, user_id)
+        db.expire_all()
+        cycles = (
+            db.query(EventRecord)
+            .filter(EventRecord.category == "menstrual_cycle")
+            .order_by(EventRecord.start_datetime)
+            .all()
+        )
+        assert [c.external_id for c in cycles] == ["apple-menstrual-2025-05-01"]
+
+    def test_none_only_payload_clears_orphan_periods(
+        self,
+        db: Session,
+        import_service: ImportService,
+    ) -> None:
+        """A sync of only HK 'none' flow (OW 0) clears previously assembled periods in-window."""
+        user = UserFactory()
+        user_id = str(user.id)
+
+        def _flow(day: str, value: int, cycle_start: bool = False) -> dict[str, Any]:
+            return {
+                "id": f"flow-{day}",
+                "type": "HKCategoryTypeIdentifierMenstrualFlow",
+                "unit": None,
+                "value": value,
+                "startDate": f"{day}T08:00:00Z",
+                "endDate": f"{day}T08:00:00Z",
+                "source": {"name": "iPhone", "bundleIdentifier": "com.apple.health"},
+                "metadata": {"HKMenstrualCycleStart": "1" if cycle_start else "0"},
+            }
+
+        import_service.load_data(
+            db,
+            {
+                **SDK_ENVELOPE,
+                "data": {"records": [_flow("2025-06-01", 3, cycle_start=True), _flow("2025-06-02", 2)]},
+            },
+            user_id,
+        )
+        assert db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").count() == 1
+
+        # Re-send the same timestamps as HK none (5 → OW 0). Active flow_days become empty.
+        import_service.load_data(
+            db,
+            {
+                **SDK_ENVELOPE,
+                "data": {"records": [_flow("2025-06-01", 5), _flow("2025-06-02", 5)]},
+            },
+            user_id,
+        )
+        db.expire_all()
+        assert db.query(EventRecord).filter(EventRecord.category == "menstrual_cycle").count() == 0

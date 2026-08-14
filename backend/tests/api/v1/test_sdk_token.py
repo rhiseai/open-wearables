@@ -31,6 +31,24 @@ class TestCreateUserToken:
         assert data["expires_in"] == settings.access_token_expire_minutes * 60
         assert data["refresh_token"].startswith("rt-")
 
+    def test_create_token_missing_user_returns_404(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        """A user id OW doesn't know must 404, not 500.
+
+        Regression: the refresh-token insert used to hit a foreign-key
+        violation for dangling user ids (e.g. rows lost across an
+        upgrade), surfacing an opaque 500 that integrators couldn't
+        distinguish from an outage.
+        """
+        developer = DeveloperFactory()
+        application = ApplicationFactory(developer=developer, app_secret="test_app_secret")
+
+        response = client.post(
+            f"{api_v1_prefix}/users/00000000-0000-4000-8000-000000000000/token",
+            json={"app_id": application.app_id, "app_secret": "test_app_secret"},
+        )
+
+        assert response.status_code == 404
+
     def test_create_token_invalid_app_id(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Non-existent app_id should return 401."""
         user = UserFactory()
