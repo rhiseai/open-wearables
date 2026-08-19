@@ -132,7 +132,19 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         return self._make_api_request(db, user_id, f"/v2/activity/workout/{workout_id}")
 
     def load_single_workout(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
-        """Fetch a single workout by ID, normalize, and save to database. Returns 1 on success."""
+        """Fetch a single workout by ID, normalize, and replace any stored version of it.
+
+        This runs for ``workout.updated`` webhooks, which Whoop sends whenever the
+        user edits an activity in the app (sport, trimmed start/end, ...).  The
+        edited workout keeps its ``external_id`` but its time window changes, so it
+        no longer collides with the ``(data_source_id, start, end)`` unique index —
+        a plain insert would leave the stale version alongside the corrected one and
+        downstream consumers would see the same workout twice.  Deleting by
+        ``external_id`` first (child detail rows go with it via the FK's ON DELETE
+        CASCADE, same as the ``workout.deleted`` path) makes ingestion idempotent.
+
+        Returns 1 on success.
+        """
         try:
             raw = self.get_workout_detail_from_api(db, user_id, workout_id)
             store_raw_payload(
@@ -148,6 +160,8 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             if workout.score_state != "SCORED" and workout.score is None:
                 return 0
             record, detail, health_score = self._normalize_workout(workout, user_id)
+            if record.external_id:
+                self.workout_repo.delete_by_external_id(db, user_id, record.external_id, source=self.provider_name)
             created = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail_for_record)
