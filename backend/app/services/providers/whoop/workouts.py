@@ -132,7 +132,25 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         return self._make_api_request(db, user_id, f"/v2/activity/workout/{workout_id}")
 
     def load_single_workout(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
-        """Fetch a single workout by ID, normalize, and save to database. Returns 1 on success."""
+        """Fetch a single workout by ID, normalize, and replace any stored version of it.
+
+        This runs for ``workout.updated`` webhooks, which Whoop sends whenever the
+        user edits an activity in the app (sport, trimmed start/end, ...).  The
+        edited workout keeps its ``external_id`` but its time window changes, so it
+        no longer collides with the ``(data_source_id, start, end)`` unique index —
+        a plain insert would leave the stale version alongside the corrected one and
+        downstream consumers would see the same workout twice.  Deleting by
+        ``external_id`` first (child detail rows go with it via the FK's ON DELETE
+        CASCADE, same as the ``workout.deleted`` path) makes ingestion idempotent.
+
+        The delete and the insert share one transaction (see
+        ``EventRecordRepository.replace_by_external_id``), so a failing insert rolls
+        the delete back and leaves the stored workout untouched.
+
+        Returns 1 on success.  A failure while fetching or normalizing the workout is
+        logged and reported as 0 records saved; a failure once we start writing is
+        re-raised so the delivery is retried instead of reporting a benign skip.
+        """
         try:
             raw = self.get_workout_detail_from_api(db, user_id, workout_id)
             store_raw_payload(
@@ -148,12 +166,6 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             if workout.score_state != "SCORED" and workout.score is None:
                 return 0
             record, detail, health_score = self._normalize_workout(workout, user_id)
-            created = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created.id})
-            event_record_service.create_detail(db, detail_for_record)
-            if health_score:
-                health_score_service.create(db, health_score)
-            return 1
         except Exception as e:
             log_structured(
                 self.logger,
@@ -163,6 +175,36 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                 task="load_single_workout",
             )
             return 0
+
+        # Swallowing a failure from here on would report a benign skip while the
+        # workout is either missing its details or stuck on the pre-edit version, so
+        # failures propagate: the webhook delivery fails, Celery retries it, and the
+        # retry replaces the workout again from scratch.
+        try:
+            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
+            if created is None:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Skipped workout record {workout_id}: an unrelated workout already occupies its time window",
+                    provider="whoop",
+                    task="load_single_workout",
+                )
+                return 0
+            detail_for_record = detail.model_copy(update={"record_id": created.id})
+            event_record_service.create_detail(db, detail_for_record)
+            if health_score:
+                health_score_service.create(db, health_score)
+        except Exception as e:
+            log_structured(
+                self.logger,
+                "error",
+                f"Failed to store workout record {workout_id}: {e}",
+                provider="whoop",
+                task="load_single_workout",
+            )
+            raise
+        return 1
 
     def _extract_dates(self, start_timestamp: str, end_timestamp: str) -> tuple[datetime, datetime]:
         """Extract start and end dates from ISO 8601 strings."""

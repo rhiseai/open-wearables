@@ -106,13 +106,31 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         return self._make_api_request(db, user_id, f"/v2/usercollection/workout/{workout_id}")
 
     def save_by_id(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
-        """Fetch a single workout by ID and save it."""
+        """Fetch a single workout by ID and save it, replacing any stored version of it.
+
+        Called for Oura ``workout`` webhooks, including ``update`` events. An edited
+        workout keeps its ``external_id`` but may shift its time window, so it no
+        longer collides with the ``(data_source_id, start, end)`` unique index; the
+        replace keeps re-ingestion idempotent instead of appending a second copy of
+        the same workout. Its delete and insert share one transaction, so a failing
+        insert leaves the stored workout untouched.
+        """
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
             return 0
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
-            created = event_record_service.create(db, record)
+            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
+            if created is None:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Skipped Oura workout: an unrelated workout already occupies its time window",
+                    action="oura_workout_slot_taken",
+                    user_id=str(user_id),
+                    workout_id=workout_id,
+                )
+                continue
             detail = details.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail)
             count += 1

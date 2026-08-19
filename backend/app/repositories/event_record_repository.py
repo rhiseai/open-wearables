@@ -113,7 +113,7 @@ class EventRecordRepository(
             query = query.filter(DataSource.provider == provider)
         return query.one_or_none()
 
-    def delete_by_external_id(
+    def delete_by_external_id_flush(
         self,
         db_session: DbSession,
         user_id: UUID,
@@ -121,9 +121,10 @@ class EventRecordRepository(
         source: str | None = None,
         provider: str | None = None,
     ) -> int:
-        """Delete EventRecord(s) matching external_id for a user in a single query.
+        """Like delete_by_external_id() but flushes instead of committing.
 
-        Returns the number of rows deleted.
+        Caller is responsible for the commit, which lets the delete share a
+        transaction with a replacement insert. Returns the number of rows deleted.
         """
         source_ids_query = db_session.query(DataSource.id).filter(DataSource.user_id == user_id)
         if source is not None:
@@ -139,8 +140,64 @@ class EventRecordRepository(
             )
             .delete(synchronize_session=False)
         )
+        db_session.flush()
+        return deleted
+
+    def delete_by_external_id(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        external_id: str,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> int:
+        """Delete EventRecord(s) matching external_id for a user in a single query.
+
+        Returns the number of rows deleted.
+        """
+        deleted = self.delete_by_external_id_flush(db_session, user_id, external_id, source=source, provider=provider)
         db_session.commit()
         return deleted
+
+    def replace_by_external_id(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        creator: EventRecordCreate,
+        source: str | None = None,
+        provider: str | None = None,
+    ) -> EventRecord | None:
+        """Insert *creator*, replacing any stored record(s) carrying the same external_id.
+
+        Used by provider ingestion paths that re-fetch a single resource the provider
+        says has changed. The stale row must go first: an edited activity keeps its
+        external_id but usually shifts its time window, so it no longer collides with
+        the unique index on (data_source_id, start_datetime, end_datetime) and a plain
+        insert would leave both versions in place. Child detail rows of the deleted
+        record go with it via the FK's ON DELETE CASCADE.
+
+        The delete and the insert share one transaction and are committed together, so
+        a failing insert rolls the delete back and leaves the existing record intact.
+
+        Returns the created record, or None when the insert was absorbed by an
+        *unrelated* record already occupying the same time slot — grafting this
+        resource's details onto that row would be wrong, so nothing is changed at all.
+        """
+        if not creator.external_id:
+            return self.create(db_session, creator)
+
+        try:
+            self.delete_by_external_id_flush(db_session, user_id, creator.external_id, source=source, provider=provider)
+            created = self.create_and_flush(db_session, creator)
+            if created.id != creator.id:
+                db_session.rollback()
+                return None
+            db_session.commit()
+            db_session.refresh(created)
+            return created
+        except Exception:
+            db_session.rollback()
+            raise
 
     @handle_exceptions
     def create(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
