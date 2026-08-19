@@ -143,10 +143,13 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         ``external_id`` first (child detail rows go with it via the FK's ON DELETE
         CASCADE, same as the ``workout.deleted`` path) makes ingestion idempotent.
 
-        Returns 1 on success.  A failure while fetching or normalizing the workout
-        is logged and reported as 0 records saved, but a failure *after* the delete
-        has committed is re-raised so the delivery is retried rather than leaving
-        the workout missing.
+        The delete and the insert share one transaction (see
+        ``EventRecordRepository.replace_by_external_id``), so a failing insert rolls
+        the delete back and leaves the stored workout untouched.
+
+        Returns 1 on success.  A failure while fetching or normalizing the workout is
+        logged and reported as 0 records saved; a failure once we start writing is
+        re-raised so the delivery is retried instead of reporting a benign skip.
         """
         try:
             raw = self.get_workout_detail_from_api(db, user_id, workout_id)
@@ -173,15 +176,21 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             )
             return 0
 
-        # `delete_by_external_id` commits on its own, so from here until the insert
-        # lands the workout is gone from the database.  Swallowing a failure in this
-        # section would make that loss permanent and silent, so it propagates instead:
-        # the webhook delivery fails, Celery retries it, and the retry re-runs a
-        # now-no-op delete followed by the insert until the workout is restored.
+        # Swallowing a failure from here on would report a benign skip while the
+        # workout is either missing its details or stuck on the pre-edit version, so
+        # failures propagate: the webhook delivery fails, Celery retries it, and the
+        # retry replaces the workout again from scratch.
         try:
-            if record.external_id:
-                self.workout_repo.delete_by_external_id(db, user_id, record.external_id, source=self.provider_name)
-            created = event_record_service.create(db, record)
+            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
+            if created is None:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Skipped workout record {workout_id}: an unrelated workout already occupies its time window",
+                    provider="whoop",
+                    task="load_single_workout",
+                )
+                return 0
             detail_for_record = detail.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail_for_record)
             if health_score:
@@ -190,7 +199,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             log_structured(
                 self.logger,
                 "error",
-                f"Failed to store workout record {workout_id} after removing the stored version: {e}",
+                f"Failed to store workout record {workout_id}: {e}",
                 provider="whoop",
                 task="load_single_workout",
             )
