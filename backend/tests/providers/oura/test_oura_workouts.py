@@ -1,14 +1,19 @@
 """Tests for OuraWorkouts."""
 
-from uuid import uuid4
+from typing import Any
+from unittest.mock import patch
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.orm import Session
 
 from app.constants.workout_types.oura import get_unified_workout_type
+from app.models import DataSource, EventRecord
 from app.schemas.enums import WorkoutType
 from app.schemas.providers.oura import OuraWorkoutJSON
 from app.services.providers.oura.strategy import OuraStrategy
 from app.services.providers.oura.workouts import OuraWorkouts
+from tests.factories import UserFactory
 
 
 class TestOuraWorkoutTypeMapping:
@@ -107,3 +112,74 @@ class TestOuraWorkoutsNormalization:
         record, detail = bundles[0]
         assert record.category == "workout"
         assert detail.record_id == record.id
+
+
+OURA_WORKOUT_ID = "oura-workout-abc123"
+
+
+def _oura_workout_payload(activity: str, start: str, end: str) -> dict[str, Any]:
+    """Oura ``GET /v2/usercollection/workout/{id}`` response for a single workout."""
+    return {
+        "id": OURA_WORKOUT_ID,
+        "activity": activity,
+        "calories": 350.5,
+        "day": "2024-01-15",
+        "distance": 5000.0,
+        "intensity": "moderate",
+        "start_datetime": start,
+        "end_datetime": end,
+    }
+
+
+def _user_records(db: Session, user_id: UUID) -> list[EventRecord]:
+    return (
+        db.query(EventRecord)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == user_id)
+        .all()
+    )
+
+
+class TestOuraSaveById:
+    """``save_by_id`` serves the Oura ``workout`` webhook, including update events."""
+
+    @pytest.fixture
+    def workouts(self) -> OuraWorkouts:
+        return OuraStrategy().workouts
+
+    def test_update_replaces_existing_record(self, db: Session, workouts: OuraWorkouts) -> None:
+        user = UserFactory()
+        original = _oura_workout_payload("running", "2024-01-15T08:00:00+00:00", "2024-01-15T09:00:00+00:00")
+        edited = _oura_workout_payload("walking", "2024-01-15T08:00:00+00:00", "2024-01-15T08:30:00+00:00")
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=original):
+            assert workouts.save_by_id(db, user.id, OURA_WORKOUT_ID) == 1
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=edited):
+            assert workouts.save_by_id(db, user.id, OURA_WORKOUT_ID) == 1
+
+        records = _user_records(db, user.id)
+        assert len(records) == 1
+        assert records[0].type == WorkoutType.WALKING.value
+        assert records[0].duration_seconds == 1800
+
+    def test_insert_failure_keeps_original_record(self, db: Session, workouts: OuraWorkouts) -> None:
+        user = UserFactory()
+        original = _oura_workout_payload("running", "2024-01-15T08:00:00+00:00", "2024-01-15T09:00:00+00:00")
+        edited = _oura_workout_payload("walking", "2024-01-15T08:00:00+00:00", "2024-01-15T08:30:00+00:00")
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=original):
+            assert workouts.save_by_id(db, user.id, OURA_WORKOUT_ID) == 1
+        original_record_id = _user_records(db, user.id)[0].id
+
+        with (
+            patch.object(workouts, "get_workout_detail_from_api", return_value=edited),
+            patch.object(workouts.workout_repo, "create_and_flush", side_effect=RuntimeError("insert exploded")),
+            pytest.raises(RuntimeError),
+        ):
+            workouts.save_by_id(db, user.id, OURA_WORKOUT_ID)
+
+        records = _user_records(db, user.id)
+        assert len(records) == 1
+        assert records[0].id == original_record_id
+        assert records[0].type == WorkoutType.RUNNING.value
+        assert records[0].duration_seconds == 3600

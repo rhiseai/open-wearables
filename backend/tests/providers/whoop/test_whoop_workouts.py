@@ -15,12 +15,18 @@ from app.services.providers.whoop.workouts import WhoopWorkouts
 from tests.factories import UserFactory
 
 WHOOP_WORKOUT_ID = "ecfc6a15-4661-442f-a9a4-f160dd7afae8"
+OTHER_WHOOP_WORKOUT_ID = "1d0f4b3a-9c2e-4f77-8a51-6b0e2c7d9f10"
 
 
-def _whoop_workout_payload(sport_name: str, start: str, end: str) -> dict[str, Any]:
+def _whoop_workout_payload(
+    sport_name: str,
+    start: str,
+    end: str,
+    workout_id: str = WHOOP_WORKOUT_ID,
+) -> dict[str, Any]:
     """Whoop ``GET /v2/activity/workout/{id}`` response for a single workout."""
     return {
-        "id": WHOOP_WORKOUT_ID,
+        "id": workout_id,
         "user_id": 10129,
         "created_at": "2026-06-30T08:12:00.000Z",
         "updated_at": "2026-06-30T09:20:00.000Z",
@@ -156,6 +162,86 @@ class TestWhoopLoadSingleWorkout:
 
         assert len(_user_records(db, user.id)) == 1
         assert len(_user_workout_details(db, user.id)) == 1
+        assert _orphaned_workout_details(db) == 0
+
+    def test_insert_failure_keeps_original_record(self, db: Session, workouts: WhoopWorkouts) -> None:
+        """The stale record must only disappear once the replacement is persisted."""
+        user = UserFactory()
+
+        original = _whoop_workout_payload(
+            "Activity",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T09:04:00.000Z",
+        )
+        edited = _whoop_workout_payload(
+            "Dog Walking",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T08:46:00.000Z",
+        )
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=original):
+            assert workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID) == 1
+        original_record_id = _user_records(db, user.id)[0].id
+
+        with (
+            patch.object(workouts, "get_workout_detail_from_api", return_value=edited),
+            patch.object(workouts.workout_repo, "create_and_flush", side_effect=RuntimeError("insert exploded")),
+            pytest.raises(RuntimeError),
+        ):
+            workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID)
+
+        # The delete shared the failed insert's transaction, so it rolled back too.
+        records = _user_records(db, user.id)
+        assert len(records) == 1
+        assert records[0].id == original_record_id
+        assert records[0].type == WorkoutType.GENERIC.value
+        assert records[0].duration_seconds == 52 * 60
+
+        details = _user_workout_details(db, user.id)
+        assert len(details) == 1
+        assert details[0].record_id == original_record_id
+
+    def test_time_window_taken_by_another_workout_keeps_both(self, db: Session, workouts: WhoopWorkouts) -> None:
+        """An insert absorbed by an unrelated workout must not consume the edited one.
+
+        Two distinct workouts can end up sharing a time window, which the
+        ``(data_source_id, start, end)`` unique index rejects. Rather than grafting
+        this workout's details onto the unrelated record, the replace is abandoned and
+        both stored workouts are left as they were.
+        """
+        user = UserFactory()
+
+        original = _whoop_workout_payload(
+            "Activity",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T09:04:00.000Z",
+        )
+        unrelated = _whoop_workout_payload(
+            "Cycling",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T08:46:00.000Z",
+            workout_id=OTHER_WHOOP_WORKOUT_ID,
+        )
+        # The edit moves the workout onto the slot the unrelated workout already holds.
+        edited = _whoop_workout_payload(
+            "Dog Walking",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T08:46:00.000Z",
+        )
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=original):
+            assert workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID) == 1
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=unrelated):
+            assert workouts.load_single_workout(db, user.id, OTHER_WHOOP_WORKOUT_ID) == 1
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=edited):
+            assert workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID) == 0
+
+        records = {r.external_id: r for r in _user_records(db, user.id)}
+        assert set(records) == {WHOOP_WORKOUT_ID, OTHER_WHOOP_WORKOUT_ID}
+        assert records[WHOOP_WORKOUT_ID].duration_seconds == 52 * 60
+        assert records[OTHER_WHOOP_WORKOUT_ID].type == WorkoutType.CYCLING.value
+        assert len(_user_workout_details(db, user.id)) == 2
         assert _orphaned_workout_details(db) == 0
 
     def test_workout_updated_webhook_replaces_existing_record(self, db: Session) -> None:

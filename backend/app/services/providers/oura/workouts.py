@@ -111,17 +111,26 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         Called for Oura ``workout`` webhooks, including ``update`` events. An edited
         workout keeps its ``external_id`` but may shift its time window, so it no
         longer collides with the ``(data_source_id, start, end)`` unique index; the
-        delete-by-external_id keeps re-ingestion idempotent instead of appending a
-        second copy of the same workout.
+        replace keeps re-ingestion idempotent instead of appending a second copy of
+        the same workout. Its delete and insert share one transaction, so a failing
+        insert leaves the stored workout untouched.
         """
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
             return 0
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
-            if record.external_id:
-                self.workout_repo.delete_by_external_id(db, user_id, record.external_id, source=self.provider_name)
-            created = event_record_service.create(db, record)
+            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
+            if created is None:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Skipped Oura workout: an unrelated workout already occupies its time window",
+                    action="oura_workout_slot_taken",
+                    user_id=str(user_id),
+                    workout_id=workout_id,
+                )
+                continue
             detail = details.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail)
             count += 1
