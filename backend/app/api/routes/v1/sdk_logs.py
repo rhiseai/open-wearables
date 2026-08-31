@@ -13,6 +13,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sdk_sync_state import mark_historical_data_types_completed, mark_historical_sync_started
 from app.utils.auth import SDKAuthDep
 from app.utils.structured_logging import log_structured
 
@@ -85,6 +86,12 @@ def submit_sdk_logs(
     batch_id = str(uuid.uuid4())
     provider = (body.provider or "unknown").lower()
     event_types = [e.eventType for e in body.events]
+    for event in body.events:
+        if isinstance(event, HistoricalDataSyncStartEvent):
+            mark_historical_sync_started(user_id, provider, (item.type for item in event.dataTypeCounts))
+    completed_types = [event.dataType for event in body.events if isinstance(event, HistoricalDataTypeSyncEndEvent)]
+    if completed_types:
+        mark_historical_data_types_completed(user_id, provider, completed_types)
 
     log_structured(
         logger,

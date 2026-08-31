@@ -282,3 +282,40 @@ jobs:
             echo "| Commit | \`${COMMIT_SHA}\` |"
             echo "| URL | https://ow.getlucie.ai |"
           } >> $GITHUB_STEP_SUMMARY
+
+  configure-lucie-webhook:
+    needs: deploy-app
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Restrict Lucie webhook subscriptions
+        env:
+          OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
+          OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
+          OW_API_BASE: https://ow.getlucie.ai/api
+          LUCIE_ENDPOINT_PATTERN: ^https://api\.getlucie\.ai/(api/v1/)?webhooks/ow/?$
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl --fail-with-body --silent --show-error \
+            --data-urlencode "username=${OW_ADMIN_EMAIL}" \
+            --data-urlencode "password=${OW_ADMIN_PASSWORD}" \
+            "${OW_API_BASE}/v1/auth/login" | jq -er '.access_token')
+          ENDPOINTS=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${OW_API_BASE}/v1/webhooks/endpoints")
+          mapfile -t ENDPOINT_IDS < <(jq -er --arg pattern "${LUCIE_ENDPOINT_PATTERN}" \
+            '.[] | select(.url | test($pattern)) | .id' <<<"${ENDPOINTS}")
+          if [[ ${#ENDPOINT_IDS[@]} -eq 0 ]]; then
+            echo "::error::Lucie webhook endpoint was not found"
+            exit 1
+          fi
+          for endpoint_id in "${ENDPOINT_IDS[@]}"; do
+            curl --fail-with-body --silent --show-error \
+              -X PATCH \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"filter_types":["sleep.created","sleep.updated","connection.created"]}' \
+              "${OW_API_BASE}/v1/webhooks/endpoints/${endpoint_id}" \
+              | jq -e '.filter_types == ["sleep.created", "sleep.updated", "connection.created"]' >/dev/null
+          done
+          echo "Restricted ${#ENDPOINT_IDS[@]} Lucie webhook endpoint(s)"

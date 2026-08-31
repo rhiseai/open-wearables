@@ -1,3 +1,4 @@
+import json
 import uuid
 from logging import getLogger
 from typing import Any
@@ -17,11 +18,24 @@ from app.services.apple.healthkit.import_service import (
 from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
 from app.services.raw_payload_storage import delete_payload_from_s3, get_payload_from_s3
+from app.services.sdk_sync_state import SDK_REALTIME_ITEM_LIMIT, is_historical_sync_active
 from app.services.sync_status_service import completed, failed, started
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
+
+
+def _payload_item_count(content: str) -> int:
+    try:
+        body = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return 0
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, dict):
+        return 0
+    return sum(len(items) for key in ("records", "workouts", "sleep") if isinstance((items := data.get(key)), list))
 
 
 def _get_import_service(provider: str) -> SDKImportService:
@@ -38,6 +52,7 @@ def process_sdk_upload(
     provider: str,
     batch_id: str | None = None,
     payload_ref: str | None = None,
+    historical_export: bool | None = None,
 ) -> dict[str, Any]:
     """
     Process SDK data import asynchronously.
@@ -140,6 +155,13 @@ def process_sdk_upload(
         metadata={"batch_id": batch_id},
     )
 
+    item_count = _payload_item_count(content)
+    historical_export = (
+        bool(historical_export)
+        or is_historical_sync_active(user_uuid, provider)
+        or item_count > SDK_REALTIME_ITEM_LIMIT
+    )
+
     with SessionLocal() as db:
         # Ensure SDK connection exists for this user (SDK-based, no OAuth tokens)
         connection_repo = UserConnectionRepository()
@@ -148,9 +170,10 @@ def process_sdk_upload(
         # Select the appropriate import service based on source
         import_service = _get_import_service(provider)
 
-        result = import_service.import_data_from_request(
-            db, content, content_type, user_id, batch_id=batch_id
-        ).model_dump()
+        with collect_sdk_webhooks(batch_id, historical=historical_export) as webhook_batch:
+            result = import_service.import_data_from_request(
+                db, content, content_type, user_id, batch_id=batch_id
+            ).model_dump()
 
         # Log processing completion with results
         log_structured(
@@ -178,6 +201,7 @@ def process_sdk_upload(
         items_total = records_saved + workouts_saved + sleep_saved
 
         if isinstance(status_code, int) and 200 <= status_code < 300:
+            webhook_summary = webhook_batch.flush()
             message = f"{provider.capitalize()} batch saved"
             if dropped_count:
                 message += f" ({dropped_count} record(s) dropped by validation)"
@@ -196,6 +220,7 @@ def process_sdk_upload(
                     "sleep_saved": sleep_saved,
                     "types": types,
                     "dropped_count": dropped_count,
+                    "webhooks": webhook_summary,
                 },
             )
             if payload_ref and settings.raw_payload_storage == "disabled":

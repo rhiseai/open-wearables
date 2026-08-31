@@ -14,6 +14,7 @@ from celery import shared_task
 from app.database import SessionLocal
 from app.services import developer_service
 from app.services.outgoing_webhooks import svix as svix_service
+from app.services.outgoing_webhooks.payloads import validate_webhook_payload
 
 logger = getLogger(__name__)
 
@@ -24,11 +25,13 @@ logger = getLogger(__name__)
     max_retries=2,
     default_retry_delay=5,
     acks_late=True,
+    queue="webhook_outgoing",
+    rate_limit="20/s",
 )
 def emit_webhook_event(
     self: Any,
     event_type: str,
-    payload: dict[str, Any],
+    payload: Any,
     *,
     channels: list[str] | None = None,
     idempotency_key: str | None = None,
@@ -39,6 +42,12 @@ def emit_webhook_event(
     application.  Multi-developer scoping (developer_id on User) can be
     added later to narrow the audience.
     """
+    try:
+        payload = validate_webhook_payload(event_type, payload)
+    except ValueError as exc:
+        logger.error("Dropping invalid webhook task event=%s: %s", event_type, exc)
+        return {"event_type": event_type, "sent": 0, "errors": ["invalid_payload"]}
+
     if not svix_service.is_enabled():
         logger.debug("Svix is not configured — skipping webhook dispatch for event %s", event_type)
         return {"event_type": event_type, "sent": 0, "errors": []}

@@ -111,9 +111,11 @@ def create_celery() -> Celery:
             "sdk_sync": {},
             "garmin_sync": {},
             "webhook_sync": {},
+            "webhook_outgoing": {},
         },
         task_routes={
             "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
+            "app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event": {"queue": "webhook_outgoing"},
         },
     )
 

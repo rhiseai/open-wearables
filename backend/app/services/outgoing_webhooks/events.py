@@ -13,27 +13,52 @@ import re
 from typing import Any
 from uuid import UUID
 
-from app.constants.webhooks.events import SERIES_TYPE_TO_GRANULAR_EVENT, SERIES_TYPE_TO_GROUP_EVENT
+from app.constants.webhooks.events import SERIES_TYPE_TO_GROUP_EVENT
 from app.schemas.webhooks.event_types import WebhookEventType
 from app.services.outgoing_webhooks import svix as svix_service
+from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
+from app.services.outgoing_webhooks.payloads import split_samples_by_payload_bytes, validate_webhook_payload
 
 logger = logging.getLogger(__name__)
-
-# Maximum number of samples included in a single Svix message.
-# At ~200 bytes per serialised sample, 2 500 samples ≈ 500 KB — well within
-# Svix's 1 MB payload limit.  Batches larger than this are split into
-# consecutive chunk events, each carrying a ``chunk_index`` / ``total_chunks``
-# envelope so consumers can reassemble if needed.
-SVIX_MAX_SAMPLES_PER_EVENT = 2500
 
 # Svix eventId must match [a-zA-Z0-9\-_.] — colons, plus-signs, and other
 # characters in ISO 8601 timestamps are not allowed.
 _SVIX_ID_SAFE = re.compile(r"[^a-zA-Z0-9\-_.]")
+_SVIX_EVENT_ID_MAX_LENGTH = 128
 
 
 def _safe_key(raw: str) -> str:
-    """Replace characters forbidden in a Svix eventId with underscores."""
-    return _SVIX_ID_SAFE.sub("_", raw)
+    """Return a bounded key containing only characters allowed by Svix."""
+    safe = _SVIX_ID_SAFE.sub("_", raw)
+    if len(safe) <= _SVIX_EVENT_ID_MAX_LENGTH:
+        return safe
+    digest = hashlib.sha256(safe.encode()).hexdigest()[:20]
+    return f"{safe[: _SVIX_EVENT_ID_MAX_LENGTH - len(digest) - 1]}.{digest}"
+
+
+def _enqueue_dispatch(
+    event_type: str,
+    payload: dict[str, Any],
+    *,
+    channels: list[str] | None = None,
+    idempotency_key: str | None = None,
+) -> bool:
+    """Validate and enqueue one bounded event. Returns whether it was accepted."""
+    if not svix_service.is_enabled():
+        return False
+    try:
+        validate_webhook_payload(event_type, payload)
+    except ValueError as exc:
+        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        return False
+    try:
+        from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
+
+        emit_webhook_event.delay(event_type, payload, channels=channels, idempotency_key=idempotency_key)
+        return True
+    except Exception:
+        logger.warning("Could not enqueue webhook event %s", event_type, exc_info=True)
+        return False
 
 
 def _dispatch(
@@ -42,6 +67,7 @@ def _dispatch(
     *,
     channels: list[str] | None = None,
     idempotency_key: str | None = None,
+    coalesce_key: str | None = None,
 ) -> None:
     """Schedule the Celery emit task.
 
@@ -52,11 +78,26 @@ def _dispatch(
     if not svix_service.is_enabled():
         return
     try:
-        from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
-
-        emit_webhook_event.delay(event_type, payload, channels=channels, idempotency_key=idempotency_key)
-    except Exception:
-        logger.warning("Could not enqueue webhook event %s", event_type, exc_info=True)
+        validate_webhook_payload(event_type, payload)
+    except ValueError as exc:
+        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        return
+    batch = current_sdk_webhook_batch()
+    if batch is not None:
+        batch.add(
+            event_type,
+            payload,
+            channels=channels,
+            idempotency_key=idempotency_key,
+            coalesce_key=coalesce_key,
+        )
+        return
+    _enqueue_dispatch(
+        event_type,
+        payload,
+        channels=channels,
+        idempotency_key=idempotency_key,
+    )
 
 
 def on_workout_created(
@@ -99,6 +140,7 @@ def on_workout_created(
             },
         },
         idempotency_key=f"workout.created.{record_id}",
+        coalesce_key=f"workout.{record_id}",
         channels=[f"user.{user_id}"],
     )
 
@@ -137,6 +179,7 @@ def on_menstrual_cycle_created(
             },
         },
         idempotency_key=f"menstrual_cycle.created.{record_id}",
+        coalesce_key=f"menstrual_cycle.{record_id}",
         channels=[f"user.{user_id}"],
     )
 
@@ -183,6 +226,7 @@ def _emit_sleep(
             },
         },
         idempotency_key=f"{event_type}.{record_id}.{revision}",
+        coalesce_key=f"sleep.{record_id}",
         channels=[f"user.{user_id}"],
     )
 
@@ -207,77 +251,81 @@ def on_timeseries_batch_saved(
     end_time: str | None = None,
     samples: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Emit one webhook event per data-type per ingestion batch.
-
-    Each event carries the full ``samples`` array so consumers can operate in
-    a webhook-first architecture without issuing follow-up API calls.
-
-    When ``samples`` exceeds ``SVIX_MAX_SAMPLES_PER_EVENT`` the batch is split
-    into multiple consecutive chunk events.  Every chunk includes
-    ``chunk_index`` (0-based) and ``total_chunks`` so consumers can detect and
-    reassemble split deliveries.  Single-chunk payloads omit these fields to
-    keep the common case clean.
-
-    Two events are emitted per batch:
-    - a *group* event (e.g. ``heart_rate.created``) for broad subscriptions
-    - a *granular* event (e.g. ``series.resting_heart_rate.created``) for
-      narrow subscriptions to a specific metric
-    """
-    group_event = SERIES_TYPE_TO_GROUP_EVENT.get(series_type)
-    if group_event is None:
-        return
-    granular_event = SERIES_TYPE_TO_GRANULAR_EVENT.get(series_type)
-    if granular_event and granular_event != group_event:
-        event_types_to_emit = [group_event, granular_event]
-    else:
-        event_types_to_emit = [group_event]
+    """Aggregate this write into the current SDK batch, or emit one group event."""
     samples = samples or []
-
-    def _emit(event_type: str, payload_data: dict[str, Any], ikey: str) -> None:
-        _dispatch(
-            event_type,
-            {"type": event_type, "data": payload_data},
-            idempotency_key=_safe_key(f"{ikey}.{event_type}"),
-            channels=[f"user.{user_id}"],
+    batch = current_sdk_webhook_batch()
+    if batch is not None:
+        batch.add_timeseries(
+            user_id=user_id,
+            provider=provider,
+            series_type=series_type,
+            sample_count=sample_count,
+            start_time=start_time,
+            end_time=end_time,
+            samples=samples,
         )
+        return
+    _emit_timeseries_batch_now(
+        user_id=user_id,
+        provider=provider,
+        series_type=series_type,
+        sample_count=sample_count,
+        start_time=start_time,
+        end_time=end_time,
+        samples=samples,
+    )
 
-    if len(samples) <= SVIX_MAX_SAMPLES_PER_EVENT:
-        base_key = f"timeseries.{user_id}.{provider}.{series_type}.{start_time or ''}.{end_time or ''}"
-        data: dict[str, Any] = {
-            "user_id": str(user_id),
-            "provider": provider,
-            "series_type": series_type,
-            "sample_count": sample_count,
-            "start_time": start_time,
-            "end_time": end_time,
-            "samples": samples,
+
+def _emit_timeseries_batch_now(
+    *,
+    user_id: UUID,
+    provider: str,
+    series_type: str,
+    sample_count: int,
+    start_time: str | None,
+    end_time: str | None,
+    samples: list[dict[str, Any]],
+) -> int:
+    """Emit the canonical group event, split by exact serialized byte size."""
+    event_type = SERIES_TYPE_TO_GROUP_EVENT.get(series_type)
+    if event_type is None:
+        return 0
+    base_data: dict[str, Any] = {
+        "user_id": str(user_id),
+        "provider": provider,
+        "series_type": series_type,
+        "sample_count": sample_count,
+        "start_time": start_time,
+        "end_time": end_time,
+    }
+    try:
+        chunks = split_samples_by_payload_bytes(event_type, base_data, samples)
+    except ValueError as exc:
+        logger.warning("Dropping oversized/invalid timeseries webhook %s: %s", series_type, exc)
+        return 0
+
+    total_chunks = len(chunks)
+    emitted = 0
+    for chunk_index, chunk in enumerate(chunks):
+        data = {
+            **base_data,
+            "start_time": chunk[0].get("timestamp", start_time) if chunk else start_time,
+            "end_time": chunk[-1].get("timestamp", end_time) if chunk else end_time,
+            "samples": chunk,
         }
-        for event_type in event_types_to_emit:
-            _emit(event_type, data, base_key)
-    else:
-        chunks = [
-            samples[i : i + SVIX_MAX_SAMPLES_PER_EVENT] for i in range(0, len(samples), SVIX_MAX_SAMPLES_PER_EVENT)
-        ]
-        total_chunks = len(chunks)
-        for chunk_index, chunk in enumerate(chunks):
-            chunk_start = chunk[0]["timestamp"] if chunk else start_time
-            chunk_end = chunk[-1]["timestamp"] if chunk else end_time
-            base_key = (
-                f"timeseries.{user_id}.{provider}.{series_type}.{start_time or ''}.{end_time or ''}.chunk{chunk_index}"
-            )
-            data = {
-                "user_id": str(user_id),
-                "provider": provider,
-                "series_type": series_type,
-                "sample_count": sample_count,
-                "start_time": chunk_start,
-                "end_time": chunk_end,
-                "samples": chunk,
-                "chunk_index": chunk_index,
-                "total_chunks": total_chunks,
-            }
-            for event_type in event_types_to_emit:
-                _emit(event_type, data, base_key)
+        if total_chunks > 1:
+            data.update({"chunk_index": chunk_index, "total_chunks": total_chunks})
+        base_key = (
+            f"timeseries.{user_id}.{provider}.{series_type}.{start_time or ''}.{end_time or ''}.chunk{chunk_index}"
+        )
+        if _enqueue_dispatch(
+            event_type,
+            {"type": event_type, "data": data},
+            idempotency_key=_safe_key(f"{base_key}.{event_type}"),
+            channels=[f"user.{user_id}"],
+        ):
+            emitted += 1
+    return emitted
 
 
 def on_connection_created(

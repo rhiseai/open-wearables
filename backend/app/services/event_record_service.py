@@ -205,11 +205,13 @@ class EventRecordService(
     def _to_local(dt: datetime, zone_offset: str | None) -> datetime:
         """Shift a datetime into the session's local zone (mirrors SQL logic in fill task)."""
         dt = dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
-        if zone_offset is not None:
-            sign = 1 if zone_offset[0] == "+" else -1
-            hours, minutes = int(zone_offset[1:3]), int(zone_offset[4:6])
-            dt = dt.astimezone(timezone(timedelta(hours=sign * hours, minutes=sign * minutes)))
-        return dt
+        if zone_offset is None:
+            # PostgreSQL renders timestamptz values in the connection's timezone.
+            # A missing wearable offset means UTC, not the database/session timezone.
+            return dt.astimezone(timezone.utc)
+        sign = 1 if zone_offset[0] == "+" else -1
+        hours, minutes = int(zone_offset[1:3]), int(zone_offset[4:6])
+        return dt.astimezone(timezone(timedelta(hours=sign * hours, minutes=sign * minutes)))
 
     @classmethod
     def _local_sleep_date(cls, start_datetime: datetime, zone_offset: str | None) -> date:

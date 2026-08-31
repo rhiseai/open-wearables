@@ -1,4 +1,5 @@
 import logging
+import re
 
 from app.schemas.enums import WorkoutType
 from app.utils.structured_logging import log_structured
@@ -166,6 +167,11 @@ WHOOP_ID_TO_UNIFIED: dict[int, WorkoutType] = {
 }
 
 
+def _normalize_sport_name(value: str) -> str:
+    """Accept current slugs and legacy display names returned by older payloads."""
+    return re.sub(r"[^a-z0-9]+", "-", value.lower().strip()).strip("-")
+
+
 def get_unified_workout_type(whoop_sport_name: str | None, whoop_sport_id: int | None = None) -> WorkoutType:
     """
     Convert Whoop sport to unified WorkoutType.
@@ -196,7 +202,7 @@ def get_unified_workout_type(whoop_sport_name: str | None, whoop_sport_id: int |
         - If both fields are missing or unmapped, defaults to WorkoutType.OTHER
     """
     if whoop_sport_name:
-        unified_type = WHOOP_TO_UNIFIED.get(whoop_sport_name.lower().strip())
+        unified_type = WHOOP_TO_UNIFIED.get(_normalize_sport_name(whoop_sport_name))
         if unified_type is not None:
             return unified_type
 
