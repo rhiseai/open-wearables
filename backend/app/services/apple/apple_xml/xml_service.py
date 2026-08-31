@@ -2,7 +2,7 @@ from datetime import datetime
 from decimal import Decimal
 from logging import Logger
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, BinaryIO, Generator
 from uuid import UUID, uuid4
 from xml.etree import ElementTree as ET
 
@@ -45,8 +45,8 @@ _MINDFUL_TYPES = {
 
 
 class XMLService:
-    def __init__(self, path: Path, log: Logger):
-        self.xml_path: Path = path
+    def __init__(self, source: str | Path | BinaryIO, log: Logger):
+        self.xml_source = source
         self.chunk_size: int = settings.xml_chunk_size
         self.log: Logger = log
         self.stats: XMLParseStats = XMLParseStats()
@@ -380,7 +380,7 @@ class XMLService:
         self.stats = XMLParseStats()
         self.menstrual_records = []
 
-        for event, elem in ET.iterparse(self.xml_path, events=("end",)):
+        for event, elem in ET.iterparse(self.xml_source, events=("end",)):
             if elem.tag == "Record" and event == "end":
                 if len(workouts) + len(time_series_records) + len(sleep_records) >= self.chunk_size:
                     self.log.info(
