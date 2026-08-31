@@ -343,7 +343,7 @@ jobs:
           OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
           OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
           OW_API_BASE: https://ow-staging.getlucie.ai/api
-          LUCIE_ENDPOINT_PATTERN: ^https://api-staging\.getlucie\.ai/(api/v1/)?webhooks/ow/?$
+          LUCIE_ENDPOINT_PATTERN: ^https://[^/]*getlucie\.ai/(api/v1/)?webhooks/ow/?$
         run: |
           set -euo pipefail
           TOKEN=$(curl --fail-with-body --silent --show-error \
@@ -353,8 +353,9 @@ jobs:
           ENDPOINTS=$(curl --fail-with-body --silent --show-error \
             -H "Authorization: Bearer ${TOKEN}" \
             "${OW_API_BASE}/v1/webhooks/endpoints")
-          mapfile -t ENDPOINT_IDS < <(jq -er --arg pattern "${LUCIE_ENDPOINT_PATTERN}" \
+          mapfile -t ENDPOINT_IDS < <(jq -r --arg pattern "${LUCIE_ENDPOINT_PATTERN}" \
             '.[] | select(.url | test($pattern)) | .id' <<<"${ENDPOINTS}")
+          echo "Found $(jq 'length' <<<"${ENDPOINTS}") endpoint(s), ${#ENDPOINT_IDS[@]} for Lucie"
           if [[ ${#ENDPOINT_IDS[@]} -eq 0 ]]; then
             echo "::error::Lucie webhook endpoint was not found"
             exit 1
