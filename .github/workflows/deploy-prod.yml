@@ -317,6 +317,6 @@ jobs:
               -H "Content-Type: application/json" \
               -d '{"filter_types":["sleep.created","sleep.updated","connection.created"]}' \
               "${OW_API_BASE}/v1/webhooks/endpoints/${endpoint_id}" \
-              | jq -e '.filter_types == ["sleep.created", "sleep.updated", "connection.created"]' >/dev/null
+              | jq -e '(.filter_types | sort) == (["sleep.created", "sleep.updated", "connection.created"] | sort)' >/dev/null
           done
           echo "Restricted ${#ENDPOINT_IDS[@]} Lucie webhook endpoint(s)"
