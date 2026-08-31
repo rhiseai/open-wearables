@@ -297,21 +297,30 @@ jobs:
 
       - name: Restrict Lucie webhook subscriptions
         id: run
+        env:
+          SVIX_JWT_SECRET: ${{ secrets.SVIX_JWT_SECRET }}
         run: |
           set -euo pipefail
           NET_CFG=$(aws ecs describe-services \
             --cluster "${ECS_CLUSTER}" \
             --services ow-backend \
             --query 'services[0].networkConfiguration' --output json)
-          TASK_DEF=$(aws ecs describe-services \
-            --cluster "${ECS_CLUSTER}" \
-            --services ow-backend \
-            --query 'services[0].taskDefinition' --output text)
+          TASK_DEF=ow-migrator
           CONTAINER_NAME=$(aws ecs describe-task-definition \
             --task-definition "${TASK_DEF}" \
             --query 'taskDefinition.containerDefinitions[0].name' --output text)
-          OVERRIDES=$(jq -cn --arg name "${CONTAINER_NAME}" \
-            '{containerOverrides:[{name:$name,command:["uv","run","python","scripts/configure_lucie_webhook.py"]}]}')
+          OVERRIDES=$(jq -cn \
+            --arg name "${CONTAINER_NAME}" \
+            --arg svix_jwt_secret "${SVIX_JWT_SECRET}" \
+            '{containerOverrides:[{
+              name:$name,
+              command:["uv","run","python","scripts/configure_lucie_webhook.py"],
+              environment:[
+                {name:"OUTGOING_WEBHOOKS_ENABLED",value:"true"},
+                {name:"SVIX_SERVER_URL",value:"http://svix-server:8071"},
+                {name:"SVIX_JWT_SECRET",value:$svix_jwt_secret}
+              ]
+            }]}')
           TASK_ARN=$(aws ecs run-task \
             --cluster "${ECS_CLUSTER}" \
             --task-definition "${TASK_DEF}" \
@@ -342,6 +351,6 @@ jobs:
           echo "Stopped reason: ${STOP_REASON}"
           if [[ "${EXIT_CODE}" != "0" ]]; then
             echo "::error::Lucie webhook configuration failed (exit ${EXIT_CODE}: ${STOP_REASON})"
-            aws logs tail /ecs/ow-backend --since 5m --region "${AWS_REGION}" || true
+            aws logs tail /ecs/ow-migrator --since 5m --region "${AWS_REGION}" || true
             exit 1
           fi
