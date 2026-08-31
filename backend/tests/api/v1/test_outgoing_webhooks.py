@@ -21,8 +21,8 @@ from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
+from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
 from app.services.outgoing_webhooks.events import (
-    SVIX_MAX_SAMPLES_PER_EVENT,
     _dispatch,
     on_connection_created,
     on_connection_revoked,
@@ -30,6 +30,7 @@ from app.services.outgoing_webhooks.events import (
     on_timeseries_batch_saved,
     on_workout_created,
 )
+from app.services.outgoing_webhooks.payloads import MAX_WEBHOOK_PAYLOAD_BYTES, encoded_payload_size
 from app.utils.security import create_access_token
 from tests.factories import DeveloperFactory
 
@@ -178,11 +179,9 @@ class TestWebhookEmit:
             end_time="2026-04-16T06:05:00+00:00",
             samples=samples,
         )
-        mock_task.delay.assert_called()
-        assert mock_task.delay.call_count == 2
+        mock_task.delay.assert_called_once()
         calls = {c[0][0] for c in mock_task.delay.call_args_list}
         assert "heart_rate.created" in calls
-        assert "series.heart_rate.created" in calls
         # validate payload on the group event
         group_call = next(c for c in mock_task.delay.call_args_list if c[0][0] == "heart_rate.created")
         args = group_call
@@ -204,10 +203,9 @@ class TestWebhookEmit:
             series_type="heart_rate",
             sample_count=100,
         )
-        assert mock_task.delay.call_count == 2
+        assert mock_task.delay.call_count == 1
         calls = {c[0][0] for c in mock_task.delay.call_args_list}
         assert "heart_rate.created" in calls
-        assert "series.heart_rate.created" in calls
         group_call = next(c for c in mock_task.delay.call_args_list if c[0][0] == "heart_rate.created")
         data = group_call[0][1]["data"]
         assert data["samples"] == []
@@ -215,7 +213,7 @@ class TestWebhookEmit:
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_timeseries_batch_saved_chunks_large_payload(self, mock_task: MagicMock) -> None:
-        """Batches exceeding SVIX_MAX_SAMPLES_PER_EVENT are split into chunk events."""
+        """Batches are split by exact JSON bytes, never an estimated sample count."""
         uid = uuid4()
         large_samples = [
             {
@@ -225,8 +223,9 @@ class TestWebhookEmit:
                 "value": float(60 + i % 40),
                 "unit": "bpm",
                 "source": {"provider": "garmin", "device": None},
+                "metadata": "x" * 2000,
             }
-            for i in range(SVIX_MAX_SAMPLES_PER_EVENT + 10)
+            for i in range(600)
         ]
         on_timeseries_batch_saved(
             user_id=uid,
@@ -237,21 +236,82 @@ class TestWebhookEmit:
             end_time=large_samples[-1]["timestamp"],
             samples=large_samples,
         )
-        # 2 chunks × 2 event types (group + granular) = 4 calls
-        assert mock_task.delay.call_count == 4
+        assert mock_task.delay.call_count >= 2
         group_calls = [c for c in mock_task.delay.call_args_list if c[0][0] == "heart_rate.created"]
-        assert len(group_calls) == 2
-        first_data = group_calls[0][0][1]["data"]
-        second_data = group_calls[1][0][1]["data"]
-        assert first_data["chunk_index"] == 0
-        assert first_data["total_chunks"] == 2
-        assert second_data["chunk_index"] == 1
-        assert second_data["total_chunks"] == 2
-        assert len(first_data["samples"]) == SVIX_MAX_SAMPLES_PER_EVENT
-        assert len(second_data["samples"]) == 10
-        # sample_count reflects the full batch in every chunk
-        assert first_data["sample_count"] == len(large_samples)
-        assert second_data["sample_count"] == len(large_samples)
+        assert sum(len(call[0][1]["data"]["samples"]) for call in group_calls) == len(large_samples)
+        for index, call in enumerate(group_calls):
+            payload = call[0][1]
+            assert encoded_payload_size(payload) <= MAX_WEBHOOK_PAYLOAD_BYTES
+            assert payload["data"]["chunk_index"] == index
+            assert payload["data"]["total_chunks"] == len(group_calls)
+            assert payload["data"]["sample_count"] == len(large_samples)
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_sdk_batch_coalesces_sleep_revisions(self, mock_task: MagicMock) -> None:
+        uid, rid = uuid4(), uuid4()
+        with collect_sdk_webhooks("batch-1", historical=False) as batch:
+            for duration in (1800, 28800):
+                on_sleep_created(
+                    record_id=rid,
+                    user_id=uid,
+                    provider="apple",
+                    device=None,
+                    start_time="2026-01-01T22:00:00",
+                    end_time="2026-01-02T06:00:00",
+                    zone_offset=None,
+                    duration_seconds=duration,
+                    efficiency_percent=None,
+                    stages=None,
+                    is_nap=False,
+                )
+        summary = batch.flush()
+
+        mock_task.delay.assert_called_once()
+        assert mock_task.delay.call_args[0][1]["data"]["duration_seconds"] == 28800
+        assert summary["coalesced"] == 1
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_sdk_batch_caps_session_and_timeseries_events_together(self, mock_task: MagicMock) -> None:
+        uid = uuid4()
+        with collect_sdk_webhooks("batch-cap", historical=False) as batch:
+            for index in range(64):
+                _dispatch(
+                    "workout.created",
+                    {"type": "workout.created", "data": {"index": index}},
+                    coalesce_key=f"workout.{index}",
+                )
+            on_timeseries_batch_saved(
+                user_id=uid,
+                provider="apple",
+                series_type="heart_rate",
+                sample_count=1,
+                samples=[{"timestamp": "2026-01-01T00:00:00+00:00", "value": 60}],
+            )
+        summary = batch.flush()
+
+        assert mock_task.delay.call_count == 64
+        assert summary["emitted"] == 64
+        assert summary["suppressed"] == 1
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_historical_sdk_batch_suppresses_realtime_events(self, mock_task: MagicMock) -> None:
+        with collect_sdk_webhooks("batch-history", historical=True) as batch:
+            on_workout_created(
+                record_id=uuid4(),
+                user_id=uuid4(),
+                provider="apple",
+                device=None,
+                workout_type="RUNNING",
+                start_time="2025-01-01T00:00:00",
+                end_time="2025-01-01T01:00:00",
+                zone_offset=None,
+                duration_seconds=3600,
+            )
+        summary = batch.flush()
+
+        mock_task.delay.assert_not_called()
+        assert summary["historical"] is True
+        assert summary["suppressed"] == 1
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_timeseries_skips_unmapped_series_type(self, mock_task: MagicMock) -> None:
@@ -335,6 +395,13 @@ class TestWebhookEmit:
 
 
 class TestEmitWebhookEventTask:
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
+    def test_invalid_payload_never_reaches_svix(self, mock_svix: MagicMock) -> None:
+        result = emit_webhook_event("sleep.created", {"data": {}})
+
+        assert result["errors"] == ["invalid_payload"]
+        mock_svix.send.assert_not_called()
+
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
     def test_sends_to_all_developers(

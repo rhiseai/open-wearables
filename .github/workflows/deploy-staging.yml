@@ -205,6 +205,7 @@ jobs:
           # Core
           SECRET_KEY=${OW_SECRET_KEY}
           SVIX_JWT_SECRET=${SVIX_JWT_SECRET}
+          OUTGOING_WEBHOOKS_ENABLED=True
           ADMIN_EMAIL=${OW_ADMIN_EMAIL}
           ADMIN_PASSWORD=${OW_ADMIN_PASSWORD}
           OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY}
@@ -336,6 +337,39 @@ jobs:
             echo "::error::deploy.sh ended with Status=$STATUS"
             exit 1
           fi
+
+      - name: Restrict Lucie webhook subscriptions
+        env:
+          OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
+          OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
+          OW_API_BASE: https://ow-staging.getlucie.ai/api
+          LUCIE_ENDPOINT_PATTERN: ^https://[^/]*getlucie\.ai/(api/v1/)?webhooks/ow/?$
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl --fail-with-body --silent --show-error \
+            --data-urlencode "username=${OW_ADMIN_EMAIL}" \
+            --data-urlencode "password=${OW_ADMIN_PASSWORD}" \
+            "${OW_API_BASE}/v1/auth/login" | jq -er '.access_token')
+          ENDPOINTS=$(curl --fail-with-body --silent --show-error \
+            -H "Authorization: Bearer ${TOKEN}" \
+            "${OW_API_BASE}/v1/webhooks/endpoints")
+          mapfile -t ENDPOINT_IDS < <(jq -r --arg pattern "${LUCIE_ENDPOINT_PATTERN}" \
+            '.[] | select(.url | test($pattern)) | .id' <<<"${ENDPOINTS}")
+          echo "Found $(jq 'length' <<<"${ENDPOINTS}") endpoint(s), ${#ENDPOINT_IDS[@]} for Lucie"
+          if [[ ${#ENDPOINT_IDS[@]} -eq 0 ]]; then
+            echo "::error::Lucie webhook endpoint was not found"
+            exit 1
+          fi
+          for endpoint_id in "${ENDPOINT_IDS[@]}"; do
+            curl --fail-with-body --silent --show-error \
+              -X PATCH \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d '{"filter_types":["sleep.created","sleep.updated","connection.created"]}' \
+              "${OW_API_BASE}/v1/webhooks/endpoints/${endpoint_id}" \
+              | jq -e '(.filter_types | sort) == (["sleep.created", "sleep.updated", "connection.created"] | sort)' >/dev/null
+          done
+          echo "Restricted ${#ENDPOINT_IDS[@]} Lucie webhook endpoint(s)"
 
       - name: Summary
         env:

@@ -13,6 +13,7 @@ from app.schemas.model_crud.activities import (
     HealthScoreCreate,
     ScoreComponent,
 )
+from app.schemas.model_crud.activities.zones import HRZone, HRZones
 from app.schemas.providers.whoop import WhoopWorkoutCollectionJSON, WhoopWorkoutJSON
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
@@ -220,6 +221,30 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
 
         return start_date, end_date
 
+    # zone_durations keys in zone order; zone_zero is the time below zone 1.
+    _ZONE_KEYS = (
+        "zone_zero_milli",
+        "zone_one_milli",
+        "zone_two_milli",
+        "zone_three_milli",
+        "zone_four_milli",
+        "zone_five_milli",
+    )
+
+    def _build_hr_zones(self, raw_workout: WhoopWorkoutJSON) -> HRZones | None:
+        """Convert Whoop's per-zone millisecond durations into HRZones."""
+        durations = raw_workout.score.zone_durations if raw_workout.score else None
+        if not durations:
+            return None
+
+        zones = []
+        for zone, key in enumerate(self._ZONE_KEYS):
+            milli = durations.get(key)
+            if milli is not None:
+                zones.append(HRZone(zone=zone, seconds=milli / 1000))
+
+        return HRZones(zones=zones) if zones else None
+
     def _build_metrics(self, raw_workout: WhoopWorkoutJSON) -> EventRecordMetrics:
         """Build metrics from Whoop workout data."""
         score = raw_workout.score
@@ -259,7 +284,12 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         raw_workout: WhoopWorkoutJSON,
         user_id: UUID,
     ) -> HealthScoreCreate | None:
-        """Extract strain health score from a Whoop workout record."""
+        """Extract strain health score from a Whoop workout record.
+
+        Leaves event_record_id unset — the caller fills it in with the id of the
+        event record it created, which is what distinguishes a per-workout strain
+        from the per-day cycle strain in app/services/providers/whoop/data_247.py.
+        """
         if not raw_workout.score or raw_workout.score.strain is None:
             return None
         try:
@@ -298,8 +328,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         """Normalize Whoop workout to EventRecordCreate, EventRecordDetailCreate, and strain HealthScoreCreate."""
         workout_id = uuid4()
 
-        # Get workout type from sport_name (sport_id deprecated after 09/01/2025)
-        workout_type = get_unified_workout_type(raw_workout.sport_name)
+        workout_type = get_unified_workout_type(raw_workout.sport_name, raw_workout.sport_id)
 
         # Extract dates
         start_date, end_date = self._extract_dates(raw_workout.start, raw_workout.end)
@@ -327,6 +356,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         # Create EventRecordDetailCreate
         workout_detail_create = EventRecordDetailCreate(
             record_id=workout_id,
+            hr_zones=self._build_hr_zones(raw_workout),
             **metrics,
         )
 
@@ -458,7 +488,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                 event_record_service.create_detail(db, detail_for_record)
                 count += 1
                 if strain_score:
-                    strain_scores.append(strain_score)
+                    strain_scores.append(strain_score.model_copy(update={"event_record_id": created_record.id}))
 
         if strain_scores:
             try:
