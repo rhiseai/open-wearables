@@ -305,6 +305,18 @@ jobs:
             --cluster "${ECS_CLUSTER}" \
             --services ow-backend \
             --query 'services[0].networkConfiguration' --output json)
+          BACKEND_TASK_DEF=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services ow-backend \
+            --query 'services[0].taskDefinition' --output text)
+          SVIX_SERVER_URL=$(aws ecs describe-task-definition \
+            --task-definition "${BACKEND_TASK_DEF}" \
+            --query "taskDefinition.containerDefinitions[0].environment[?name=='SVIX_SERVER_URL'].value | [0]" \
+            --output text)
+          if [[ -z "${SVIX_SERVER_URL}" || "${SVIX_SERVER_URL}" == "None" ]]; then
+            echo "::error::SVIX_SERVER_URL is not configured on the production backend task"
+            exit 1
+          fi
           TASK_DEF=ow-migrator
           CONTAINER_NAME=$(aws ecs describe-task-definition \
             --task-definition "${TASK_DEF}" \
@@ -312,12 +324,13 @@ jobs:
           OVERRIDES=$(jq -cn \
             --arg name "${CONTAINER_NAME}" \
             --arg svix_jwt_secret "${SVIX_JWT_SECRET}" \
+            --arg svix_server_url "${SVIX_SERVER_URL}" \
             '{containerOverrides:[{
               name:$name,
               command:["uv","run","python","scripts/configure_lucie_webhook.py"],
               environment:[
                 {name:"OUTGOING_WEBHOOKS_ENABLED",value:"true"},
-                {name:"SVIX_SERVER_URL",value:"http://svix-server:8071"},
+                {name:"SVIX_SERVER_URL",value:$svix_server_url},
                 {name:"SVIX_JWT_SECRET",value:$svix_jwt_secret}
               ]
             }]}')
