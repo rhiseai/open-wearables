@@ -225,6 +225,7 @@ class TimeSeriesService(
                 total_count=total_count,
             ),
             metadata=TimeseriesMetadata(
+                resolution=params.resolution,
                 sample_count=len(data),
                 start_time=params.start_datetime,
                 end_time=params.end_datetime,

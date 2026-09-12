@@ -1,11 +1,29 @@
 import contextlib
-from datetime import datetime, time, timedelta
+from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import ColumnElement, Date, Interval, String, and_, asc, case, cast, func, literal_column, text, tuple_
+from sqlalchemy import (
+    ColumnElement,
+    Date,
+    Interval,
+    String,
+    Uuid,
+    and_,
+    asc,
+    case,
+    cast,
+    desc,
+    func,
+    literal_column,
+    text,
+    tuple_,
+)
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.orm import Query
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, DeviceTypePriority, ProviderPriority
@@ -13,8 +31,11 @@ from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import (
+    AGGREGATION_METHOD_BY_TYPE,
+    AggregationMethod,
     ProviderName,
     SeriesType,
+    bucket_width,
     get_series_type_from_id,
     get_series_type_id,
 )
@@ -33,6 +54,45 @@ from app.utils.pagination import decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+# Postgres bins from a fixed origin, so a bucket covers the same wall-clock
+# window for every user and every request — 09:05:00 at "5min" is always
+# 09:05:00-09:09:59, never an offset of whenever the range happened to start.
+_BUCKET_ORIGIN = "1970-01-01"
+
+
+@dataclass(frozen=True)
+class BucketedSample:
+    """One downsampled bucket, shaped like the ``DataPointSeries`` row it stands for.
+
+    ``get_samples`` returns these instead of ORM rows when the caller asks for
+    a resolution, so the service maps both the same way. ``id`` is the lowest
+    sample id in the bucket: stable, unique per bucket, and therefore usable as
+    the pagination cursor's tiebreaker exactly like a row id.
+    """
+
+    id: UUID
+    data_source_id: UUID
+    recorded_at: datetime
+    zone_offset: str | None
+    value: Decimal
+    series_type_definition_id: int
+    is_daily_total: bool | None
+
+
+def _series_ids_by_method(method: AggregationMethod) -> list[int]:
+    """Series type definition ids aggregated with ``method``.
+
+    Unknown types fall through to AVG in ``get_aggregation_method``; the same
+    default applies here, so only SUM and MAX need explicit id sets.
+    """
+    ids: list[int] = []
+    for series_type, series_method in AGGREGATION_METHOD_BY_TYPE.items():
+        if series_method is not method:
+            continue
+        with contextlib.suppress(KeyError):
+            ids.append(get_series_type_id(series_type))
+    return ids
 
 
 class WriteCounts(int):
@@ -269,20 +329,71 @@ class DataPointSeriesRepository(
         params: TimeSeriesQueryParams,
         types: list[SeriesType],
         user_id: UUID,
-    ) -> tuple[list[tuple[DataPointSeries, DataSource]], int]:
+    ) -> tuple[list[tuple[DataPointSeries | BucketedSample, DataSource]], int]:
         """Get data points with filtering and keyset pagination.
+
+        ``params.resolution`` downsamples server-side: samples are binned into
+        fixed windows and one row per (bucket, series type, data source) comes
+        back as a ``BucketedSample``. Anything other than RAW goes through
+        ``_get_bucketed_samples``.
 
         Returns a tuple of (samples, total_count) where total_count is calculated
         BEFORE applying cursor pagination, giving the total number of matching records.
         """
-        query = (
-            db_session.query(self.model, DataSource)
-            .join(
+        width = bucket_width(params.resolution)
+        if width is not None:
+            return self._get_bucketed_samples(db_session, params, types, user_id, width)
+
+        query = self._filter_samples(
+            db_session.query(self.model, DataSource).join(
                 DataSource,
                 self.model.data_source_id == DataSource.id,
-            )
-            .filter(DataSource.user_id == user_id)
+            ),
+            params,
+            types,
+            user_id,
         )
+
+        # Calculate total count BEFORE applying cursor pagination
+        # This gives us the total matching records (after all other filters)
+        total_count = query.count()
+
+        # Cursor pagination (keyset)
+        if params.cursor:
+            cursor_ts, cursor_id, direction = decode_cursor(params.cursor)
+
+            if direction == "prev":
+                # Backward pagination: get items BEFORE cursor
+                query = query.filter(
+                    tuple_(self.model.recorded_at, self.model.id) < (cursor_ts, cursor_id),
+                )
+                query = query.order_by(self.model.recorded_at.desc(), self.model.id.desc())
+                # Limit + 1 to check for previous page
+                limit = params.limit or 50
+                results = query.limit(limit + 1).all()
+                # Reverse to get correct order
+                return list(reversed(results)), total_count
+            # Forward pagination: get items AFTER cursor
+            query = query.filter(
+                tuple_(self.model.recorded_at, self.model.id) > (cursor_ts, cursor_id),
+            )
+
+        # Normal ascending order for forward pagination
+        query = query.order_by(asc(self.model.recorded_at), asc(self.model.id))
+
+        # Limit + 1 to check for next page
+        limit = params.limit or 50
+        return query.limit(limit + 1).all(), total_count
+
+    def _filter_samples(
+        self,
+        query: Query,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+    ) -> Query:
+        """Apply the ``/timeseries`` filters. ``query`` must already join ``DataSource``."""
+        query = query.filter(DataSource.user_id == user_id)
 
         if types:
             type_ids = [get_series_type_id(t) for t in types]
@@ -305,36 +416,119 @@ class DataPointSeriesRepository(
                 end_dt = end_dt + timedelta(days=1)
             query = query.filter(self.model.recorded_at < end_dt)
 
-        # Calculate total count BEFORE applying cursor pagination
-        # This gives us the total matching records (after all other filters)
-        total_count = query.count()
+        return query
 
-        # Cursor pagination (keyset)
+    def _get_bucketed_samples(
+        self,
+        db_session: DbSession,
+        params: TimeSeriesQueryParams,
+        types: list[SeriesType],
+        user_id: UUID,
+        width: timedelta,
+    ) -> tuple[list[tuple[DataPointSeries | BucketedSample, DataSource]], int]:
+        """Downsample the matching samples into ``width`` buckets.
+
+        One row per (bucket, series type, data source): sources stay separate so
+        a caller can still tell a watch from a phone and apply its own priority,
+        and daily totals stay separate from intraday samples so a provider that
+        sends both (Garmin, Suunto) is never double-counted inside one bucket —
+        the same rule the daily aggregates use.
+
+        The aggregate follows the series type's own method: summed for
+        cumulative types (steps, energy), averaged for rates (heart rate, HRV),
+        max for peaks. Bucket timestamp is the window start.
+        """
+        bucket = func.date_bin(
+            cast(literal_column(f"'{int(width.total_seconds())} seconds'"), Interval),
+            self.model.recorded_at,
+            cast(literal_column(f"'{_BUCKET_ORIGIN}'"), self.model.recorded_at.type),
+        )
+        # series_type_definition_id is in the GROUP BY, so it is constant per
+        # group and can pick the aggregate for that group.
+        value = case(
+            (
+                self.model.series_type_definition_id.in_(_series_ids_by_method(AggregationMethod.SUM)),
+                func.sum(self.model.value),
+            ),
+            (
+                self.model.series_type_definition_id.in_(_series_ids_by_method(AggregationMethod.MAX)),
+                func.max(self.model.value),
+            ),
+            else_=func.avg(self.model.value),
+        )
+
+        aggregated = (
+            self._filter_samples(
+                db_session.query(
+                    bucket.label("recorded_at"),
+                    # Postgres has no min(uuid); the text form orders the same way
+                    # and only has to be deterministic to serve as a cursor id.
+                    cast(func.min(cast(self.model.id, String)), Uuid).label("id"),
+                    self.model.data_source_id.label("data_source_id"),
+                    self.model.series_type_definition_id.label("series_type_definition_id"),
+                    self.model.is_daily_total.label("is_daily_total"),
+                    func.min(self.model.zone_offset).label("zone_offset"),
+                    value.label("value"),
+                ).join(DataSource, self.model.data_source_id == DataSource.id),
+                params,
+                types,
+                user_id,
+            )
+            .group_by(
+                bucket,
+                self.model.data_source_id,
+                self.model.series_type_definition_id,
+                self.model.is_daily_total,
+            )
+            .subquery()
+        )
+
+        # Buckets, not samples: the count a caller pages through.
+        total_count = db_session.query(func.count()).select_from(aggregated).scalar() or 0
+
+        query = db_session.query(aggregated, DataSource).join(DataSource, aggregated.c.data_source_id == DataSource.id)
+
+        limit = params.limit or 50
+        backward = False
         if params.cursor:
             cursor_ts, cursor_id, direction = decode_cursor(params.cursor)
-
+            keyset = tuple_(aggregated.c.recorded_at, aggregated.c.id)
             if direction == "prev":
-                # Backward pagination: get items BEFORE cursor
-                query = query.filter(
-                    tuple_(self.model.recorded_at, self.model.id) < (cursor_ts, cursor_id),
+                backward = True
+                query = query.filter(keyset < (cursor_ts, cursor_id)).order_by(
+                    desc(aggregated.c.recorded_at),
+                    desc(aggregated.c.id),
                 )
-                query = query.order_by(self.model.recorded_at.desc(), self.model.id.desc())
-                # Limit + 1 to check for previous page
-                limit = params.limit or 50
-                results = query.limit(limit + 1).all()
-                # Reverse to get correct order
-                return list(reversed(results)), total_count  # ty:ignore[invalid-return-type]
-            # Forward pagination: get items AFTER cursor
-            query = query.filter(
-                tuple_(self.model.recorded_at, self.model.id) > (cursor_ts, cursor_id),
+            else:
+                query = query.filter(keyset > (cursor_ts, cursor_id))
+
+        if not backward:
+            query = query.order_by(asc(aggregated.c.recorded_at), asc(aggregated.c.id))
+
+        # Limit + 1 so the service can tell whether another page follows.
+        rows = query.limit(limit + 1).all()
+        if backward:
+            rows = list(reversed(rows))
+
+        samples: list[tuple[DataPointSeries | BucketedSample, DataSource]] = [
+            (
+                BucketedSample(
+                    id=row.id,
+                    data_source_id=row.data_source_id,
+                    # Postgres hands a timestamptz back in the session's own
+                    # time zone; normalise so a bucket reads the same whatever
+                    # zone the server runs in.
+                    recorded_at=row.recorded_at.astimezone(UTC),
+                    zone_offset=row.zone_offset,
+                    value=row.value,
+                    series_type_definition_id=row.series_type_definition_id,
+                    is_daily_total=row.is_daily_total,
+                ),
+                row.DataSource,
             )
-
-        # Normal ascending order for forward pagination
-        query = query.order_by(asc(self.model.recorded_at), asc(self.model.id))
-
-        # Limit + 1 to check for next page
-        limit = params.limit or 50
-        return query.limit(limit + 1).all(), total_count  # ty:ignore[invalid-return-type]
+            for row in rows
+        ]
+        return samples, total_count
 
     def get_total_count(self, db_session: DbSession) -> int:
         """Get total count of all data points."""
