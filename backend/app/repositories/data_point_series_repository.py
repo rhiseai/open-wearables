@@ -58,7 +58,7 @@ DataSourceIdentity = tuple[UUID, str | None, str | None]
 # Postgres bins from a fixed origin, so a bucket covers the same wall-clock
 # window for every user and every request — 09:05:00 at "5min" is always
 # 09:05:00-09:09:59, never an offset of whenever the range happened to start.
-_BUCKET_ORIGIN = "1970-01-01"
+_BUCKET_ORIGIN = "1970-01-01T00:00:00+00:00"
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries
@@ -67,6 +68,23 @@ def _params(resolution: TimeseriesResolution, **kwargs) -> TimeSeriesQueryParams
 
 class TestBucketAggregate:
     """The aggregate follows the series type's own method."""
+
+    @pytest.mark.parametrize("session_zone", ["UTC", "Asia/Kolkata", "Asia/Kathmandu", "America/St_Johns"])
+    def test_hourly_buckets_do_not_depend_on_database_session_timezone(
+        self, db: Session, series_repo: DataPointSeriesRepository, session_zone: str
+    ) -> None:
+        user = UserFactory()
+        source = DataSourceFactory(user=user)
+        _sample(series_repo, db, source, user.id, minutes=3, value=60)
+        _sample(series_repo, db, source, user.id, minutes=33, value=80)
+        db.execute(text("SELECT set_config('TimeZone', :zone, true)"), {"zone": session_zone})
+
+        results, total_count = series_repo.get_samples(
+            db, _params(TimeseriesResolution.ONE_HOUR), [SeriesType.heart_rate], user.id
+        )
+
+        assert total_count == 1
+        assert [(sample.recorded_at, float(sample.value)) for sample, _ in results] == [(_START, 70.0)]
 
     def test_rate_series_is_averaged_per_bucket(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         user = UserFactory()
