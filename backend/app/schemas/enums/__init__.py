@@ -26,12 +26,20 @@ from .series_types import (
     get_series_type_id,
     get_series_type_unit,
 )
+from .timeseries_resolution import (
+    RESOLUTION_BUCKET,
+    TimeseriesResolution,
+    bucket_width,
+)
 from .workout_types import (
     WORKOUTS_WITH_PACE,
     WorkoutType,
 )
 
 __all__ = [
+    "TimeseriesResolution",
+    "RESOLUTION_BUCKET",
+    "bucket_width",
     "DeviceType",
     "DEFAULT_DEVICE_TYPE_PRIORITY",
     "infer_device_type_from_model",

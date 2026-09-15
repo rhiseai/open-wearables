@@ -252,7 +252,7 @@ Common workout types returned by the events/workouts endpoint. This is not an ex
 
 ## Resolution Options
 
-The `resolution` parameter for timeseries aggregation:
+The `resolution` parameter downsamples timeseries server-side:
 
 | Resolution | Description |
 |------------|-------------|
@@ -261,6 +261,37 @@ The `resolution` parameter for timeseries aggregation:
 | `5min` | Aggregated to 5-minute intervals |
 | `15min` | Aggregated to 15-minute intervals |
 | `1hour` | Aggregated to 1-hour intervals |
+
+Aggregation returns **one sample per (bucket, series type, data source)**:
+
+- **How values combine** follows the series type: cumulative types are summed
+  (`steps`, `energy`, `distance_walking_running`, `mindful_minutes`), rate and
+  level types are averaged (`heart_rate`, `heart_rate_variability_rmssd`,
+  `oxygen_saturation`, `weight`), and peak types take the maximum.
+- **Data sources stay separate.** A watch and a phone reporting the same minute
+  come back as two samples, each with its own `source`, so you can apply your
+  own priority rules.
+- **Daily totals stay separate** from intraday samples (`is_daily_total`), so a
+  provider that sends both is never double-counted inside a bucket.
+- **Buckets are aligned to the wall clock**, not to `start_time`: at `1hour`,
+  a bucket always starts on the hour. The `timestamp` is the bucket start (UTC),
+  and `pagination.total_count` counts buckets, not raw samples.
+
+```json
+{
+  "data": [
+    {
+      "timestamp": "2025-01-01T09:00:00Z",
+      "type": "heart_rate",
+      "value": 63.5,
+      "unit": "bpm",
+      "source": { "provider": "apple", "device": "Watch7,1" }
+    }
+  ],
+  "pagination": { "has_more": true, "next_cursor": "...", "total_count": 24 },
+  "metadata": { "resolution": "1hour", "sample_count": 1 }
+}
+```
 
 ---
 
