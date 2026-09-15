@@ -1,0 +1,155 @@
+name: EU Sovereign Image Sync
+
+on:
+  workflow_call:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  SOURCE_AWS_REGION: us-east-1
+  SOURCE_ROLE_ARN: arn:aws:iam::031244176128:role/ow-deploy-prod
+  TARGET_AWS_REGION: ${{ vars.AWS_EUSC_REGION }}
+  TARGET_ROLE_ARN: ${{ vars.AWS_EUSC_PROD_ROLE_ARN }}
+  ECS_CLUSTER: lucie-prod
+
+jobs:
+  sync-inactive-runtime:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate EU Sovereign target configuration
+        env:
+          TARGET_ACCOUNT_ID: ${{ vars.AWS_EUSC_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+          [[ "$TARGET_AWS_REGION" == "eusc-de-east-1" ]]
+          [[ "$TARGET_ROLE_ARN" == "arn:aws-eusc:iam::${TARGET_ACCOUNT_ID}:role/ow-deploy-prod" ]]
+
+      - name: Configure Commercial source credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.SOURCE_ROLE_ARN }}
+          role-session-name: ow-eusc-source-${{ github.run_id }}
+          aws-region: ${{ env.SOURCE_AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Resolve exact Commercial image digests
+        id: source
+        run: |
+          set -euo pipefail
+          for image in backend frontend; do
+            repo="lucie/ow-${image}"
+            digest=$(aws ecr batch-get-image --repository-name "$repo" \
+              --image-ids imageTag=latest --query 'images[0].imageId.imageDigest' --output text)
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid ${repo}:latest digest: ${digest}"
+              exit 1
+            fi
+            echo "${image}_digest=${digest}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Login to Commercial ECR
+        id: source-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure EU Sovereign target credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.TARGET_ROLE_ARN }}
+          role-session-name: ow-eusc-target-${{ github.run_id }}
+          aws-region: ${{ env.TARGET_AWS_REGION }}
+          audience: sts.amazonaws.eu
+
+      - name: Login to EU Sovereign ECR
+        id: target-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Copy exact images across partitions
+        env:
+          SOURCE_REGISTRY: ${{ steps.source-ecr.outputs.registry }}
+          TARGET_REGISTRY: ${{ steps.target-ecr.outputs.registry }}
+          BACKEND_DIGEST: ${{ steps.source.outputs.backend_digest }}
+          FRONTEND_DIGEST: ${{ steps.source.outputs.frontend_digest }}
+        run: |
+          set -euo pipefail
+          for image in backend frontend; do
+            repo="lucie/ow-${image}"
+            if [[ "$image" == "backend" ]]; then
+              digest="$BACKEND_DIGEST"
+            else
+              digest="$FRONTEND_DIGEST"
+            fi
+            source_image="${SOURCE_REGISTRY}/${repo}@${digest}"
+            target_image="${TARGET_REGISTRY}/${repo}:latest"
+            docker buildx imagetools create --prefer-index=false --tag "$target_image" "$source_image"
+            copied_digest=$(docker buildx imagetools inspect "$target_image" \
+              --format '{{json .Manifest}}' | jq -r '.digest // empty')
+            if [[ "$copied_digest" != "$digest" ]]; then
+              echo "::error::${repo} EU digest ${copied_digest} differs from source ${digest}"
+              exit 1
+            fi
+          done
+
+      - name: Point inactive EU task definitions at mirrored digests
+        env:
+          TARGET_REGISTRY: ${{ steps.target-ecr.outputs.registry }}
+          BACKEND_DIGEST: ${{ steps.source.outputs.backend_digest }}
+          FRONTEND_DIGEST: ${{ steps.source.outputs.frontend_digest }}
+        run: |
+          set -euo pipefail
+          services=(ow-backend ow-celery-worker ow-celery-beat ow-svix-server ow-frontend)
+          state=$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "${services[@]}" --output json)
+          jq -e --argjson expected "${#services[@]}" '
+            (.services | length == $expected) and
+            all(.services[]; .desiredCount == 0 and .runningCount == 0 and .pendingCount == 0)
+          ' <<< "$state" >/dev/null || {
+            echo "::error::EU runtime is not complete and inactive; refusing to mutate task definitions"
+            exit 1
+          }
+
+          backend_image="${TARGET_REGISTRY}/lucie/ow-backend@${BACKEND_DIGEST}"
+          frontend_image="${TARGET_REGISTRY}/lucie/ow-frontend@${FRONTEND_DIGEST}"
+          families=(ow-backend ow-celery-worker ow-celery-beat ow-frontend ow-migrator)
+          for family in "${families[@]}"; do
+            image="$backend_image"
+            [[ "$family" == "ow-frontend" ]] && image="$frontend_image"
+            task_definition=$(aws ecs describe-task-definition --task-definition "$family" \
+              --query taskDefinition | jq --arg image "$image" '
+                .containerDefinitions[0].image = $image |
+                del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+              ')
+            task_definition_arn=$(aws ecs register-task-definition --cli-input-json "$task_definition" \
+              --query taskDefinition.taskDefinitionArn --output text)
+            registered_image=$(aws ecs describe-task-definition --task-definition "$task_definition_arn" \
+              --query 'taskDefinition.containerDefinitions[0].image' --output text)
+            [[ "$registered_image" == "$image" ]] || {
+              echo "::error::${family} registered ${registered_image}, expected ${image}"
+              exit 1
+            }
+            if [[ "$family" != "ow-migrator" ]]; then
+              aws ecs update-service --cluster "$ECS_CLUSTER" --service "$family" \
+                --task-definition "$task_definition_arn" >/dev/null
+            fi
+          done
+
+          final_state=$(aws ecs describe-services --cluster "$ECS_CLUSTER" \
+            --services "${services[@]}" --output json)
+          jq -e '
+            (.services | length == 5) and
+            all(.services[]; .desiredCount == 0 and .runningCount == 0 and .pendingCount == 0)
+          ' <<< "$final_state" >/dev/null
+
+          {
+            echo "## EU Sovereign inactive runtime synced"
+            echo ""
+            echo "- Backend digest: \`${BACKEND_DIGEST}\`"
+            echo "- Frontend digest: \`${FRONTEND_DIGEST}\`"
+            echo "- Desired/running/pending tasks: \`0/0/0\`"
+          } >> "$GITHUB_STEP_SUMMARY"
