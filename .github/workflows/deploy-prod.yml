@@ -354,3 +354,8 @@ jobs:
             aws logs tail /ecs/ow-migrator --since 5m --region "${AWS_REGION}" || true
             exit 1
           fi
+
+  sync-eu-sovereign:
+    needs: configure-lucie-webhook
+    uses: ./.github/workflows/eusc-sync.yml
+    secrets: inherit
