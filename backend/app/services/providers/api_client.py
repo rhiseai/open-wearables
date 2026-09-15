@@ -140,7 +140,6 @@ def _get_valid_token(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=f"Token expired and no refresh token available for {provider_name}",
             )
-
         token_response = oauth.refresh_access_token(db, user_id, connection.refresh_token)
         return token_response.access_token
 

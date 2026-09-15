@@ -1,10 +1,10 @@
-from typing import Annotated, Literal
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Query
 
 from app.database import DbSession
-from app.schemas.enums import SeriesType
+from app.schemas.enums import SeriesType, TimeseriesResolution
 from app.schemas.model_crud.activities import TimeSeriesQueryParams
 from app.schemas.responses.activity import TimeSeriesSample
 from app.schemas.utils import PaginatedResponse
@@ -22,14 +22,21 @@ def get_timeseries(
     db: DbSession,
     _api_key: ApiKeyDep,
     types: Annotated[list[SeriesType], Query()] = [],
-    resolution: Literal["raw", "1min", "5min", "15min", "1hour"] = "raw",
+    resolution: TimeseriesResolution = TimeseriesResolution.RAW,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> PaginatedResponse[TimeSeriesSample]:
-    """Returns granular time series data (biometrics or activity)."""
+    """Returns time series data (biometrics or activity), raw or downsampled.
+
+    ``resolution`` bins samples into fixed windows server-side and returns one
+    value per (bucket, series type, data source), aggregated by the series
+    type's own method — summed for cumulative types (steps, energy), averaged
+    for rates (heart rate, HRV). ``raw`` returns every stored sample.
+    """
     params = TimeSeriesQueryParams(
         start_datetime=parse_query_datetime(start_time),
         end_datetime=parse_query_datetime(end_time),
+        resolution=resolution,
         limit=limit,
         cursor=cursor,
     )

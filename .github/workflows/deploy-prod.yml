@@ -282,3 +282,93 @@ jobs:
             echo "| Commit | \`${COMMIT_SHA}\` |"
             echo "| URL | https://ow.getlucie.ai |"
           } >> $GITHUB_STEP_SUMMARY
+
+  configure-lucie-webhook:
+    needs: deploy-app
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: ow-configure-lucie-webhook
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Restrict Lucie webhook subscriptions
+        id: run
+        env:
+          SVIX_JWT_SECRET: ${{ secrets.SVIX_JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          NET_CFG=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services ow-backend \
+            --query 'services[0].networkConfiguration' --output json)
+          BACKEND_TASK_DEF=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services ow-backend \
+            --query 'services[0].taskDefinition' --output text)
+          SVIX_SERVER_URL=$(aws ecs describe-task-definition \
+            --task-definition "${BACKEND_TASK_DEF}" \
+            --query "taskDefinition.containerDefinitions[0].environment[?name=='SVIX_SERVER_URL'].value | [0]" \
+            --output text)
+          if [[ -z "${SVIX_SERVER_URL}" || "${SVIX_SERVER_URL}" == "None" ]]; then
+            echo "::error::SVIX_SERVER_URL is not configured on the production backend task"
+            exit 1
+          fi
+          TASK_DEF=ow-migrator
+          CONTAINER_NAME=$(aws ecs describe-task-definition \
+            --task-definition "${TASK_DEF}" \
+            --query 'taskDefinition.containerDefinitions[0].name' --output text)
+          OVERRIDES=$(jq -cn \
+            --arg name "${CONTAINER_NAME}" \
+            --arg svix_jwt_secret "${SVIX_JWT_SECRET}" \
+            --arg svix_server_url "${SVIX_SERVER_URL}" \
+            '{containerOverrides:[{
+              name:$name,
+              command:["uv","run","python","scripts/configure_lucie_webhook.py"],
+              environment:[
+                {name:"OUTGOING_WEBHOOKS_ENABLED",value:"true"},
+                {name:"SVIX_SERVER_URL",value:$svix_server_url},
+                {name:"SVIX_JWT_SECRET",value:$svix_jwt_secret}
+              ]
+            }]}')
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${ECS_CLUSTER}" \
+            --task-definition "${TASK_DEF}" \
+            --launch-type EC2 \
+            --network-configuration "${NET_CFG}" \
+            --overrides "${OVERRIDES}" \
+            --query 'tasks[0].taskArn' --output text)
+          if [[ -z "${TASK_ARN}" || "${TASK_ARN}" == "None" ]]; then
+            echo "::error::Failed to start Lucie webhook configuration task"
+            exit 1
+          fi
+          echo "Started webhook configuration task: ${TASK_ARN}"
+          echo "task_arn=${TASK_ARN}" >> "${GITHUB_OUTPUT}"
+          aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}"
+
+      - name: Verify Lucie webhook configuration
+        env:
+          TASK_ARN: ${{ steps.run.outputs.task_arn }}
+        run: |
+          set -euo pipefail
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          STOP_REASON=$(aws ecs describe-tasks \
+            --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}" \
+            --query 'tasks[0].stoppedReason' --output text)
+          echo "Webhook configuration exit code: ${EXIT_CODE}"
+          echo "Stopped reason: ${STOP_REASON}"
+          if [[ "${EXIT_CODE}" != "0" ]]; then
+            echo "::error::Lucie webhook configuration failed (exit ${EXIT_CODE}: ${STOP_REASON})"
+            aws logs tail /ecs/ow-migrator --since 5m --region "${AWS_REGION}" || true
+            exit 1
+          fi
+
+  sync-eu-sovereign:
+    needs: configure-lucie-webhook
+    uses: ./.github/workflows/eusc-sync.yml
+    secrets: inherit

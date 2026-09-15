@@ -105,7 +105,13 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         """Get detailed workout data from Oura API."""
         return self._make_api_request(db, user_id, f"/v2/usercollection/workout/{workout_id}")
 
-    def save_by_id(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
+    def save_by_id(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        workout_id: str,
+        trace_id: str | None = None,
+    ) -> int:
         """Fetch a single workout by ID and save it, replacing any stored version of it.
 
         Called for Oura ``workout`` webhooks, including ``update`` events. An edited
@@ -118,6 +124,13 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
             return 0
+        store_raw_payload(
+            source="api_response",
+            provider="oura",
+            payload=raw,
+            user_id=str(user_id),
+            trace_id=trace_id,
+        )
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
             created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)

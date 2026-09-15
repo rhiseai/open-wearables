@@ -12,6 +12,14 @@
     {
       "source": "/dev-guides/backend-e2e-integration",
       "destination": "/dev-guides/integration-guide"
+    },
+    {
+      "source": "/deployment/docker-images",
+      "destination": "/deployment/docker"
+    },
+    {
+      "source": "/data-migrations/:slug*",
+      "destination": "/dev-guides/data-migrations"
     }
   ],
   "navigation": {
@@ -59,7 +67,7 @@
             ]
           },
           {
-            "group": "Sync SDK",
+            "group": "Mobile SDK",
             "pages": [
               "sdk/index",
               {
@@ -111,18 +119,9 @@
             "pages": [
               "dev-guides/integration-guide",
               "dev-guides/how-to-add-new-provider",
+              "dev-guides/data-migrations",
               "dev-guides/ngrok-setup",
               "dev-guides/seed-data-generator"
-            ]
-          },
-          {
-            "group": "Data Migrations",
-            "pages": [
-              "data-migrations/index",
-              "data-migrations/backfill-garmin-sleep-end-datetime",
-              "data-migrations/backfill-sleep-scores",
-              "data-migrations/normalize-body-fat-percentage",
-              "data-migrations/relabel-oura-hrv-sdnn-to-rmssd"
             ]
           },
           {
@@ -135,7 +134,7 @@
           {
             "group": "Deployment",
             "pages": [
-              "deployment/docker-images",
+              "deployment/docker",
               "deployment/railway"
             ]
           },
@@ -259,6 +258,10 @@
             "group": "Apple Health Import",
             "pages": [
               "POST /api/v1/users/{user_id}/import/apple/xml/s3",
+              "POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/create",
+              "POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/sign",
+              "POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/complete",
+              "POST /api/v1/users/{user_id}/import/apple/xml/s3/multipart/abort",
               "POST /api/v1/users/{user_id}/import/apple/xml/direct"
             ]
           },

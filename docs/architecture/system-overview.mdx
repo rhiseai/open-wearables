@@ -150,7 +150,7 @@ Each SDK sync batch flushes the current session to PostgreSQL immediately (same
 `finalize_stale_sleeps` task only closes Redis state after a quiet gap.
 ## Deployment Architecture
 
-The platform is designed for **self-hosting** with Docker Compose:
+The platform is designed for **self-hosting** with Docker. For production, use the published images (see [Deploying with Docker](/deployment/docker)); the repository's `docker-compose.yml` runs the same stack locally for development:
 
 **Services:**
 - `app` - FastAPI application server
@@ -159,7 +159,7 @@ The platform is designed for **self-hosting** with Docker Compose:
 - `celery-worker` - Background task processor
 - `celery-beat` - Scheduled task scheduler
 - `flower` - Celery monitoring dashboard
-- `frontend` - React development server (production builds use static hosting)
+- `frontend` - React frontend (TanStack Start, served by Nitro)
 
 **Key Design Decisions:**
 - Single-tenant architecture (one deployment = one organization)

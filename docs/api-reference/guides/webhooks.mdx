@@ -205,12 +205,13 @@ Fired once when a complete session is saved or merged.
 | `connection.revoked` | A connection became invalid or was disconnected (refresh token expired/revoked, the user deregistered on the provider side, or the user manually disconnected). The user must re-authorize to resume syncing. |
 | `workout.created` | A new workout session was saved. |
 | `sleep.created` | A new (or merged) sleep session was saved. |
+| `sleep.updated` | An existing sleep session was revised or finalized. |
 | `menstrual_cycle.created` | A new menstrual cycle record was saved. |
 | `activity.created` | A new generic activity session was saved. |
 
 ### Timeseries Events
 
-Fired per ingestion batch — one event per distinct `(user, provider, series_type)` combination in a sync run. Each event carries the full `samples` array, so consumers can store data directly from the webhook without issuing follow-up API calls.
+Fired per ingestion batch — one canonical group event per distinct `(user, provider, series_type)` combination in a sync run. Open Wearables coalesces writes from the same Mobile SDK batch instead of emitting both group and granular duplicates. Each event carries the `samples` array, so consumers can store data directly from the webhook without issuing follow-up API calls.
 
 | Event | Series types included |
 |-------|-----------------------|
@@ -439,7 +440,11 @@ Each entry in `samples` matches the schema returned by `GET /api/v1/users/{user_
 </Note>
 
 <Note>
-  **Large batches** (exceeding 2 500 samples) are automatically split into consecutive chunk events to stay within Svix's 1 MB payload limit.  Each chunk event includes `chunk_index` (0-based) and `total_chunks` so you can detect and reassemble split deliveries.  The `sample_count` field always reflects the total number of samples across all chunks.
+  **Large batches** are split by the exact UTF-8 JSON payload size, not by an estimated sample count. Each delivery stays at or below 900 KiB, leaving headroom under Svix's 1 MB limit. Each chunk includes `chunk_index` (0-based) and `total_chunks`; `sample_count` always reflects the total across all chunks.
+</Note>
+
+<Note>
+  **Mobile SDK syncs are bounded.** One realtime SDK upload emits at most 64 coalesced product events. Initial historical exports suppress per-record realtime notifications and emit the compact `sync.completed` lifecycle event instead. Use the pull API for historical backfill and reconciliation.
 </Note>
 
 The pull API (`GET /api/v1/users/{user_id}/timeseries`) remains available for backfill, reconciliation, or recovery after missed deliveries.
