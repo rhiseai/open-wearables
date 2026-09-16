@@ -154,6 +154,9 @@ def sync_sdk_data(
         batch_id=batch_id,
         payload_ref=payload_ref,
         historical_export=historical_export,
+        # SDK versions that do not send these yet have no session, so the batch is live.
+        sync_session_id=body.get("syncSessionId"),
+        sync_type=body.get("syncType"),
     )
 
     return UploadDataResponse(status_code=202, response="Import task queued successfully", user_id=user_id)

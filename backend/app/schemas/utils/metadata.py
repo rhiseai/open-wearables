@@ -3,7 +3,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field, computed_field
 
 from app.constants.devices_map import resolve_device_name
-from app.schemas.enums import DeviceType, TimeseriesResolution
+from app.schemas.enums import DeviceType, Resolution
 
 
 class SourceMetadata(BaseModel):
@@ -24,7 +24,7 @@ class SourceMetadata(BaseModel):
 
 
 class TimeseriesMetadata(BaseModel):
-    resolution: TimeseriesResolution | None = None
+    resolution: Resolution | None = None
     sample_count: int | None = None
     start_time: datetime | None = None
     end_time: datetime | None = None

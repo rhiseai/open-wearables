@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -27,7 +28,7 @@ from app.repositories import (
     EventRecordRepository,
     HealthScoreRepository,
 )
-from app.schemas.enums import WORKOUTS_WITH_PACE, HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -35,14 +36,16 @@ from app.schemas.model_crud.activities import (
     EventRecordResponse,
     EventRecordUpdate,
     MenstrualCycleDetailCreate,
+    SleepInclude,
+    WorkoutInclude,
 )
 from app.schemas.model_crud.activities.sleep import SleepStage
+from app.schemas.model_crud.activities.zones import HRZones, PowerZones
 from app.schemas.responses.activity import (
     MenstrualCycleRecord,
     SleepSession,
     SleepStagesSummary,
     Workout,
-    WorkoutDetailed,
 )
 from app.schemas.utils import (
     PaginatedResponse,
@@ -62,6 +65,7 @@ from app.services.outgoing_webhooks.events import (
 from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
+from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
 
@@ -91,6 +95,8 @@ class _DataSourceSnapshot:
     user_id: UUID
     provider: Any
     device_model: str | None
+    source: str | None
+    device_type: Any
 
 
 def _snapshot_record(record: EventRecord) -> _RecordSnapshot:
@@ -110,7 +116,20 @@ def _snapshot_data_source(data_source: DataSource) -> _DataSourceSnapshot:
         user_id=data_source.user_id,
         provider=data_source.provider,
         device_model=data_source.device_model,
+        source=data_source.source,
+        device_type=data_source.device_type,
     )
+
+
+def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float | None:
+    """Average pace in seconds per kilometre.
+
+    Derived from distance and time rather than ``average_speed``, whose unit is not
+    consistent across providers (Suunto stores km/h, Garmin/Strava/Google m/s).
+    """
+    if distance_meters is None or seconds is None or distance_meters <= 0 or seconds <= 0:
+        return None
+    return round(seconds / (distance_meters / 1000), 1)
 
 
 class EventRecordService(
@@ -195,9 +214,10 @@ class EventRecordService(
                 _data_source_snap = _snapshot_data_source(data_source)
                 _detail = detail
 
-                @sa_event.listens_for(db_session, "after_commit", once=True)
-                def _dispatch_webhook(session: DbSession) -> None:  # noqa: ARG001
-                    self._emit_event_record_webhook(_record_snap, _data_source_snap, _detail)
+                # The repository has already committed, so dispatch now. Registering an
+                # after_commit listener at this point would wait for an unrelated future
+                # transaction and can silently lose the event when no second commit occurs.
+                self._emit_event_record_webhook(_record_snap, _data_source_snap, _detail)
 
         return result
 
@@ -324,6 +344,12 @@ class EventRecordService(
                     final_detail.sleep_rem_minutes,
                 ]
             )
+            device_type = None
+            if svix_service.is_enabled() and result.data_source_id is not None:
+                data_source = self.data_source_repo.get(db_session, result.data_source_id)
+                if data_source is not None:
+                    device_type = data_source.device_type
+
             emit = on_sleep_updated if action == "updated" else on_sleep_created
             emit(
                 record_id=result.id,
@@ -344,6 +370,18 @@ class EventRecordService(
                 if has_stages
                 else None,
                 is_nap=final_detail.is_nap,
+                source_app=record.source,
+                device_type=device_type,
+                sleep_duration_seconds=(
+                    final_detail.sleep_total_duration_minutes * 60
+                    if final_detail.sleep_total_duration_minutes is not None
+                    else None
+                ),
+                sleep_stage_intervals=(
+                    [stage.model_dump(mode="json") for stage in final_detail.sleep_stages]
+                    if final_detail.sleep_stages
+                    else None
+                ),
             )
         return result
 
@@ -634,6 +672,18 @@ class EventRecordService(
                     if has_stages
                     else None,
                     is_nap=detail.is_nap,
+                    source_app=data_source.source,
+                    device_type=data_source.device_type,
+                    sleep_duration_seconds=(
+                        detail.sleep_total_duration_minutes * 60
+                        if detail.sleep_total_duration_minutes is not None
+                        else None
+                    ),
+                    sleep_stage_intervals=(
+                        [stage.model_dump(mode="json") for stage in detail.sleep_stages]
+                        if detail.sleep_stages
+                        else None
+                    ),
                 )
             case "menstrual_cycle":
                 mcd = detail if isinstance(detail, MenstrualCycleDetailCreate) else None
@@ -652,9 +702,10 @@ class EventRecordService(
                     pregnancy_snapshot=mcd.pregnancy_snapshot if mcd else None,
                 )
             case "workout":
-                avg_pace: int | None = None
-                if detail.average_speed and float(detail.average_speed) > 0:
-                    avg_pace = int(1000 / float(detail.average_speed))
+                avg_pace = pace_sec_per_km(
+                    as_float(detail.distance),
+                    detail.moving_time_seconds if detail.moving_time_seconds is not None else record.duration_seconds,
+                )
                 on_workout_created(
                     record_id=record.id,
                     user_id=data_source.user_id,
@@ -672,7 +723,7 @@ class EventRecordService(
                     elevation_gain_meters=float(detail.total_elevation_gain)
                     if detail.total_elevation_gain is not None
                     else None,
-                    avg_pace_sec_per_km=avg_pace,
+                    avg_pace_sec_per_km=round(avg_pace) if avg_pace is not None else None,
                 )
 
     def bulk_create(
@@ -768,6 +819,11 @@ class EventRecordService(
 
         return [self._build_response(record, data_source) for record, data_source in records]
 
+    @handle_exceptions
+    def get_workout_types(self, db_session: DbSession, user_id: UUID) -> list[str]:
+        """Workout types this user actually has, so a client can filter on real options only."""
+        return self.crud.get_distinct_workout_types(db_session, user_id)
+
     def get_category_counts(self, db_session: DbSession) -> list[tuple[str, int]]:
         """Count event records grouped by category (cheap aggregate on a small table)."""
         return self.crud.get_category_counts(db_session)
@@ -786,8 +842,11 @@ class EventRecordService(
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
+        include: Sequence[WorkoutInclude] = (),
     ) -> PaginatedResponse[Workout]:
         params.category = "workout"
+        with_zones = WorkoutInclude.ZONES in include
+        with_segments = WorkoutInclude.SEGMENTS in include
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
@@ -831,24 +890,43 @@ class EventRecordService(
         data = []
         for record, data_source in records:
             details: WorkoutDetails | None = record.workout_detail
-
+            moving_seconds = (
+                details.moving_time_seconds
+                if details and details.moving_time_seconds is not None
+                else record.duration_seconds
+            )
             workout = Workout(
                 id=record.id,
                 type=record.type or "unknown",
-                name=None,  # Not in EventRecord currently
+                name=details.label if details else None,
                 start_time=record.start_datetime,
                 end_time=record.end_datetime,
                 zone_offset=record.zone_offset,
                 duration_seconds=record.duration_seconds,
                 source=self._map_source(data_source),
+                entry_source=details.entry_source if details else None,
+                intensity=details.intensity if details else None,
                 calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
                 distance_meters=float(details.distance) if details and details.distance else None,
                 avg_heart_rate_bpm=computed_hr.get(record.id),
                 max_heart_rate_bpm=details.heart_rate_max if details else None,
-                avg_pace_sec_per_km=None,  # Derived or in details?
+                avg_pace_sec_per_km=pace_sec_per_km(as_float(details.distance) if details else None, moving_seconds),
                 elevation_gain_meters=float(details.total_elevation_gain)
                 if details and details.total_elevation_gain
                 else None,
+                heart_rate_min=details.heart_rate_min if details else None,
+                steps_count=details.steps_count if details else None,
+                average_speed=as_float(details.average_speed) if details else None,
+                max_speed=as_float(details.max_speed) if details else None,
+                average_cadence=as_float(details.average_cadence) if details else None,
+                average_watts=as_float(details.average_watts) if details else None,
+                max_watts=as_float(details.max_watts) if details else None,
+                moving_time_seconds=details.moving_time_seconds if details else None,
+                elev_high=as_float(details.elev_high) if details else None,
+                elev_low=as_float(details.elev_low) if details else None,
+                hr_zones=as_model(HRZones, details.hr_zones) if details and with_zones else None,
+                power_zones=as_model(PowerZones, details.power_zones) if details and with_zones else None,
+                segments=as_dict_list(details.segments) if details and with_segments else None,
             )
             data.append(workout)
 
@@ -868,63 +946,16 @@ class EventRecordService(
         )
 
     @handle_exceptions
-    def get_workout_detailed(
-        self,
-        db_session: DbSession,
-        user_id: UUID,
-        workout_id: UUID,
-    ) -> WorkoutDetailed | None:
-        """Get a detailed workout record with all associated data."""
-        record = self.crud.get_record_with_details(db_session, workout_id, "workout")
-
-        if not record:
-            return None
-
-        data_source = self.data_source_repo.get(db_session, record.data_source_id)
-
-        if not data_source or data_source.user_id != user_id:
-            return None
-
-        details: WorkoutDetails | None = record.workout_detail
-
-        if details and record.type in WORKOUTS_WITH_PACE:
-            # Seconds per kilometer - speed is in meters per second
-            if details.average_speed and details.average_speed > 0:
-                avg_pace_sec_per_km = 1000 / details.average_speed
-            elif details.distance > 0:  # ty:ignore[unsupported-operator]
-                avg_pace_sec_per_km = record.duration_seconds / details.distance * 1000  # ty:ignore[unsupported-operator]
-        else:
-            avg_pace_sec_per_km = None
-
-        return WorkoutDetailed(
-            id=record.id,
-            type=record.type or "unknown",
-            name=None,
-            start_time=record.start_datetime,
-            end_time=record.end_datetime,
-            zone_offset=record.zone_offset,
-            duration_seconds=record.duration_seconds,
-            source=self._map_source(data_source),
-            calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
-            distance_meters=float(details.distance) if details and details.distance else None,
-            avg_heart_rate_bpm=self._resolve_avg_hr(db_session, [record]).get(record.id),
-            max_heart_rate_bpm=details.heart_rate_max if details else None,
-            avg_pace_sec_per_km=avg_pace_sec_per_km,
-            elevation_gain_meters=float(details.total_elevation_gain)
-            if details and details.total_elevation_gain
-            else None,
-            heart_rate_samples=[],  # TODO: Fetch from DataPointSeries if needed
-        )
-
-    @handle_exceptions
     def get_sleep_sessions(
         self,
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
         filter_by_priority: bool = False,
+        include: Sequence[SleepInclude] = (),
     ) -> PaginatedResponse[SleepSession]:
         params.category = "sleep"
+        with_stages = SleepInclude.STAGES in include
 
         # inline query that restricts records to ones
         # with highest priority
@@ -980,11 +1011,8 @@ class EventRecordService(
         for record, data_source in records:
             details: SleepDetails | None = record.sleep_detail
 
-            sleep_duration_seconds = (
-                details.sleep_total_duration_minutes * 60
-                if details and details.sleep_total_duration_minutes is not None
-                else None
-            )
+            sleep_duration_seconds = minutes_to_seconds(details.sleep_total_duration_minutes) if details else None
+            time_in_bed_seconds = minutes_to_seconds(details.sleep_time_in_bed_minutes) if details else None
             session = SleepSession(
                 id=record.id,
                 start_time=record.start_datetime,
@@ -993,16 +1021,15 @@ class EventRecordService(
                 source=self._map_source(data_source),
                 duration_seconds=record.duration_seconds or 0,
                 sleep_duration_seconds=sleep_duration_seconds,
-                efficiency_percent=float(details.sleep_efficiency_score)
-                if details and details.sleep_efficiency_score
-                else None,
+                time_in_bed_seconds=time_in_bed_seconds,
+                efficiency_percent=as_float(details.sleep_efficiency_score) if details else None,
                 is_nap=details.is_nap if (details and details.is_nap is not None) else False,
-                sleep_stage_intervals=details.sleep_stages if details else None,
+                sleep_stage_intervals=details.sleep_stages if details and with_stages else None,
                 stages=SleepStagesSummary(
-                    deep_minutes=details.sleep_deep_minutes or 0 if details else 0,
-                    light_minutes=details.sleep_light_minutes or 0 if details else 0,
-                    rem_minutes=details.sleep_rem_minutes or 0 if details else 0,
-                    awake_minutes=details.sleep_awake_minutes or 0 if details else 0,
+                    deep_minutes=details.sleep_deep_minutes,
+                    light_minutes=details.sleep_light_minutes,
+                    rem_minutes=details.sleep_rem_minutes,
+                    awake_minutes=details.sleep_awake_minutes,
                 )
                 if details
                 else None,

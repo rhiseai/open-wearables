@@ -27,7 +27,7 @@ def _get(client: TestClient, user_id: str, **params: object) -> dict:
     api_key = ApiKeyFactory()
     response = client.get(
         f"/api/v1/users/{user_id}/timeseries",
-        headers=api_key_headers(api_key.id),
+        headers=api_key_headers(api_key.plain_key),
         params={
             "start_time": "2026-06-01T00:00:00Z",
             "end_time": "2026-06-01T23:59:59Z",
@@ -62,7 +62,9 @@ class TestTimeseriesResolution:
         assert raw["metadata"]["resolution"] == "raw"
 
         assert len(hourly["data"]) == 3
-        assert hourly["pagination"]["total_count"] == 3
+        # Aggregated reads avoid a full count over the largest table; cursors and
+        # has_more provide bounded pagination without scanning the whole range.
+        assert hourly["pagination"]["total_count"] is None
         assert hourly["metadata"]["resolution"] == "1hour"
         assert [s["timestamp"] for s in hourly["data"]] == [
             "2026-06-01T00:00:00Z",
@@ -102,7 +104,7 @@ class TestTimeseriesResolution:
 
         response = client.get(
             f"/api/v1/users/{user.id}/timeseries",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={
                 "start_time": "2026-06-01T00:00:00Z",
                 "end_time": "2026-06-01T23:59:59Z",
