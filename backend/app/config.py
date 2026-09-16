@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     # Will default to false in a future release.
     historical_sync_on_connect: bool = True
 
+    # Per-request timeout for provider API calls (connect/read/write/pool alike).
+    provider_request_timeout_seconds: float = Field(30.0, gt=0, le=300)
+
+    # How long a linked-account pull lock survives without renewal. The holder renews it
+    # four times per lease from a daemon thread, so the lock dies with the worker process.
+    linked_sync_pull_lease_seconds: int = Field(120, ge=30, le=3600)
+
     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
     # data_point_series on workout webhook arrival. Significantly increases DB storage.
     # Per-provider granularity will be added via ProviderSetting in a future release.
@@ -127,6 +134,16 @@ class Settings(BaseSettings):
     resilience_score_interval_seconds: int = (
         600  # How often to run the fill-missing-resilience-scores task (default: 10 min)
     )
+
+    # SYNC RUN TRACKING
+    sync_run_tracking_enabled: bool = True
+    # Persist live runs too. WARNING: space-consuming — one row per webhook and per SDK
+    # batch, so hundreds a day for an active user. Historical runs are a handful, ever.
+    persist_live_sync_runs: bool = False
+    # Closed as stale once this long passes with no event. Covers the gap between events,
+    # not the whole run: the sweep leaves anything still reporting in Redis alone.
+    sync_run_stale_after_hours: int = Field(2, ge=1)
+    sync_run_sweep_interval_seconds: int = Field(1800, ge=60)
 
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"
@@ -216,6 +233,11 @@ class Settings(BaseSettings):
     # with RAW granularity, either list or reconcile is used
     # true - reconcile, false - list; for details check docs
     google_use_reconcile: bool = True
+
+    withings_client_id: str | None = None
+    withings_client_secret: SecretStr | None = None
+    withings_webhook_token: SecretStr | None = None
+    withings_default_scope: str = "user.info,user.metrics,user.activity"
 
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None

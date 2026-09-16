@@ -203,7 +203,7 @@ The `types` parameter in the timeseries endpoint accepts the following values:
 
 ## Workout Types
 
-Common workout types returned by the events/workouts endpoint. This is not an exhaustive list - the API supports 80+ workout types:
+Common workout types returned by the events/workouts endpoint. This is not an exhaustive list - the API supports 100+ workout types:
 
 | Type | Description |
 |------|-------------|
@@ -248,6 +248,21 @@ Common workout types returned by the events/workouts endpoint. This is not an ex
   Workout types are normalized from provider-specific values. The original provider type is preserved in the raw data.
 </Note>
 
+Filter the list by exact type with `?type=running`. The older `record_type` parameter matches a
+substring, so `record_type=running` also returns `trail_running`; it is kept for backwards
+compatibility.
+
+To offer only the types a user actually has, read them from
+`GET /api/v1/users/{user_id}/events/workouts/types`, which returns a sorted list such as
+`["cycling", "running", "trail_running"]`.
+
+Heart-rate zones, power zones and lap segments are omitted by default because they multiply the
+payload size. Request them explicitly with `?include=zones` and `?include=segments` (repeat the
+parameter to ask for both).
+
+Sleep sessions follow the same rule: `sleep_stage_intervals` is omitted unless you pass
+`?include=stages` on `/events/sleep`.
+
 ---
 
 ## Resolution Options
@@ -262,36 +277,10 @@ The `resolution` parameter downsamples timeseries server-side:
 | `15min` | Aggregated to 15-minute intervals |
 | `1hour` | Aggregated to 1-hour intervals |
 
-Aggregation returns **one sample per (bucket, series type, data source)**:
-
-- **How values combine** follows the series type: cumulative types are summed
-  (`steps`, `energy`, `distance_walking_running`, `mindful_minutes`), rate and
-  level types are averaged (`heart_rate`, `heart_rate_variability_rmssd`,
-  `oxygen_saturation`, `weight`), and peak types take the maximum.
-- **Data sources stay separate.** A watch and a phone reporting the same minute
-  come back as two samples, each with its own `source`, so you can apply your
-  own priority rules.
-- **Daily totals stay separate** from intraday samples (`is_daily_total`), so a
-  provider that sends both is never double-counted inside a bucket.
-- **Buckets are aligned to the wall clock**, not to `start_time`: at `1hour`,
-  a bucket always starts on the hour. The `timestamp` is the bucket start (UTC),
-  and `pagination.total_count` counts buckets, not raw samples.
-
-```json
-{
-  "data": [
-    {
-      "timestamp": "2025-01-01T09:00:00Z",
-      "type": "heart_rate",
-      "value": 63.5,
-      "unit": "bpm",
-      "source": { "provider": "apple", "device": "Watch7,1" }
-    }
-  ],
-  "pagination": { "has_more": true, "next_cursor": "...", "total_count": 24 },
-  "metadata": { "resolution": "1hour", "sample_count": 1 }
-}
-```
+Buckets are grouped per data source, so two devices reporting the same minute stay two points.
+Rate metrics (heart rate, power) are averaged and counters (steps, energy) are summed. A
+provider's own daily total is skipped, since it is not a point in an intraday series — use
+`/summaries` for per-day figures.
 
 ---
 
