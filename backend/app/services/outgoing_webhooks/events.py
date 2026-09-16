@@ -13,6 +13,7 @@ import re
 from typing import Any
 from uuid import UUID
 
+from app.constants.devices_map import resolve_device_name
 from app.constants.webhooks.events import SERIES_TYPE_TO_GROUP_EVENT
 from app.schemas.webhooks.event_types import WebhookEventType
 from app.services.outgoing_webhooks import svix as svix_service
@@ -198,6 +199,10 @@ def _emit_sleep(
     efficiency_percent: float | None = None,
     stages: dict[str, int | None] | None = None,
     is_nap: bool | None = None,
+    source_app: str | None = None,
+    device_type: str | None = None,
+    sleep_duration_seconds: float | None = None,
+    sleep_stage_intervals: list[dict[str, Any]] | None = None,
 ) -> None:
     # Content-aware idempotency: a provider re-sends the same session as it is
     # finalized (Oura sends the stub early, then updates duration/stages/score).
@@ -219,9 +224,17 @@ def _emit_sleep(
                 "end_time": end_time,
                 "zone_offset": zone_offset,
                 "duration_seconds": duration_seconds,
-                "source": {"provider": provider, "device": device},
+                "sleep_duration_seconds": sleep_duration_seconds,
+                "source": {
+                    "provider": provider,
+                    "source": source_app,
+                    "device": device,
+                    "device_type": device_type,
+                    "device_name": resolve_device_name(device),
+                },
                 "efficiency_percent": efficiency_percent,
                 "stages": stages,
+                "sleep_stage_intervals": sleep_stage_intervals,
                 "is_nap": is_nap,
             },
         },

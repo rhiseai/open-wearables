@@ -12,6 +12,7 @@ import httpx
 from fastapi import HTTPException, status
 from redis.exceptions import RedisError
 
+from app.config import settings
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.models import UserConnection
@@ -154,6 +155,7 @@ def make_authenticated_request(
     endpoint: str,
     method: str = "GET",
     params: dict[str, Any] | None = None,
+    form_data: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
     json_data: dict[str, Any] | None = None,
     expect_json: bool = True,
@@ -173,6 +175,8 @@ def make_authenticated_request(
         endpoint: API endpoint path (e.g., "/v3/workouts/")
         method: HTTP method (default: GET)
         params: Query parameters
+        form_data: Form-encoded request body, mutually exclusive with json_data.
+            Used by providers whose API is RPC-over-POST, e.g. Withings.
         headers: Additional headers (Authorization header will be added automatically)
         json_data: JSON body for POST/PUT requests
         expect_json: Whether to parse response as JSON (default True).
@@ -187,6 +191,9 @@ def make_authenticated_request(
     Raises:
         HTTPException: If API request fails
     """
+    if form_data is not None and json_data is not None:
+        raise ValueError("form_data and json_data are mutually exclusive")
+
     # Get valid token (will auto-refresh if needed)
     access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
 
@@ -209,8 +216,9 @@ def make_authenticated_request(
                     url=url,
                     headers=request_headers,
                     params=params or {},
+                    data=form_data,
                     json=json_data,
-                    timeout=30.0,
+                    timeout=settings.provider_request_timeout_seconds,
                 )
 
             # Handle 429 rate limiting with retry
@@ -351,7 +359,9 @@ def download_binary_content(
     headers = {"Authorization": f"Bearer {access_token}"}
 
     for attempt in range(MAX_RETRIES + 1):
-        response = httpx.get(url, headers=headers, timeout=30.0, follow_redirects=True)
+        response = httpx.get(
+            url, headers=headers, timeout=settings.provider_request_timeout_seconds, follow_redirects=True
+        )
         if response.status_code == 429 and attempt < MAX_RETRIES:
             backoff_delay = RETRY_BASE_DELAY * (2**attempt)
             log_structured(

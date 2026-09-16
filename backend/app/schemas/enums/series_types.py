@@ -61,6 +61,8 @@ class SeriesType(str, Enum):
     waist_circumference = "waist_circumference"
     body_fat_mass = "body_fat_mass"
     skeletal_muscle_mass = "skeletal_muscle_mass"
+    bone_mass = "bone_mass"
+    body_water_mass = "body_water_mass"
 
     # =========================================================================
     # BIOMETRICS - Fitness Metrics (IDs 60-79)
@@ -180,6 +182,12 @@ class SeriesType(str, Enum):
     mindful_minutes = "mindful_minutes"
 
     # =========================================================================
+    # WITHINGS-SPECIFIC METRICS (IDs 300-319)
+    # =========================================================================
+    withings_pulse_wave_velocity = "withings_pulse_wave_velocity"
+    withings_metabolic_age = "withings_metabolic_age"
+
+    # =========================================================================
     # OTHER (IDs 500-)
     # =========================================================================
 
@@ -239,6 +247,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (49, SeriesType.skeletal_muscle_mass, "kg"),
     (50, SeriesType.skin_temperature_deviation, "celsius"),
     (51, SeriesType.skin_temperature_trend_deviation, "celsius"),
+    (52, SeriesType.bone_mass, "kg"),
+    (53, SeriesType.body_water_mass, "kg"),
     # -------------------------------------------------------------------------
     # BIOMETRICS - Fitness Metrics (IDs 60-79)
     # -------------------------------------------------------------------------
@@ -343,6 +353,11 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     # -------------------------------------------------------------------------
     (280, SeriesType.mindful_minutes, "minutes"),
     # -------------------------------------------------------------------------
+    # WITHINGS-SPECIFIC METRICS (IDs 300-319)
+    # -------------------------------------------------------------------------
+    (300, SeriesType.withings_pulse_wave_velocity, "m_per_s"),
+    (301, SeriesType.withings_metabolic_age, "years"),
+    # -------------------------------------------------------------------------
     # OTHER (IDs 500-)
     # -------------------------------------------------------------------------
     (500, SeriesType.electrodermal_activity, "count"),
@@ -363,6 +378,12 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
 SERIES_TYPE_ID_BY_ENUM: dict[SeriesType, int] = {enum: type_id for type_id, enum, _ in SERIES_TYPE_DEFINITIONS}
 SERIES_TYPE_ENUM_BY_ID: dict[int, SeriesType] = {type_id: enum for type_id, enum, _ in SERIES_TYPE_DEFINITIONS}
 SERIES_TYPE_UNIT_BY_ENUM: dict[SeriesType, str] = {enum: unit for _, enum, unit in SERIES_TYPE_DEFINITIONS}
+
+# Optional human-readable descriptions surfaced in the coverage matrix (tooltips).
+# Only series types that need a meaningful clarification have an entry here;
+SERIES_TYPE_DESCRIPTION_BY_ENUM: dict[SeriesType, str] = {
+    SeriesType.garmin_body_battery: "Intraday body battery readings (0-100), one sample per measurement",
+}
 
 
 # =============================================================================
@@ -405,6 +426,7 @@ _CATEGORY_RANGES: list[tuple[range, str]] = [
     (range(240, 260), "Nutrition"),
     (range(260, 280), "Reproductive Health"),
     (range(280, 300), "Mindfulness"),
+    (range(300, 320), "Provider-Specific"),
     (range(500, 600), "Other"),
 ]
 

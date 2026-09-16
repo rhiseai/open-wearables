@@ -8,7 +8,7 @@ Tests cover:
 - create_or_merge_sleep: adjacent session merging
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -17,7 +17,12 @@ from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, HealthScore
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, EventRecordQueryParams
+from app.schemas.model_crud.activities import (
+    EventRecordCreate,
+    EventRecordDetailCreate,
+    EventRecordQueryParams,
+    SleepInclude,
+)
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
 from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
@@ -105,6 +110,35 @@ class TestEventRecordServiceCreateDetail:
         assert getattr(detail, "heart_rate_min", None) is None
         assert getattr(detail, "steps_count", None) is None
 
+    def test_create_detail_dispatches_sleep_webhook_with_source_and_stages(self, db: Session) -> None:
+        """_emit_event_record_webhook passes device_type, writer app, and stage intervals for sleep."""
+        data_source = DataSourceFactory(source="oura", device_type="ring")
+        event_record = EventRecordFactory(mapping=data_source, category="sleep", type_="sleep_session")
+        stage = SleepStage(
+            stage="light",
+            start_time=event_record.start_datetime,
+            end_time=event_record.end_datetime,
+        )
+        detail_payload = EventRecordDetailCreate(
+            record_id=event_record.id,
+            sleep_total_duration_minutes=90,
+            sleep_stages=[stage],
+        )
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
+        ):
+            event_record_service.create_detail(db, detail_payload, detail_type="sleep")
+
+        mock_sleep.assert_called_once()
+        kwargs = mock_sleep.call_args.kwargs
+        assert kwargs["record_id"] == event_record.id
+        assert kwargs["source_app"] == "oura"
+        assert kwargs["device_type"] == "ring"
+        assert kwargs["sleep_duration_seconds"] == 90 * 60
+        assert kwargs["sleep_stage_intervals"] == [stage.model_dump(mode="json")]
+
 
 class TestEventRecordServiceBulkCreateDetails:
     """bulk_create_details must dispatch a webhook per detail on commit.
@@ -141,6 +175,29 @@ class TestEventRecordServiceBulkCreateDetails:
         assert mock_workout.call_count == 2
         dispatched_ids = {c.kwargs["record_id"] for c in mock_workout.call_args_list}
         assert dispatched_ids == {rec1.id, rec2.id}
+
+    def test_workout_webhook_pace_comes_from_distance_not_average_speed(self, db: Session) -> None:
+        """average_speed is km/h for Suunto and m/s elsewhere, so pace must not be derived from it."""
+        data_source = DataSourceFactory(source="suunto")
+        record = EventRecordFactory(mapping=data_source, category="workout", type_="running")
+        details = [
+            EventRecordDetailCreate(
+                record_id=record.id,
+                distance=Decimal("10000.0"),
+                moving_time_seconds=3000,
+                average_speed=Decimal("12.00"),
+            )
+        ]
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_workout_created") as mock_workout,
+        ):
+            event_record_service.bulk_create_details(db, details, detail_type="workout")
+            db.commit()
+
+        # 10 km in 3000 s is 300 s/km; the old 1000/average_speed formula would have said 83.
+        assert mock_workout.call_args.kwargs["avg_pace_sec_per_km"] == 300
 
     def test_bulk_create_details_silent_when_svix_disabled(self, db: Session) -> None:
         data_source = DataSourceFactory(source="apple")
@@ -742,6 +799,83 @@ class TestCreateOrMergeSleep:
         assert stages[0]["stage"] == "light"
         assert stages[1]["stage"] == "deep"
 
+    def test_dispatches_webhook_with_source_and_stage_details(self, db: Session) -> None:
+        """create_or_merge_sleep passes device_type, writer app, and stage intervals to the webhook."""
+        data_source = DataSourceFactory(source="oura", device_type="ring")
+        start, end = self._dt(1, 35), self._dt(8, 51)
+        record = self._record(data_source, start, end)
+        detail = self._detail(record.id)
+        stage = SleepStage(stage="light", start_time=start, end_time=end)
+        detail = detail.model_copy(update={"sleep_stages": [stage]})
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
+        ):
+            result = event_record_service.create_or_merge_sleep(db, data_source.user_id, record, detail, self.THRESHOLD)
+
+        mock_sleep.assert_called_once()
+        kwargs = mock_sleep.call_args.kwargs
+        assert kwargs["record_id"] == result.id
+        assert kwargs["source_app"] == "oura"
+        assert kwargs["device_type"] == "ring"
+        assert kwargs["sleep_duration_seconds"] == detail.sleep_total_duration_minutes * 60
+        assert kwargs["sleep_stage_intervals"] == [stage.model_dump(mode="json")]
+
+    def test_skips_data_source_lookup_when_svix_disabled(self, db: Session) -> None:
+        """No device_type lookup (and no webhook) happens when Svix is not configured."""
+        data_source = DataSourceFactory(source="oura", device_type="ring")
+        start, end = self._dt(1, 35), self._dt(8, 51)
+        record = self._record(data_source, start, end)
+        detail = self._detail(record.id)
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=False),
+            patch.object(event_record_service, "data_source_repo") as mock_repo,
+            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
+        ):
+            event_record_service.create_or_merge_sleep(db, data_source.user_id, record, detail, self.THRESHOLD)
+
+        mock_repo.get.assert_not_called()
+        mock_sleep.assert_called_once()
+        assert mock_sleep.call_args.kwargs["device_type"] is None
+
+    def test_resolves_device_type_when_input_record_has_no_data_source_id(self, db: Session) -> None:
+        """Real provider ingestion (e.g. Oura's save_sleep_data) never sets data_source_id on
+        the input EventRecordCreate - it gets resolved/created by the repository during insert.
+        device_type must therefore be looked up from the *persisted* record, not the input.
+        """
+        user = UserFactory()
+        # Pre-existing DataSource matching the identity (user_id, provider, device_model, source)
+        # that the repository's get-or-create will resolve to - with a known device_type, so the
+        # assertion below actually distinguishes "looked up the resolved source" from "always None".
+        DataSourceFactory(user=user, provider=ProviderName.OURA, device_model=None, source="oura", device_type="ring")
+
+        start, end = self._dt(1, 35), self._dt(8, 51)
+        record = EventRecordCreate(
+            id=uuid4(),
+            category="sleep",
+            type="sleep_session",
+            source_name="Oura",
+            source="oura",
+            user_id=user.id,
+            start_datetime=start,
+            end_datetime=end,
+            duration_seconds=int((end - start).total_seconds()),
+        )
+        assert record.data_source_id is None
+        detail = self._detail(record.id)
+
+        with (
+            patch("app.services.event_record_service.svix_service.is_enabled", return_value=True),
+            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
+        ):
+            result = event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
+
+        assert result.data_source_id is not None
+        mock_sleep.assert_called_once()
+        assert mock_sleep.call_args.kwargs["device_type"] == "ring"
+
 
 class TestRecomputeSleepScores:
     """Test the internal sleep score recompute triggered by create_or_merge_sleep."""
@@ -848,6 +982,114 @@ class TestGetSleepSessions:
         session = next(s for s in response.data if s.id == record.id)
         assert session.duration_seconds == 28800  # time in bed (unchanged)
         assert session.sleep_duration_seconds == 450 * 60  # actual sleep
+
+    def test_unreported_stages_stay_null_instead_of_reading_as_zero(self, db: Session) -> None:
+        """A provider that does not measure a stage must not show the user zero minutes of it."""
+        user = UserFactory()
+        record = EventRecordFactory(
+            mapping=DataSourceFactory(user=user, source="oura"), category="sleep", type_="sleep"
+        )
+        SleepDetailsFactory(
+            event_record=record,
+            sleep_deep_minutes=None,
+            sleep_rem_minutes=None,
+            sleep_light_minutes=300,
+            sleep_awake_minutes=0,
+            sleep_efficiency_score=None,
+        )
+
+        params = EventRecordQueryParams(
+            start_datetime=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            end_datetime=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+        session = next(
+            s for s in event_record_service.get_sleep_sessions(db, user.id, params).data if s.id == record.id
+        )
+
+        assert session.stages is not None
+        assert session.stages.deep_minutes is None
+        assert session.stages.rem_minutes is None
+        assert session.stages.light_minutes == 300
+        assert session.stages.awake_minutes == 0  # measured zero survives
+        assert session.efficiency_percent is None
+
+    def test_stage_intervals_are_opt_in(self, db: Session) -> None:
+        """Intervals are ~89% of a sleep page, so they ship only when asked for."""
+        user = UserFactory()
+        record = EventRecordFactory(
+            mapping=DataSourceFactory(user=user, source="oura"), category="sleep", type_="sleep"
+        )
+        stage = SleepStage(
+            stage="light",
+            start_time=datetime(2026, 4, 10, 23, 0, tzinfo=timezone.utc),
+            end_time=datetime(2026, 4, 10, 23, 40, tzinfo=timezone.utc),
+        )
+        SleepDetailsFactory(event_record=record, sleep_stages=[stage.model_dump(mode="json")])
+
+        params = EventRecordQueryParams(
+            start_datetime=datetime(2020, 1, 1, tzinfo=timezone.utc),
+            end_datetime=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        )
+
+        default = event_record_service.get_sleep_sessions(db, user.id, params)
+        expanded = event_record_service.get_sleep_sessions(db, user.id, params, include=[SleepInclude.STAGES])
+
+        assert next(s for s in default.data if s.id == record.id).sleep_stage_intervals is None
+        intervals = next(s for s in expanded.data if s.id == record.id).sleep_stage_intervals
+        assert intervals is not None
+        assert intervals[0].stage == "light"
+
+    def test_time_in_bed_comes_from_the_provider_not_the_record_span(self, db: Session) -> None:
+        """The reported time in bed differs from end-minus-start often enough to be worth returning."""
+        user = UserFactory()
+        record = EventRecordFactory(
+            mapping=DataSourceFactory(user=user, source="oura"),
+            category="sleep",
+            type_="sleep",
+            start_datetime=datetime(2026, 4, 10, 23, 0, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 4, 11, 7, 0, tzinfo=timezone.utc),
+            duration_seconds=28800,
+        )
+        SleepDetailsFactory(event_record=record, sleep_time_in_bed_minutes=470)
+
+        params = EventRecordQueryParams(
+            start_datetime=datetime(2026, 4, 1, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 4, 30, tzinfo=timezone.utc),
+        )
+        session = next(
+            s for s in event_record_service.get_sleep_sessions(db, user.id, params).data if s.id == record.id
+        )
+
+        assert session.duration_seconds == 28800
+        assert session.time_in_bed_seconds == 470 * 60
+
+    def test_source_filters_narrow_the_sleep_list(self, db: Session) -> None:
+        """Sleep accepts the same origin filters as the workout list."""
+        user = UserFactory()
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura_api")
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop_api")
+        base = datetime(2026, 4, 10, 23, 0, tzinfo=timezone.utc)
+        for mapping, offset in ((oura, 0), (whoop, 24)):
+            EventRecordFactory(
+                mapping=mapping,
+                category="sleep",
+                type_="sleep",
+                start_datetime=base + timedelta(hours=offset),
+                end_datetime=base + timedelta(hours=offset + 8),
+            )
+
+        def fetch(**overrides) -> list:
+            params = EventRecordQueryParams(
+                start_datetime=datetime(2026, 4, 1, tzinfo=timezone.utc),
+                end_datetime=datetime(2026, 4, 30, tzinfo=timezone.utc),
+                **overrides,
+            )
+            return event_record_service.get_sleep_sessions(db, user.id, params).data
+
+        assert len(fetch()) == 2
+        assert [s.source.provider for s in fetch(provider=ProviderName.OURA)] == ["oura"]
+        assert len(fetch(source="whoop_api")) == 1
+        assert len(fetch(data_source_id=oura.id)) == 1
 
     def test_sleep_duration_none_when_details_missing(self, db: Session) -> None:
         """sleep_duration_seconds should be None if SleepDetails has no total duration."""
