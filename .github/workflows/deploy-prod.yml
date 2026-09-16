@@ -25,12 +25,13 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
+  AWS_REGION: eusc-de-east-1
   ECS_CLUSTER: lucie-prod
   BACKEND_REPO: lucie/ow-backend
   FRONTEND_REPO: lucie/ow-frontend
+  ECR_REGISTRY: 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu
   OW_API_BASE_URL: https://ow.getlucie.ai
-  ROLE_ARN: arn:aws:iam::031244176128:role/ow-deploy-prod
+  ROLE_ARN: arn:aws-eusc:iam::326876515198:role/ow-deploy-prod
 
 jobs:
   build:
@@ -57,10 +58,11 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-build-${{ matrix.name }}
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Compute short SHA
         id: tag
-        run: echo "sha_short=${GITHUB_SHA:0:7}" >> $GITHUB_OUTPUT
+        run: echo "sha_short=${GITHUB_SHA:0:7}" >> "${GITHUB_OUTPUT}"
 
       - name: Login to ECR
         id: ecr
@@ -83,8 +85,63 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:latest
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:sha-${{ steps.tag.outputs.sha_short }}
 
-  migrate:
+  prepare-release:
     needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    outputs:
+      migrator_task_definition: ${{ steps.register.outputs.ow_migrator }}
+      backend_task_definition: ${{ steps.register.outputs.ow_backend }}
+      worker_task_definition: ${{ steps.register.outputs.ow_celery_worker }}
+      beat_task_definition: ${{ steps.register.outputs.ow_celery_beat }}
+      frontend_task_definition: ${{ steps.register.outputs.ow_frontend }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: ow-prepare-release
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
+
+      - name: Register task definitions for exact image digests
+        id: register
+        run: |
+          set -euo pipefail
+          BACKEND_DIGEST=$(aws ecr batch-get-image \
+            --repository-name "${BACKEND_REPO}" --image-ids imageTag=latest \
+            --query 'images[0].imageId.imageDigest' --output text)
+          FRONTEND_DIGEST=$(aws ecr batch-get-image \
+            --repository-name "${FRONTEND_REPO}" --image-ids imageTag=latest \
+            --query 'images[0].imageId.imageDigest' --output text)
+          for digest in "${BACKEND_DIGEST}" "${FRONTEND_DIGEST}"; do
+            [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error::Invalid ECR image digest: ${digest}"
+              exit 1
+            }
+          done
+
+          for family in ow-migrator ow-backend ow-celery-worker ow-celery-beat ow-frontend; do
+            image="${ECR_REGISTRY}/${BACKEND_REPO}@${BACKEND_DIGEST}"
+            if [[ "${family}" == "ow-frontend" ]]; then
+              image="${ECR_REGISTRY}/${FRONTEND_REPO}@${FRONTEND_DIGEST}"
+            fi
+            task_definition=$(aws ecs describe-task-definition \
+              --task-definition "${family}" --query taskDefinition | jq --arg image "${image}" '
+                .containerDefinitions[0].image = $image |
+                del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+              ')
+            task_definition_arn=$(aws ecs register-task-definition \
+              --cli-input-json "${task_definition}" \
+              --query taskDefinition.taskDefinitionArn --output text)
+            output_name=${family//-/_}
+            echo "${output_name}=${task_definition_arn}" >> "${GITHUB_OUTPUT}"
+            echo "Registered ${task_definition_arn} with ${image}"
+          done
+
+  migrate:
+    needs: prepare-release
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -94,23 +151,34 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-migrate
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Run ow-migrator task
         id: run
+        env:
+          MIGRATOR_TASK_DEFINITION: ${{ needs.prepare-release.outputs.migrator_task_definition }}
         run: |
           set -e
           NET_CFG=$(aws ecs describe-services \
             --cluster "${ECS_CLUSTER}" \
             --services ow-backend \
             --query 'services[0].networkConfiguration' --output json)
+          CAPACITY_PROVIDER_STRATEGY=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services ow-backend \
+            --query 'services[0].capacityProviderStrategy' --output json)
+          if [[ "${CAPACITY_PROVIDER_STRATEGY}" == "[]" ]]; then
+            echo "::error::ow-backend has no capacity-provider strategy"
+            exit 1
+          fi
           TASK_ARN=$(aws ecs run-task \
             --cluster "${ECS_CLUSTER}" \
-            --task-definition ow-migrator \
-            --launch-type EC2 \
+            --task-definition "${MIGRATOR_TASK_DEFINITION}" \
+            --capacity-provider-strategy "${CAPACITY_PROVIDER_STRATEGY}" \
             --network-configuration "${NET_CFG}" \
             --query 'tasks[0].taskArn' --output text)
           echo "Started migrator task: ${TASK_ARN}"
-          echo "task_arn=${TASK_ARN}" >> $GITHUB_OUTPUT
+          echo "task_arn=${TASK_ARN}" >> "${GITHUB_OUTPUT}"
           aws ecs wait tasks-stopped --cluster "${ECS_CLUSTER}" --tasks "${TASK_ARN}"
 
       - name: Verify migration succeeded
@@ -133,7 +201,7 @@ jobs:
           fi
 
   deploy-frontend:
-    needs: migrate
+    needs: [prepare-release, migrate]
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -143,11 +211,14 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-deploy-frontend
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Force new deployment (ow-frontend)
+        env:
+          TASK_DEFINITION: ${{ needs.prepare-release.outputs.frontend_task_definition }}
         run: |
           aws ecs update-service --cluster "${ECS_CLUSTER}" \
-            --service ow-frontend --force-new-deployment \
+            --service ow-frontend --task-definition "${TASK_DEFINITION}" \
             --query 'service.serviceName' --output text
 
       - name: Wait + confirm frontend rollout
@@ -182,6 +253,7 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-deploy-svix
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Force new deployment (ow-svix-server)
         run: |
@@ -211,7 +283,7 @@ jobs:
           fi
 
   deploy-app:
-    needs: deploy-svix
+    needs: [prepare-release, deploy-svix]
     runs-on: ubuntu-latest
     environment: production
     steps:
@@ -221,12 +293,22 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-deploy-app
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Force new deployment on 3 services
+        env:
+          BACKEND_TASK_DEFINITION: ${{ needs.prepare-release.outputs.backend_task_definition }}
+          WORKER_TASK_DEFINITION: ${{ needs.prepare-release.outputs.worker_task_definition }}
+          BEAT_TASK_DEFINITION: ${{ needs.prepare-release.outputs.beat_task_definition }}
         run: |
-          for svc in ow-backend ow-celery-worker ow-celery-beat; do
+          for deployment in \
+            "ow-backend:${BACKEND_TASK_DEFINITION}" \
+            "ow-celery-worker:${WORKER_TASK_DEFINITION}" \
+            "ow-celery-beat:${BEAT_TASK_DEFINITION}"; do
+            svc=${deployment%%:*}
+            task_definition=${deployment#*:}
             aws ecs update-service --cluster "${ECS_CLUSTER}" \
-              --service "$svc" --force-new-deployment \
+              --service "${svc}" --task-definition "${task_definition}" \
               --query 'service.serviceName' --output text
           done
 
@@ -265,7 +347,7 @@ jobs:
               FAILED=1
             fi
           done
-          exit $FAILED
+          exit "${FAILED}"
 
       - name: Deployment summary
         env:
@@ -281,7 +363,7 @@ jobs:
             echo "| Image tag | \`latest\` + \`sha-${COMMIT_SHA:0:7}\` |"
             echo "| Commit | \`${COMMIT_SHA}\` |"
             echo "| URL | https://ow.getlucie.ai |"
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   configure-lucie-webhook:
     needs: deploy-app
@@ -294,6 +376,7 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           role-session-name: ow-configure-lucie-webhook
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Restrict Lucie webhook subscriptions
         id: run
@@ -305,6 +388,14 @@ jobs:
             --cluster "${ECS_CLUSTER}" \
             --services ow-backend \
             --query 'services[0].networkConfiguration' --output json)
+          CAPACITY_PROVIDER_STRATEGY=$(aws ecs describe-services \
+            --cluster "${ECS_CLUSTER}" \
+            --services ow-backend \
+            --query 'services[0].capacityProviderStrategy' --output json)
+          if [[ "${CAPACITY_PROVIDER_STRATEGY}" == "[]" ]]; then
+            echo "::error::ow-backend has no capacity-provider strategy"
+            exit 1
+          fi
           BACKEND_TASK_DEF=$(aws ecs describe-services \
             --cluster "${ECS_CLUSTER}" \
             --services ow-backend \
@@ -337,7 +428,7 @@ jobs:
           TASK_ARN=$(aws ecs run-task \
             --cluster "${ECS_CLUSTER}" \
             --task-definition "${TASK_DEF}" \
-            --launch-type EC2 \
+            --capacity-provider-strategy "${CAPACITY_PROVIDER_STRATEGY}" \
             --network-configuration "${NET_CFG}" \
             --overrides "${OVERRIDES}" \
             --query 'tasks[0].taskArn' --output text)
@@ -367,8 +458,3 @@ jobs:
             aws logs tail /ecs/ow-migrator --since 5m --region "${AWS_REGION}" || true
             exit 1
           fi
-
-  sync-eu-sovereign:
-    needs: configure-lucie-webhook
-    uses: ./.github/workflows/eusc-sync.yml
-    secrets: inherit
