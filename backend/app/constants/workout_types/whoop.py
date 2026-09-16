@@ -158,8 +158,8 @@ WHOOP_WORKOUT_TYPE_MAPPINGS: list[tuple[str, int | None, WorkoutType]] = [
     ("dedicated-parenting", 251, WorkoutType.LIFESTYLE),
     # Undocumented sports: missing from the Whoop docs, seen in real payloads, likely more to
     # come
-    ("weightlifting_msk", None, WorkoutType.STRENGTH_TRAINING),
-    ("foam_rolling", None, WorkoutType.RECOVERY),
+    ("weightlifting-msk", None, WorkoutType.STRENGTH_TRAINING),
+    ("foam-rolling", None, WorkoutType.RECOVERY),
 ]
 
 WHOOP_TO_UNIFIED: dict[str, WorkoutType] = {

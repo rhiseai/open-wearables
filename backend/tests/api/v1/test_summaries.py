@@ -75,7 +75,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2026-05-05T00:00:00Z", "end_date": "2026-05-06T00:00:00Z"},
         )
         assert response.status_code == 200
@@ -102,7 +102,7 @@ class TestSleepSummaryEndpoint:
         api_key = ApiKeyFactory()
         response = client.get(
             f"/api/v1/users/{user.id}/summaries/sleep",
-            headers=api_key_headers(api_key.id),
+            headers=api_key_headers(api_key.plain_key),
             params={"start_date": "2026-05-05T00:00:00Z", "end_date": "2026-05-06T00:00:00Z"},
         )
         assert response.status_code == 200
