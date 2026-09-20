@@ -1,14 +1,14 @@
 # OpenWearables deployment stack
 #
 # Deployed to a dedicated EC2 (separate from lucie-api).
-# Uses Traefik as HTTP reverse proxy (no TLS — accessed via EC2 public DNS).
+# Uses Traefik as the TLS-terminating HTTP reverse proxy.
 # Images pulled from ECR; this file is synced to /app on the box by CI.
 #
 # Required env (written by CI from GH Secrets → /app/.env):
 #   ENVIRONMENT          = staging | production
-#   OW_PUBLIC_HOST       = ec2-xx-xx-xx-xx.compute-1.amazonaws.com (auto-detected by CI)
-#   OW_IMAGE_BACKEND     = 031244176128.dkr.ecr.us-east-1.amazonaws.com/rhiseai/open-wearables-backend:<tag>
-#   OW_IMAGE_FRONTEND    = 031244176128.dkr.ecr.us-east-1.amazonaws.com/rhiseai/open-wearables-frontend:<tag>
+#   OW_PUBLIC_HOST       = the staging EC2 public DNS name (auto-detected by CI)
+#   OW_IMAGE_BACKEND     = 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu/rhiseai/open-wearables-backend:<tag>
+#   OW_IMAGE_FRONTEND    = 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu/rhiseai/open-wearables-frontend:<tag>
 #   OW_DB_NAME           = open-wearables
 #   OW_DB_USER           = open-wearables
 #   OW_DB_PASSWORD       = <secret>
