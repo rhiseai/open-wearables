@@ -59,12 +59,16 @@ _DEFAULT_ADOPTION_DAYS = 7
 def get_connection_adoption_endpoint(
     db: DbSession,
     _api_key: ApiKeyDep,
+    since: Annotated[
+        datetime | None,
+        Query(description="Exact start of the recency window. Overrides since_days when given."),
+    ] = None,
     since_days: Annotated[
         int,
         Query(
             ge=0,
             le=3650,
-            description="Size of the recency window, in days back from now.",
+            description="Size of the recency window in days back from now. Ignored when since is given.",
         ),
     ] = _DEFAULT_ADOPTION_DAYS,
 ):
@@ -72,9 +76,20 @@ def get_connection_adoption_endpoint(
 
     One aggregate over every provider, so a consumer charting adoption does not
     have to fan out a request per user. ``total_users`` is all time and ignores
-    the window; only ``new_users`` follows ``since_days``.
+    the window; only ``new_users`` follows it.
+
+    ``since`` exists because ``since_days`` cannot name a boundary like "local
+    midnight": a caller that counts its own rows from midnight and asks here
+    for "7 days" is comparing two windows that differ by up to a day, which is
+    exactly the kind of skew that makes two bars in one chart disagree. Pass
+    the instant and both halves count from the same edge. A naive value is
+    read as UTC, so a caller cannot silently shift the window by its own
+    timezone.
     """
-    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    if since is None:
+        since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    elif since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
     return user_connection_service.get_provider_adoption(db, since)
 
 
