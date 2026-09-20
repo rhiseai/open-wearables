@@ -21,6 +21,14 @@ The endpoint must respond quickly; ``dispatch()`` stores the raw payload and
 enqueues a Celery task, returning 200 immediately. ``process_payload()`` does
 the actual API fetch and DB write, called by the task.
 
+Fan-out
+-------
+  Oura names only the ring in its payload, and one ring can be connected to
+  several OW profiles. The object is fetched once — any linked profile's token
+  reads the same account — and then saved for every profile sharing it. The
+  oldest connection is the primary; resolving a single one would leave every
+  other profile silent forever, since Oura has no polling path to catch up.
+
 Supported data types
 ---------------------
   workout / daily_sleep / sleep / daily_readiness / daily_activity / daily_spo2
@@ -30,6 +38,7 @@ See: https://cloud.ouraring.com/v2/docs#tag/Webhook-Subscription-Routes
 
 import json
 import logging
+from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -39,6 +48,7 @@ from pydantic import ValidationError
 
 from app.config import settings
 from app.database import DbSession
+from app.models.user_connection import UserConnection
 from app.repositories import UserConnectionRepository
 from app.schemas.providers.oura import OuraWebhookNotification
 from app.services.providers.oura.data_247 import Oura247Data
@@ -50,6 +60,10 @@ from app.utils.structured_logging import LogContext, log_structured
 logger = logging.getLogger(__name__)
 
 _PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_webhook_push"
+
+# Upstream statuses that condemn one profile's token rather than the object
+# itself, so the fetch is worth retrying with another linked profile's token.
+_TOKEN_FAILURE_STATUSES = frozenset({401, 403})
 
 SUPPORTED_DATA_TYPES = [
     "workout",
@@ -214,8 +228,8 @@ class OuraWebhookHandler(BaseWebhookHandler):
             )
             return {"status": "ignored", "reason": "delete_event"}
 
-        connection = self.connection_repo.get_by_provider_user_id(db, "oura", notification.user_id)
-        if not connection:
+        connections = self.connection_repo.get_all_by_provider_user_id(db, "oura", notification.user_id)
+        if not connections:
             log_structured(
                 logger,
                 "warning",
@@ -231,7 +245,13 @@ class OuraWebhookHandler(BaseWebhookHandler):
                 "data_type": notification.data_type,
             }
 
-        user_id: UUID = connection.user_id
+        # One ring can be connected to several OW profiles, and Oura names only
+        # the ring in its payload. Resolving a single connection therefore sends
+        # every delivery to one profile and starves the rest indefinitely —
+        # Oura has no polling fallback to catch them up. ``connections`` is
+        # ordered oldest-first, so the primary stays stable across deliveries.
+        user_id: UUID = connections[0].user_id
+        linked_user_ids: list[UUID] = [connection.user_id for connection in connections[1:]]
 
         log_structured(
             logger,
@@ -240,32 +260,46 @@ class OuraWebhookHandler(BaseWebhookHandler):
             provider="oura",
             trace_id=trace_id,
             user_id=str(user_id),
+            linked_user_ids=[str(linked) for linked in linked_user_ids],
             provider_user_id=notification.user_id,
             data_type=notification.data_type,
             event_type=notification.event_type,
             object_id=notification.object_id,
         )
 
-        self.connection_repo.update_last_synced_at(db, connection)
+        for connection in connections:
+            self.connection_repo.update_last_synced_at(db, connection)
 
-        count = self._dispatch_data_type(db, notification, user_id, trace_id)
+        raw = self._fetch_object_for_connections(db, notification, connections, trace_id)
 
-        if count is None:
-            log_structured(
-                logger,
-                "info",
-                "Unhandled Oura data type",
-                provider="oura",
-                trace_id=trace_id,
-                data_type=notification.data_type,
-                user_id=str(user_id),
-                provider_user_id=notification.user_id,
-            )
-            return {
-                "status": "ignored",
-                "reason": f"unhandled_data_type: {notification.data_type}",
-                "user_id": str(user_id),
-            }
+        saved: dict[UUID, Any] = {}
+        if raw is not None:
+            for connection in connections:
+                count = self._save_object(db, notification, raw, connection.user_id, trace_id)
+                if count is None:
+                    # Unhandled data types are a property of the payload, not of
+                    # the profile, so the first verdict settles it for all.
+                    log_structured(
+                        logger,
+                        "info",
+                        "Unhandled Oura data type",
+                        provider="oura",
+                        trace_id=trace_id,
+                        data_type=notification.data_type,
+                        user_id=str(user_id),
+                        provider_user_id=notification.user_id,
+                    )
+                    return {
+                        "status": "ignored",
+                        "reason": f"unhandled_data_type: {notification.data_type}",
+                        "user_id": str(user_id),
+                    }
+                saved[connection.user_id] = count
+
+        # The primary's count is what ``records_saved`` has always meant: the
+        # records one profile received. Summing the fan-out here would report a
+        # single night of sleep twice in the sync log.
+        primary_count: Any = saved.get(user_id, 0)
 
         log_structured(
             logger,
@@ -275,19 +309,22 @@ class OuraWebhookHandler(BaseWebhookHandler):
             action="oura_webhook_complete",
             trace_id=trace_id,
             user_id=str(user_id),
+            linked_user_ids=[str(linked) for linked in linked_user_ids],
             provider_user_id=notification.user_id,
             data_type=notification.data_type,
             event_type=notification.event_type,
-            records_saved=int(count),
-            records_inserted=getattr(count, "inserted", None),
-            records_updated=getattr(count, "updated", None),
+            records_saved=int(primary_count),
+            records_saved_total=sum(int(count) for count in saved.values()),
+            records_inserted=getattr(primary_count, "inserted", None),
+            records_updated=getattr(primary_count, "updated", None),
         )
         return {
             "status": "processed",
             "data_type": notification.data_type,
             "event_type": notification.event_type,
-            "records_saved": count,
+            "records_saved": primary_count,
             "user_id": str(user_id),
+            "linked_user_ids": [str(linked) for linked in linked_user_ids],
         }
 
     # ------------------------------------------------------------------
@@ -301,6 +338,66 @@ class OuraWebhookHandler(BaseWebhookHandler):
         user_id: UUID,
         trace_id: str,
     ) -> int | None:
+        """Fetch the changed object with ``user_id``'s token and save it for them.
+
+        ``process_payload`` drives the two halves separately so one fetch can
+        feed every profile sharing the ring; this keeps the single-profile path
+        readable as one call.
+        """
+        raw = self._fetch_object(db, notification, user_id, trace_id)
+        if raw is None:
+            return 0
+        return self._save_object(db, notification, raw, user_id, trace_id)
+
+    def _fetch_object_for_connections(
+        self,
+        db: DbSession,
+        notification: OuraWebhookNotification,
+        connections: Sequence[UserConnection],
+        trace_id: str,
+    ) -> dict[str, Any] | None:
+        """Fetch the changed object once, trying each profile's token in turn.
+
+        Every connection here points at the same Oura account, so any of their
+        tokens can read the object. Falling through on an auth failure keeps a
+        dead token on the oldest profile from starving all the others — the bug
+        this fan-out exists to fix, one step removed.
+        """
+        auth_error: HTTPException | None = None
+        for connection in connections:
+            try:
+                return self._fetch_object(db, notification, connection.user_id, trace_id)
+            except HTTPException as exc:
+                if exc.status_code not in _TOKEN_FAILURE_STATUSES:
+                    raise
+                auth_error = exc
+                log_structured(
+                    logger,
+                    "warning",
+                    "Oura rejected this profile's token; trying the next linked profile",
+                    provider="oura",
+                    trace_id=trace_id,
+                    user_id=str(connection.user_id),
+                    provider_user_id=notification.user_id,
+                    data_type=notification.data_type,
+                    status_code=exc.status_code,
+                )
+        if auth_error is not None:
+            raise auth_error
+        return None
+
+    def _fetch_object(
+        self,
+        db: DbSession,
+        notification: OuraWebhookNotification,
+        user_id: UUID,
+        trace_id: str,
+    ) -> dict[str, Any] | None:
+        """Read the changed object from Oura with ``user_id``'s token.
+
+        Returns None when there is nothing to save: a payload carrying no
+        object_id, or a fetch that came back empty.
+        """
         data_type = notification.data_type
         object_id = notification.object_id
 
@@ -316,14 +413,14 @@ class OuraWebhookHandler(BaseWebhookHandler):
                 data_type=data_type,
                 event_type=notification.event_type,
             )
-            return 0
+            return None
 
         if data_type == "workout":
-            return self.workouts.save_by_id(db, user_id, object_id, trace_id=trace_id)
+            raw = self.workouts.get_workout_detail_from_api(db, user_id, object_id)
+        else:
+            collection = _COLLECTION_NAME.get(data_type, data_type)
+            raw = self.data_247._make_api_request(db, user_id, f"/v2/usercollection/{collection}/{object_id}")
 
-        collection = _COLLECTION_NAME.get(data_type, data_type)
-        endpoint = f"/v2/usercollection/{collection}/{object_id}"
-        raw = self.data_247._make_api_request(db, user_id, endpoint)
         if not raw or not isinstance(raw, dict):
             log_structured(
                 logger,
@@ -336,7 +433,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
                 data_type=data_type,
                 object_id=object_id,
             )
-            return 0
+            return None
 
         store_raw_payload(
             source="api_response",
@@ -345,6 +442,24 @@ class OuraWebhookHandler(BaseWebhookHandler):
             user_id=str(user_id),
             trace_id=trace_id,
         )
+        return raw
+
+    def _save_object(
+        self,
+        db: DbSession,
+        notification: OuraWebhookNotification,
+        raw: dict[str, Any],
+        user_id: UUID,
+        trace_id: str,
+    ) -> int | None:
+        """Persist one already-fetched object for one profile.
+
+        Returns None for a data type this handler does not store.
+        """
+        data_type = notification.data_type
+
+        if data_type == "workout":
+            return self.workouts.save_from_raw(db, user_id, raw, str(notification.object_id), trace_id=trace_id)
 
         docs = [raw]
 

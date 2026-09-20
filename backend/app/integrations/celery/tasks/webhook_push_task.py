@@ -68,6 +68,27 @@ def _extract_breakdown(result: dict[str, Any], count: Any) -> dict[str, int] | N
     return {"inserted": inserted or 0, "updated": updated or 0}
 
 
+def _delivered_user_ids(result: dict[str, Any]) -> list[UUID]:
+    """Every profile this delivery reached, primary first.
+
+    A provider account shared by several OW profiles fans one delivery out to
+    all of them (``linked_user_ids``). Each needs its own sync-log entry, or a
+    profile that is now receiving data still reads as silent in the UI.
+    """
+    user_ids: list[UUID] = []
+    raw_ids = [result.get("user_id"), *(result.get("linked_user_ids") or [])]
+    for raw_id in raw_ids:
+        if not raw_id:
+            continue
+        try:
+            user_id = UUID(str(raw_id))
+        except (ValueError, TypeError):
+            continue
+        if user_id not in user_ids:
+            user_ids.append(user_id)
+    return user_ids
+
+
 def _emit_webhook_sync_status(provider_name: str, result: Any) -> None:
     """Record a webhook delivery in the sync log (best-effort, never raises).
 
@@ -80,12 +101,8 @@ def _emit_webhook_sync_status(provider_name: str, result: Any) -> None:
         if provider_name not in _SYNC_LOG_PROVIDERS or not isinstance(result, dict):
             return
 
-        raw_user_id = result.get("user_id")
-        if not raw_user_id:
-            return
-        try:
-            user_id = UUID(str(raw_user_id))
-        except (ValueError, TypeError):
+        user_ids = _delivered_user_ids(result)
+        if not user_ids:
             return
 
         status_str = str(result.get("status") or "").lower()
@@ -94,37 +111,38 @@ def _emit_webhook_sync_status(provider_name: str, result: Any) -> None:
 
         breakdown = _extract_breakdown(result, count)
 
-        if status_str == "error":
-            sync_status_service.emit_webhook_delivered(
-                user_id,
-                provider_name,
-                status=SyncStatus.FAILED,
-                error=str(result.get("error") or "unknown"),
-                message=f"webhook {descriptor}".strip(),
-            )
-        elif status_str in _SAVED_STATUSES and (count or 0) > 0:
-            # Prefer the new/updated split so an upsert-in-place reads as
-            # "0 new, 3 updated" rather than looking like freshly arrived data.
-            detail = f"{breakdown['inserted']} new, {breakdown['updated']} updated" if breakdown else descriptor
-            sync_status_service.emit_webhook_delivered(
-                user_id,
-                provider_name,
-                status=SyncStatus.SUCCESS,
-                items_processed=count,
-                message=f"webhook {detail}".strip(),
-                metadata=breakdown,
-            )
-        else:
-            # processed-but-no-data, ignored, duplicate, unknown_event_type, …
-            reason = result.get("reason") or (descriptor if status_str in _SAVED_STATUSES else status_str)
-            sync_status_service.emit_webhook_delivered(
-                user_id,
-                provider_name,
-                status=SyncStatus.SKIPPED,
-                items_processed=count,
-                message=f"skipped: {reason}".strip(),
-                metadata=breakdown,
-            )
+        for user_id in user_ids:
+            if status_str == "error":
+                sync_status_service.emit_webhook_delivered(
+                    user_id,
+                    provider_name,
+                    status=SyncStatus.FAILED,
+                    error=str(result.get("error") or "unknown"),
+                    message=f"webhook {descriptor}".strip(),
+                )
+            elif status_str in _SAVED_STATUSES and (count or 0) > 0:
+                # Prefer the new/updated split so an upsert-in-place reads as
+                # "0 new, 3 updated" rather than looking like freshly arrived data.
+                detail = f"{breakdown['inserted']} new, {breakdown['updated']} updated" if breakdown else descriptor
+                sync_status_service.emit_webhook_delivered(
+                    user_id,
+                    provider_name,
+                    status=SyncStatus.SUCCESS,
+                    items_processed=count,
+                    message=f"webhook {detail}".strip(),
+                    metadata=breakdown,
+                )
+            else:
+                # processed-but-no-data, ignored, duplicate, unknown_event_type, …
+                reason = result.get("reason") or (descriptor if status_str in _SAVED_STATUSES else status_str)
+                sync_status_service.emit_webhook_delivered(
+                    user_id,
+                    provider_name,
+                    status=SyncStatus.SKIPPED,
+                    items_processed=count,
+                    message=f"skipped: {reason}".strip(),
+                    metadata=breakdown,
+                )
     except Exception as exc:  # pragma: no cover - sync log must never break processing
         logger.debug("Failed to emit webhook sync status: %s", exc, exc_info=True)
 
