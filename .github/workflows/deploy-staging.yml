@@ -14,53 +14,18 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: us-east-1
-  ECR_REGISTRY: 031244176128.dkr.ecr.us-east-1.amazonaws.com
+  AWS_REGION: eusc-de-east-1
+  ECR_REGISTRY: 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu
   BACKEND_REPO: rhiseai/open-wearables-backend
   FRONTEND_REPO: rhiseai/open-wearables-frontend
-  ROLE_ARN: arn:aws:iam::031244176128:role/github-actions-ow-publish
+  ROLE_ARN: arn:aws-eusc:iam::326876515198:role/ow-deploy-staging
+  SNS_TOPIC_ARN: arn:aws-eusc:sns:eusc-de-east-1:326876515198:owear-staging
 
 jobs:
-  # ===========================================================================
-  # Resolve EC2 public DNS (needed as VITE_API_URL at frontend build time)
-  # ===========================================================================
-  resolve-host:
-    runs-on: ubuntu-latest
-    environment: staging
-    outputs:
-      instance_id: ${{ steps.inst.outputs.instance_id }}
-      public_dns: ${{ steps.inst.outputs.public_dns }}
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ env.ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Resolve staging instance id + public DNS
-        id: inst
-        run: |
-          INSTANCE=$(aws ec2 describe-instances \
-            --filters "Name=tag:app,Values=open-wearables" \
-                      "Name=tag:environment,Values=staging" \
-                      "Name=instance-state-name,Values=running" \
-            --query 'Reservations[0].Instances[0].[InstanceId,PublicDnsName]' --output text)
-          ID=$(echo "$INSTANCE" | awk '{print $1}')
-          DNS=$(echo "$INSTANCE" | awk '{print $2}')
-          if [[ "$ID" == "None" || -z "$ID" ]]; then
-            echo "No running ow-staging instance found"; exit 1
-          fi
-          if [[ -z "$DNS" || "$DNS" == "None" ]]; then
-            echo "Instance $ID has no public DNS — check that it has a public IP"; exit 1
-          fi
-          echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
-          echo "public_dns=$DNS" >> "$GITHUB_OUTPUT"
-
   # ===========================================================================
   # Build + push backend and frontend images to ECR
   # ===========================================================================
   build:
-    needs: resolve-host
     runs-on: ubuntu-latest
     environment: staging
     outputs:
@@ -81,10 +46,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: ow-staging-build-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
       - name: Login to ECR
         id: ecr
@@ -117,111 +84,13 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:staging
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:sha-${{ steps.tags.outputs.sha_short }}
 
-  # Mirror the exact staging manifests across the partition boundary. Builds
-  # happen once in Commercial AWS; both staging hosts deploy identical bytes.
-  mirror-eusc:
+  # ===========================================================================
+  # Deploy to the EU Sovereign staging host through SSM.
+  # ===========================================================================
+  deploy:
     needs: build
     runs-on: ubuntu-latest
     environment: staging
-    env:
-      TARGET_REGION: eusc-de-east-1
-      TARGET_ROLE_ARN: arn:aws-eusc:iam::326876515198:role/ow-deploy-staging
-    steps:
-      - name: Configure Commercial source credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: ow-staging-eusc-source-${{ github.run_id }}
-          aws-region: ${{ env.AWS_REGION }}
-          audience: sts.amazonaws.com
-
-      - name: Resolve exact staging digests
-        id: source
-        run: |
-          set -euo pipefail
-          for image in backend frontend; do
-            repo_var="${image^^}_REPO"
-            repo="${!repo_var}"
-            digest=$(aws ecr batch-get-image --repository-name "$repo" \
-              --image-ids imageTag=staging \
-              --query 'images[0].imageId.imageDigest' --output text)
-            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
-              echo "::error::Invalid ${repo}:staging digest: ${digest}"
-              exit 1
-            }
-            echo "${image}_digest=${digest}" >> "$GITHUB_OUTPUT"
-          done
-
-      - name: Login to Commercial ECR
-        id: source-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Configure EU Sovereign target credentials
-        uses: aws-actions/configure-aws-credentials@v5
-        with:
-          role-to-assume: ${{ env.TARGET_ROLE_ARN }}
-          role-session-name: ow-staging-eusc-target-${{ github.run_id }}
-          aws-region: ${{ env.TARGET_REGION }}
-          audience: sts.amazonaws.eu
-
-      - name: Login to EU Sovereign ECR
-        id: target-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Copy exact staging images
-        env:
-          SOURCE_REGISTRY: ${{ steps.source-ecr.outputs.registry }}
-          TARGET_REGISTRY: ${{ steps.target-ecr.outputs.registry }}
-          BACKEND_DIGEST: ${{ steps.source.outputs.backend_digest }}
-          FRONTEND_DIGEST: ${{ steps.source.outputs.frontend_digest }}
-          SHA_SHORT: ${{ needs.build.outputs.sha_short }}
-        run: |
-          set -euo pipefail
-          for image in backend frontend; do
-            repo_var="${image^^}_REPO"
-            digest_var="${image^^}_DIGEST"
-            repo="${!repo_var}"
-            digest="${!digest_var}"
-            source_image="${SOURCE_REGISTRY}/${repo}@${digest}"
-            for tag in staging "sha-${SHA_SHORT}"; do
-              docker buildx imagetools create --prefer-index=false \
-                --tag "${TARGET_REGISTRY}/${repo}:${tag}" "$source_image"
-            done
-            copied=$(docker buildx imagetools inspect \
-              "${TARGET_REGISTRY}/${repo}:staging" \
-              --format '{{json .Manifest}}' | jq -r '.digest // empty')
-            [[ "$copied" == "$digest" ]] || {
-              echo "::error::${repo} EU digest ${copied} differs from ${digest}"
-              exit 1
-            }
-          done
-
-  # ===========================================================================
-  # Deploy the same release to Commercial and EU through SSM. Commercial stays
-  # active as the rollback target until the DNS cutover is proven healthy.
-  # ===========================================================================
-  deploy:
-    needs: [build, mirror-eusc]
-    runs-on: ubuntu-latest
-    environment: staging
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - name: commercial
-            region: us-east-1
-            role_arn: arn:aws:iam::031244176128:role/github-actions-ow-publish
-            registry: 031244176128.dkr.ecr.us-east-1.amazonaws.com
-            sns_topic_arn: arn:aws:sns:us-east-1:031244176128:owear-staging
-            audience: sts.amazonaws.com
-          - name: eusc
-            region: eusc-de-east-1
-            role_arn: arn:aws-eusc:iam::326876515198:role/ow-deploy-staging
-            registry: 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu
-            sns_topic_arn: arn:aws-eusc:sns:eusc-de-east-1:326876515198:owear-staging
-            audience: sts.amazonaws.eu
 
     steps:
       - uses: actions/checkout@v4
@@ -229,12 +98,12 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          role-to-assume: ${{ matrix.target.role_arn }}
-          role-session-name: ow-staging-${{ matrix.target.name }}-${{ github.run_id }}
-          aws-region: ${{ matrix.target.region }}
-          audience: ${{ matrix.target.audience }}
+          role-to-assume: ${{ env.ROLE_ARN }}
+          role-session-name: ow-staging-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.eu
 
-      - name: Resolve ${{ matrix.target.name }} staging host
+      - name: Resolve staging host
         id: inst
         run: |
           INSTANCE=$(aws ec2 describe-instances \
@@ -245,7 +114,7 @@ jobs:
           ID=$(echo "$INSTANCE" | awk '{print $1}')
           DNS=$(echo "$INSTANCE" | awk '{print $2}')
           if [[ "$ID" == "None" || -z "$ID" || -z "$DNS" || "$DNS" == "None" ]]; then
-            echo "No usable ${{ matrix.target.name }} OW staging host found"
+            echo "No usable OW staging host found"
             exit 1
           fi
           echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
@@ -269,8 +138,8 @@ jobs:
         env:
           OW_DB_PASSWORD: ${{ secrets.OW_DB_PASSWORD }}
           OW_PUBLIC_HOST: ${{ steps.inst.outputs.public_dns }}
-          BACKEND_IMAGE: ${{ matrix.target.registry }}/${{ env.BACKEND_REPO }}:staging
-          FRONTEND_IMAGE: ${{ matrix.target.registry }}/${{ env.FRONTEND_REPO }}:staging
+          BACKEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_REPO }}:staging
+          FRONTEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_REPO }}:staging
         run: |
           # URL-encode the password for the svix DSN (svix parses a full
           # postgres:// URL, so any /, +, @, = in a base64-style secret
@@ -300,8 +169,8 @@ jobs:
           OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
           OPEN_WEARABLES_API_KEY: ${{ secrets.OPEN_WEARABLES_API_KEY }}
           OW_PUBLIC_HOST: ${{ steps.inst.outputs.public_dns }}
-          TARGET_AWS_REGION: ${{ matrix.target.region }}
-          TARGET_SNS_TOPIC_ARN: ${{ matrix.target.sns_topic_arn }}
+          TARGET_AWS_REGION: ${{ env.AWS_REGION }}
+          TARGET_SNS_TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
           # Providers
           GARMIN_CLIENT_ID: ${{ secrets.GARMIN_CLIENT_ID }}
           GARMIN_CLIENT_SECRET: ${{ secrets.GARMIN_CLIENT_SECRET }}
@@ -458,7 +327,6 @@ jobs:
           fi
 
       - name: Restrict Lucie webhook subscriptions
-        if: matrix.target.name == 'commercial'
         env:
           OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
           OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
@@ -493,15 +361,14 @@ jobs:
 
       - name: Summary
         env:
-          TARGET: ${{ matrix.target.name }}
           INSTANCE_ID: ${{ steps.inst.outputs.instance_id }}
-          BACKEND_IMAGE: ${{ matrix.target.registry }}/${{ env.BACKEND_REPO }}:staging
-          FRONTEND_IMAGE: ${{ matrix.target.registry }}/${{ env.FRONTEND_REPO }}:staging
+          BACKEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_REPO }}:staging
+          FRONTEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_REPO }}:staging
           OW_PUBLIC_HOST: ${{ steps.inst.outputs.public_dns }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
           {
-            echo "## OW staging deployment — $TARGET"
+            echo "## OW staging deployment"
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Instance | \`$INSTANCE_ID\` |"
