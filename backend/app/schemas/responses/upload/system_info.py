@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel
 
 
@@ -30,6 +32,25 @@ class EventRecordsInfo(BaseModel):
 class ProviderConnectionCount(BaseModel):
     provider: str
     count: int
+
+
+class ProviderAdoption(BaseModel):
+    """One provider's reach: users holding it, and users who joined recently.
+
+    ``new_users`` counts first connections inside the requested window, so a
+    consumer can render "total (+N this week)" without a second call.
+    """
+
+    provider: str
+    total_users: int
+    new_users: int
+
+
+class ConnectionAdoptionResponse(BaseModel):
+    """Per-provider adoption for every provider with an active connection."""
+
+    since: datetime
+    providers: list[ProviderAdoption]
 
 
 class ConnectionsCoverage(BaseModel):

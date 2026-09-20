@@ -8,7 +8,12 @@ from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName, SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
-from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
+from app.schemas.responses.upload import (
+    ConnectionAdoptionResponse,
+    ConnectionsCoverage,
+    ProviderAdoption,
+    ProviderConnectionCount,
+)
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.services import AppService
@@ -41,6 +46,16 @@ class UserConnectionService(
             top_providers=[
                 ProviderConnectionCount(provider=p, count=c)
                 for p, c in self.crud.get_top_providers_by_active_conn(db_session, limit=6)
+            ],
+        )
+
+    def get_provider_adoption(self, db_session: DbSession, since: datetime) -> ConnectionAdoptionResponse:
+        """Per-provider adoption, with first connections since ``since`` counted separately."""
+        return ConnectionAdoptionResponse(
+            since=since,
+            providers=[
+                ProviderAdoption(provider=provider, total_users=total, new_users=new)
+                for provider, total, new in self.crud.get_provider_adoption(db_session, since)
             ],
         )
 

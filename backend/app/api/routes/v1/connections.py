@@ -1,7 +1,9 @@
 import contextlib
+from datetime import datetime, timedelta, timezone
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 
 from app.database import DbSession
 from app.models import ProviderSetting
@@ -9,6 +11,7 @@ from app.repositories.provider_settings_repository import ProviderSettingsReposi
 from app.schemas.auth import ConnectionStatus, LiveSyncMode, SDKAuthContext
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.user_management import UserConnectionWithCapabilities
+from app.schemas.responses.upload import ConnectionAdoptionResponse
 from app.services import ApiKeyDep, user_connection_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
@@ -45,6 +48,34 @@ def _with_capabilities(
     if linked_user_ids:
         enriched.linked_user_ids = linked_user_ids
     return enriched
+
+
+#: A window has to default to something; 7 days matches the period a caller
+#: charting "new this week" asks for most often.
+_DEFAULT_ADOPTION_DAYS = 7
+
+
+@router.get("/connections/stats", response_model=ConnectionAdoptionResponse)
+def get_connection_adoption_endpoint(
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    since_days: Annotated[
+        int,
+        Query(
+            ge=0,
+            le=3650,
+            description="Size of the recency window, in days back from now.",
+        ),
+    ] = _DEFAULT_ADOPTION_DAYS,
+):
+    """Per-provider adoption: users with an active connection, and how many are new.
+
+    One aggregate over every provider, so a consumer charting adoption does not
+    have to fan out a request per user. ``total_users`` is all time and ignores
+    the window; only ``new_users`` follows ``since_days``.
+    """
+    since = datetime.now(timezone.utc) - timedelta(days=since_days)
+    return user_connection_service.get_provider_adoption(db, since)
 
 
 @router.get("/users/{user_id}/connections", response_model=list[UserConnectionWithCapabilities])

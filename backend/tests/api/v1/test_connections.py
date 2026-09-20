@@ -9,7 +9,7 @@ Tests the /api/v1/users/{user_id}/connections endpoint including:
 - Error cases
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import UUID
 
@@ -859,3 +859,54 @@ class TestDisconnectDeregistration:
         # Assert
         assert response.status_code == 204
         mock_httpx_delete.assert_not_called()
+
+
+class TestConnectionAdoptionEndpoint:
+    """GET /api/v1/connections/stats."""
+
+    def test_returns_per_provider_adoption(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+        now = datetime.now(timezone.utc)
+        UserConnectionFactory(user=UserFactory(), provider="oura", created_at=now - timedelta(days=90))
+        UserConnectionFactory(user=UserFactory(), provider="oura", created_at=now - timedelta(days=1))
+        UserConnectionFactory(user=UserFactory(), provider="whoop", created_at=now - timedelta(days=90))
+        db.commit()
+
+        # Act
+        response = client.get("/api/v1/connections/stats?since_days=7", headers=api_key_headers(api_key.plain_key))
+
+        # Assert
+        assert response.status_code == 200
+        providers = {row["provider"]: row for row in response.json()["providers"]}
+        assert providers["oura"]["total_users"] == 2
+        assert providers["oura"]["new_users"] == 1
+        assert providers["whoop"]["new_users"] == 0
+
+    def test_requires_authentication(self, client: TestClient, db: Session) -> None:
+        # Act
+        response = client.get("/api/v1/connections/stats")
+
+        # Assert
+        assert response.status_code == 401
+
+    def test_rejects_a_negative_window(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+
+        # Act
+        response = client.get("/api/v1/connections/stats?since_days=-1", headers=api_key_headers(api_key.plain_key))
+
+        # Assert: this app renders validation failures as 400, not FastAPI's 422.
+        assert response.status_code == 400
+
+    def test_empty_database_is_an_empty_list_not_an_error(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+
+        # Act
+        response = client.get("/api/v1/connections/stats", headers=api_key_headers(api_key.plain_key))
+
+        # Assert
+        assert response.status_code == 200
+        assert response.json()["providers"] == []
