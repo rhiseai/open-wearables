@@ -42,7 +42,7 @@ mkdir -p /app
 chown root:root /app
 
 log "Verifying ECR pull works..."
-docker pull 031244176128.dkr.ecr.us-east-1.amazonaws.com/rhiseai/open-wearables-backend:staging 2>&1 || \
+docker pull 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu/rhiseai/open-wearables-backend:staging 2>&1 || \
   log "  (expected to fail if no :staging tag has been pushed yet — fine)"
 
 log "Bootstrap complete."

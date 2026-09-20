@@ -28,10 +28,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     environment: staging
-    outputs:
-      backend_image: ${{ steps.tags.outputs.backend_image }}
-      frontend_image: ${{ steps.tags.outputs.frontend_image }}
-      sha_short: ${{ steps.tags.outputs.sha_short }}
     strategy:
       fail-fast: true
       matrix:
@@ -64,9 +60,11 @@ jobs:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
           SHORT="${SHA:0:7}"
-          echo "sha_short=$SHORT" >> "$GITHUB_OUTPUT"
-          echo "backend_image=${REGISTRY}/${BACKEND_REPO}:staging" >> "$GITHUB_OUTPUT"
-          echo "frontend_image=${REGISTRY}/${FRONTEND_REPO}:staging" >> "$GITHUB_OUTPUT"
+          {
+            echo "sha_short=$SHORT"
+            echo "backend_image=${REGISTRY}/${BACKEND_REPO}:staging"
+            echo "frontend_image=${REGISTRY}/${FRONTEND_REPO}:staging"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 

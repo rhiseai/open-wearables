@@ -8,6 +8,15 @@ on:
       - synchronize
 
 jobs:
+  validate-delivery-partition:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject retired Commercial AWS delivery targets
+        run: deploy/scripts/check-eu-delivery-config.sh
+
   validate-pr-title:
     runs-on: ubuntu-latest
     permissions:
@@ -45,4 +54,3 @@ jobs:
           subjectPattern: ^.+$
           subjectPatternError: |
             The subject "{subject}" doesn't match the required pattern. Please ensure the PR title has a proper description after the type (and optional scope).
-
