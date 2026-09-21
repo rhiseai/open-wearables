@@ -181,6 +181,8 @@ jobs:
           SUUNTO_CLIENT_SECRET: ${{ secrets.SUUNTO_CLIENT_SECRET }}
           POLAR_CLIENT_ID: ${{ secrets.POLAR_CLIENT_ID }}
           POLAR_CLIENT_SECRET: ${{ secrets.POLAR_CLIENT_SECRET }}
+          STRAVA_CLIENT_ID: ${{ secrets.STRAVA_CLIENT_ID }}
+          STRAVA_CLIENT_SECRET: ${{ secrets.STRAVA_CLIENT_SECRET }}
           # Optional
 
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -241,6 +243,10 @@ jobs:
           # Polar
           POLAR_CLIENT_ID=${POLAR_CLIENT_ID}
           POLAR_CLIENT_SECRET=${POLAR_CLIENT_SECRET}
+
+          # Strava
+          STRAVA_CLIENT_ID=${STRAVA_CLIENT_ID}
+          STRAVA_CLIENT_SECRET=${STRAVA_CLIENT_SECRET}
 
           # Sync
           SYNC_INTERVAL_SECONDS=3600
