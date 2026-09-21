@@ -38,7 +38,8 @@ die()  { printf '\033[1;31m[render-env]\033[0m %s\n' "$*" >&2; exit 1; }
 # `required` fails the deploy when the entry is missing or empty. That is the
 # point of the table: an unset GitHub secret used to expand to an empty string
 # and break a provider silently, days later, in a way only a user noticed.
-# `optional` is for credentials that genuinely are not provisioned yet: Garmin
+# `optional` is for credentials that genuinely are not provisioned yet — no
+# entry, an empty one, or one still holding the REPLACE_ME skeleton: Garmin
 # has never had a staging application (its GitHub secrets were empty, so the
 # old workflow wrote GARMIN_CLIENT_ID= into ow.env), Strava's is pending, and
 # Sentry is switched off on staging.
@@ -86,10 +87,16 @@ validate_secret() {
     *$'\n'*)
       die "$1: $SECRET_PREFIX/$2 contains a newline; an env file cannot carry it"
       ;;
-    *REPLACE_ME*)
-      die "$1: $SECRET_PREFIX/$2 still holds a placeholder — set the real value first"
-      ;;
   esac
+}
+
+# An entry that exists but still holds the skeleton value. The prod family
+# keeps entries like this for credentials that are provisioned but not yet
+# issued, so staging will too: for an `optional` one that means "not
+# provisioned", exactly as a missing entry does. Writing it through would put
+# the literal REPLACE_ME into a client_id and break the provider quietly.
+is_placeholder() {
+  [[ "$1" == *REPLACE_ME* ]]
 }
 
 umask 077
@@ -126,6 +133,14 @@ while read -r var path requirement; do
     continue
   fi
 
+  if is_placeholder "$value"; then
+    if [[ "$requirement" == "required" ]]; then
+      die "$var: $SECRET_PREFIX/$path still holds a placeholder — set the real value first"
+    fi
+    skipped+=("$var")
+    continue
+  fi
+
   validate_secret "$var" "$path" "$value"
   printf '%s=%s\n' "$var" "$value" >>"$tmp_ow"
   resolved=$((resolved + 1))
@@ -139,6 +154,9 @@ db_password=$(fetch_secret db/password) ||
   die "cannot read $SECRET_PREFIX/db/password — $(tr -d '\n' <"$aws_error")"
 [[ -n "$db_password" && "$db_password" != "None" ]] ||
   die "$SECRET_PREFIX/db/password is empty"
+if is_placeholder "$db_password"; then
+  die "OW_DB_PASSWORD: $SECRET_PREFIX/db/password still holds a placeholder — set the real value first"
+fi
 validate_secret OW_DB_PASSWORD db/password "$db_password"
 db_password_encoded=$(
   OW_DB_PASSWORD_RAW="$db_password" python3 -c \
