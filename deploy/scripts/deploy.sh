@@ -54,8 +54,9 @@ die()  { printf '\033[1;31m[deploy]\033[0m %s\n' "$*" >&2; exit 1; }
 log "Rendering /app/.env and /app/ow.env from AWS Secrets Manager..."
 bash "$APP_DIR/deploy/scripts/render-env.sh"
 
-# Re-render at boot too, so a reboot picks up a rotated credential instead of
-# reusing whatever the last deploy happened to write.
+# Re-render at boot too, so the files on disk never go stale. Running
+# containers keep the env they were created with either way — a rotated
+# credential reaches them when a deploy recreates them.
 install -m 0644 "$APP_DIR/deploy/systemd/ow-render-env.service" \
   /etc/systemd/system/ow-render-env.service
 systemctl daemon-reload
@@ -235,7 +236,14 @@ log "Pruning dangling images..."
 docker image prune -f >/dev/null
 
 # Post-deploy convergence. Runs here rather than in CI because it needs the
-# admin credentials, and CI no longer has any (RHISE-3839).
+# admin credentials, and CI no longer has any (RHISE-3839). jq used to come
+# free on the GitHub runner; on the host it is only present because something
+# else pulled it in, and user_data installs just Docker and the ECR helper.
+if ! command -v jq >/dev/null 2>&1; then
+  log "Installing jq (needed by the webhook step)..."
+  dnf install -y jq
+fi
+
 log "Restricting Lucie webhook subscriptions..."
 bash "$APP_DIR/deploy/scripts/restrict-lucie-webhooks.sh"
 
