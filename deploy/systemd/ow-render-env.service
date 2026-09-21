@@ -1,0 +1,18 @@
+[Unit]
+Description=Render OpenWearables staging env files from AWS Secrets Manager
+Documentation=https://linear.app/rhiseai/issue/RHISE-3839
+After=network-online.target
+Wants=network-online.target
+# Containers restart with the daemon (restart: unless-stopped), so the env
+# files have to be current before Docker comes back. This is ordering only:
+# if Secrets Manager is unreachable the render fails, the previous files stay
+# on disk, and the stack still starts on the values it had.
+Before=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/app/deploy/scripts/render-env.sh
+
+[Install]
+WantedBy=multi-user.target
