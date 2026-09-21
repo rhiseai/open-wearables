@@ -4,15 +4,21 @@
 # Uses Traefik as the TLS-terminating HTTP reverse proxy.
 # Images pulled from ECR; this file is synced to /app on the box by CI.
 #
-# Required env (written by CI from GH Secrets → /app/.env):
+# Required env. render-env.sh builds both files on the host: the non-secret
+# half comes from the deploy (/app/.env.deploy) and from the committed
+# deploy/staging/ow.env.base, the credentials from AWS Secrets Manager.
+#
+# /app/.env — interpolated into this file:
 #   ENVIRONMENT          = staging | production
-#   OW_PUBLIC_HOST       = the staging EC2 public DNS name (auto-detected by CI)
+#   OW_PUBLIC_HOST       = the staging EC2 public DNS name (resolved by CI)
 #   OW_IMAGE_BACKEND     = 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu/rhiseai/open-wearables-backend:<tag>
 #   OW_IMAGE_FRONTEND    = 326876515198.dkr.ecr.eusc-de-east-1.amazonaws.eu/rhiseai/open-wearables-frontend:<tag>
 #   OW_DB_NAME           = open-wearables
 #   OW_DB_USER           = open-wearables
-#   OW_DB_PASSWORD       = <secret>
-#   # plus any provider credentials the backend needs (loaded via env_file /app/ow.env)
+#   OW_DB_PASSWORD       = from lucie-staging/ow/db/password
+#
+# /app/ow.env — env_file for app, celery-worker, celery-beat and svix-server:
+#   backend settings plus every provider credential (lucie-staging/ow/*)
 
 services:
   # ---------------------------------------------------------------------------

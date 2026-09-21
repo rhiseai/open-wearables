@@ -17,6 +17,9 @@ jobs:
       - name: Reject retired Commercial AWS delivery targets
         run: deploy/scripts/check-eu-delivery-config.sh
 
+      - name: Reject credentials in the staging delivery path
+        run: deploy/scripts/check-staging-credential-sources.sh
+
   validate-pr-title:
     runs-on: ubuntu-latest
     permissions:
