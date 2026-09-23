@@ -61,24 +61,14 @@ class DataSourceRepository(
     ) -> DataSource:
         existing = self.get_by_identity(db_session, user_id, provider, device_model, source)
         if existing:
-            updated = False
-            if user_connection_id and existing.user_connection_id is None:
-                object.__setattr__(existing, "user_connection_id", user_connection_id)
-                updated = True
-            if software_version and existing.software_version is None:
-                object.__setattr__(existing, "software_version", software_version)
-                updated = True
-            if original_source_name and existing.original_source_name is None:
-                object.__setattr__(existing, "original_source_name", original_source_name)
-                updated = True
-            if existing.device_type is None:
-                device_type = self._infer_device_type(device_model, original_source_name)
-                if device_type != DeviceType.UNKNOWN:
-                    object.__setattr__(existing, "device_type", device_type.value)
-                    updated = True
-            if updated:
-                db_session.flush()
-            return existing
+            return self._enrich_data_source(
+                db_session,
+                existing,
+                user_connection_id=user_connection_id,
+                software_version=software_version,
+                device_model=device_model,
+                original_source_name=original_source_name,
+            )
 
         provider_priority_repo = ProviderPriorityRepository(ProviderPriority)
         provider_priority_repo.ensure_provider_exists(db_session, provider)
@@ -96,9 +86,49 @@ class DataSourceRepository(
             device_type=device_type.value if device_type != DeviceType.UNKNOWN else None,
             original_source_name=original_source_name,
         )
-        result = self.create(db_session, create_payload)
+        stmt = insert(self.model).values(create_payload.model_dump()).on_conflict_do_nothing()
+        db_session.execute(stmt)
+        db_session.commit()
+
+        result = self.get_by_identity(db_session, user_id, provider, device_model, source)
         assert result is not None
-        return result
+        return self._enrich_data_source(
+            db_session,
+            result,
+            user_connection_id=user_connection_id,
+            software_version=software_version,
+            device_model=device_model,
+            original_source_name=original_source_name,
+        )
+
+    def _enrich_data_source(
+        self,
+        db_session: DbSession,
+        data_source: DataSource,
+        *,
+        user_connection_id: UUID | None,
+        software_version: str | None,
+        device_model: str | None,
+        original_source_name: str | None,
+    ) -> DataSource:
+        updated = False
+        if user_connection_id and data_source.user_connection_id is None:
+            object.__setattr__(data_source, "user_connection_id", user_connection_id)
+            updated = True
+        if software_version and data_source.software_version is None:
+            object.__setattr__(data_source, "software_version", software_version)
+            updated = True
+        if original_source_name and data_source.original_source_name is None:
+            object.__setattr__(data_source, "original_source_name", original_source_name)
+            updated = True
+        if data_source.device_type is None:
+            device_type = self._infer_device_type(device_model, original_source_name)
+            if device_type != DeviceType.UNKNOWN:
+                object.__setattr__(data_source, "device_type", device_type.value)
+                updated = True
+        if updated:
+            db_session.flush()
+        return data_source
 
     def _infer_device_type(
         self,

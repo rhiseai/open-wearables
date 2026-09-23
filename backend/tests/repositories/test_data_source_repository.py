@@ -9,9 +9,14 @@ HealthKit tags on-device data with a source bundle identifier of the form
 The column is now ``VARCHAR(100)``.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from typing import Any
+from uuid import uuid4
+
 from sqlalchemy.orm import Session
 
-from app.models import DataSource
+from app.models import DataSource, ProviderPriority, User
 from app.repositories.data_source_repository import DataSourceRepository
 from app.schemas.enums import ProviderName
 from tests.factories import UserFactory
@@ -58,3 +63,57 @@ class TestDataSourceRepository:
         assert stored is not None
         assert stored.source == APPLE_HEALTH_SOURCE
         assert len(stored.source) == len(APPLE_HEALTH_SOURCE)
+
+    def test_parallel_creation_reuses_one_data_source(self, engine: Any, session_factory: Any) -> None:
+        """Parallel SDK batches atomically resolve the same data-source identity."""
+        user_id = uuid4()
+        start = Barrier(2)
+
+        with session_factory() as session:
+            provider_priority_existed = (
+                session.query(ProviderPriority).filter(ProviderPriority.provider == ProviderName.APPLE).first()
+                is not None
+            )
+            session.add(User(id=user_id, email=f"{user_id}@example.com"))
+            session.commit()
+
+        def ensure_data_source() -> tuple[str, str | None]:
+            with session_factory() as session:
+                repo = DataSourceRepository(DataSource)
+                get_by_identity = repo.get_by_identity
+                first_lookup = True
+
+                def synchronized_lookup(*args: Any, **kwargs: Any) -> DataSource | None:
+                    nonlocal first_lookup
+                    result = get_by_identity(*args, **kwargs)
+                    if first_lookup:
+                        first_lookup = False
+                        assert result is None
+                        start.wait()
+                    return result
+
+                repo.get_by_identity = synchronized_lookup  # type: ignore[method-assign]
+                resolved = repo.ensure_data_source(
+                    session,
+                    user_id=user_id,
+                    provider=ProviderName.APPLE,
+                    device_model="Watch7,5",
+                    source=APPLE_HEALTH_SOURCE,
+                )
+                return str(resolved.id), resolved.source
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: ensure_data_source(), range(2)))
+
+            assert results[0] == results[1]
+            with session_factory() as session:
+                stored = session.query(DataSource).filter(DataSource.user_id == user_id).all()
+                assert len(stored) == 1
+        finally:
+            with session_factory() as session:
+                session.query(DataSource).filter(DataSource.user_id == user_id).delete()
+                session.query(User).filter(User.id == user_id).delete()
+                if not provider_priority_existed:
+                    session.query(ProviderPriority).filter(ProviderPriority.provider == ProviderName.APPLE).delete()
+                session.commit()
