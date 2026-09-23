@@ -133,6 +133,24 @@ class OuraWorkouts(BaseWorkoutsTemplate):
             user_id=str(user_id),
             trace_id=trace_id,
         )
+        return self.save_from_raw(db, user_id, raw, workout_id, trace_id=trace_id)
+
+    def save_from_raw(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        raw: dict[str, Any],
+        workout_id: str,
+        trace_id: str | None = None,
+    ) -> int:
+        """Save an already-fetched Oura workout for one profile.
+
+        Split out of ``save_by_id`` so a webhook delivery can fetch the workout
+        once and then store it for every profile sharing the same ring. A
+        secondary profile must not re-fetch: it would spend a second API call on
+        an identical object, and its own token may be expired even while the
+        data is perfectly deliverable.
+        """
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
             created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
@@ -142,6 +160,7 @@ class OuraWorkouts(BaseWorkoutsTemplate):
                     "warning",
                     "Skipped Oura workout: an unrelated workout already occupies its time window",
                     action="oura_workout_slot_taken",
+                    trace_id=trace_id,
                     user_id=str(user_id),
                     workout_id=workout_id,
                 )

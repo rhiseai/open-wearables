@@ -80,6 +80,33 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         )
         return [(row.provider, row.cnt) for row in rows]
 
+    def get_provider_adoption(self, db_session: DbSession, since: datetime) -> list[tuple[str, int, int]]:
+        """Users per provider with an active connection, and how many joined since ``since``.
+
+        Returns ``(provider, total_users, new_users)`` for every provider that
+        has at least one active connection, biggest first.
+
+        Distinct users rather than connections, unlike
+        :meth:`get_top_providers_by_active_conn`: a consumer charting adoption
+        is asking how many people wear an Oura, not how many rows exist. The
+        unique index on ``(user_id, provider)`` makes the two the same today,
+        so the DISTINCT is what keeps the answer right if that index is ever
+        relaxed.
+        """
+        user_count = func.count(func.distinct(self.model.user_id))
+        rows = (
+            db_session.query(
+                self.model.provider,
+                user_count.label("total_users"),
+                user_count.filter(self.model.created_at >= since).label("new_users"),
+            )
+            .filter(self.model.status == ConnectionStatus.ACTIVE)
+            .group_by(self.model.provider)
+            .order_by(user_count.desc(), self.model.provider)
+            .all()
+        )
+        return [(row.provider, row.total_users, row.new_users) for row in rows]
+
     def get_by_user_and_provider(
         self,
         db_session: DbSession,

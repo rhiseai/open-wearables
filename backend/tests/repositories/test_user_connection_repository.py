@@ -636,3 +636,74 @@ class TestUserConnectionRepository:
         assert conn1.id in expiring_ids
         # 8-minute expiry should not be included
         assert all(c.token_expires_at <= now + timedelta(minutes=3) for c in results if c.id == conn1.id)
+
+
+class TestProviderAdoption:
+    """get_provider_adoption: who has each provider, and who is new.
+
+    The numbers feed an adoption chart, so the two mistakes that matter are
+    counting rows instead of people and letting a revoked connection keep its
+    bar height.
+    """
+
+    @pytest.fixture
+    def connection_repo(self) -> UserConnectionRepository:
+        return UserConnectionRepository(UserConnection)
+
+    def test_counts_distinct_users_not_connections(
+        self, db: Session, connection_repo: UserConnectionRepository
+    ) -> None:
+        # Arrange: two users on oura, one of them also on whoop.
+        alice, bob = UserFactory(), UserFactory()
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        UserConnectionFactory(user=alice, provider="oura", created_at=old)
+        UserConnectionFactory(user=bob, provider="oura", created_at=old)
+        UserConnectionFactory(user=alice, provider="whoop", created_at=old)
+        db.commit()
+
+        # Act
+        rows = dict((p, (t, n)) for p, t, n in connection_repo.get_provider_adoption(db, datetime.now(timezone.utc)))
+
+        # Assert
+        assert rows["oura"][0] == 2
+        assert rows["whoop"][0] == 1
+
+    def test_revoked_connections_do_not_count(self, db: Session, connection_repo: UserConnectionRepository) -> None:
+        # Arrange
+        alice = UserFactory()
+        UserConnectionFactory(user=alice, provider="polar", status=ConnectionStatus.REVOKED)
+        db.commit()
+
+        # Act
+        rows = [p for p, _t, _n in connection_repo.get_provider_adoption(db, datetime.now(timezone.utc))]
+
+        # Assert: a provider with nothing active is absent, not zero.
+        assert "polar" not in rows
+
+    def test_new_users_counts_only_inside_the_window(
+        self, db: Session, connection_repo: UserConnectionRepository
+    ) -> None:
+        # Arrange: one long-standing connection, one from yesterday.
+        now = datetime.now(timezone.utc)
+        UserConnectionFactory(user=UserFactory(), provider="garmin", created_at=now - timedelta(days=90))
+        UserConnectionFactory(user=UserFactory(), provider="garmin", created_at=now - timedelta(days=1))
+        db.commit()
+
+        # Act
+        rows = dict((p, (t, n)) for p, t, n in connection_repo.get_provider_adoption(db, now - timedelta(days=7)))
+
+        # Assert: the total ignores the window, the delta does not.
+        assert rows["garmin"] == (2, 1)
+
+    def test_orders_by_reach(self, db: Session, connection_repo: UserConnectionRepository) -> None:
+        # Arrange
+        UserConnectionFactory(user=UserFactory(), provider="suunto")
+        for _ in range(3):
+            UserConnectionFactory(user=UserFactory(), provider="oura")
+        db.commit()
+
+        # Act
+        providers = [p for p, _t, _n in connection_repo.get_provider_adoption(db, datetime.now(timezone.utc))]
+
+        # Assert
+        assert providers.index("oura") < providers.index("suunto")

@@ -102,3 +102,33 @@ def test_emission_never_raises() -> None:
         task._emit_webhook_sync_status("oura", None)
         task._emit_webhook_sync_status("oura", {"status": "processed", "records_saved": 1, "user_id": "not-a-uuid"})
     assert calls == []
+
+
+def test_linked_profiles_each_get_a_sync_log_entry(user_id: str) -> None:
+    """A fanned-out delivery must not leave the linked profile reading as silent."""
+    linked_id = str(uuid4())
+    calls, fake = _capture()
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+        task._emit_webhook_sync_status(
+            "oura",
+            {
+                "status": "processed",
+                "records_saved": 3,
+                "user_id": user_id,
+                "linked_user_ids": [linked_id],
+            },
+        )
+
+    assert [call["user_id"] for call in calls] == [user_id, linked_id]
+    assert {call["status"] for call in calls} == {SyncStatus.SUCCESS}
+
+
+def test_linked_profile_repeated_in_payload_is_logged_once(user_id: str) -> None:
+    calls, fake = _capture()
+    with patch.object(task.sync_status_service, "emit_webhook_delivered", side_effect=fake):
+        task._emit_webhook_sync_status(
+            "oura",
+            {"status": "processed", "records_saved": 1, "user_id": user_id, "linked_user_ids": [user_id, "not-a-uuid"]},
+        )
+
+    assert [call["user_id"] for call in calls] == [user_id]

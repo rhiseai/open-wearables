@@ -45,7 +45,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
-          role-session-name: ow-staging-build-${{ matrix.name }}-${{ github.run_id }}
+          role-session-name: ow-staging-build-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.eu
 
@@ -82,7 +82,9 @@ jobs:
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:staging
             ${{ steps.ecr.outputs.registry }}/${{ matrix.repo }}:sha-${{ steps.tags.outputs.sha_short }}
 
-  # Deploy the release to the EU Sovereign staging host through SSM.
+  # ===========================================================================
+  # Deploy to the EU Sovereign staging host through SSM.
+  # ===========================================================================
   deploy:
     needs: build
     runs-on: ubuntu-latest
@@ -99,7 +101,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.eu
 
-      - name: Resolve EU Sovereign staging host
+      - name: Resolve staging host
         id: inst
         run: |
           INSTANCE=$(aws ec2 describe-instances \
@@ -110,7 +112,7 @@ jobs:
           ID=$(echo "$INSTANCE" | awk '{print $1}')
           DNS=$(echo "$INSTANCE" | awk '{print $2}')
           if [[ "$ID" == "None" || -z "$ID" || -z "$DNS" || "$DNS" == "None" ]]; then
-            echo "No usable EU Sovereign OW staging host found"
+            echo "No usable OW staging host found"
             exit 1
           fi
           echo "instance_id=$ID" >> "$GITHUB_OUTPUT"
@@ -129,20 +131,18 @@ jobs:
           done
           echo "SSM never came online"; exit 1
 
-      - name: Generate .env from secrets
+      - name: Generate the non-secret half of .env
         id: env_gen
         env:
-          OW_DB_PASSWORD: ${{ secrets.OW_DB_PASSWORD }}
           OW_PUBLIC_HOST: ${{ steps.inst.outputs.public_dns }}
           BACKEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.BACKEND_REPO }}:staging
           FRONTEND_IMAGE: ${{ env.ECR_REGISTRY }}/${{ env.FRONTEND_REPO }}:staging
         run: |
-          # URL-encode the password for the svix DSN (svix parses a full
-          # postgres:// URL, so any /, +, @, = in a base64-style secret
-          # would break InvalidPort/InvalidHost parsing). Backend
-          # connects via discrete DB_PASSWORD env and doesn't need this.
-          OW_DB_PASSWORD_ENCODED=$(python3 -c 'import os,urllib.parse;print(urllib.parse.quote(os.environ["OW_DB_PASSWORD"],safe=""))')
-
+          # Image tags and the resolved public hostname are the only things
+          # this workflow knows that the host does not. Every credential —
+          # OW_DB_PASSWORD and the whole backend set that used to be written
+          # into ow.env here — is appended on the host from Secrets Manager by
+          # deploy/scripts/render-env.sh.
           cat > .env.deploy <<EOF
           ENVIRONMENT=staging
           OW_PUBLIC_HOST=${OW_PUBLIC_HOST}
@@ -150,106 +150,15 @@ jobs:
           SERVER_EMAIL=admin@getlucie.ai
           OW_DB_NAME=open-wearables
           OW_DB_USER=open-wearables
-          OW_DB_PASSWORD=${OW_DB_PASSWORD}
-          OW_DB_PASSWORD_ENCODED=${OW_DB_PASSWORD_ENCODED}
           OW_IMAGE_BACKEND=${BACKEND_IMAGE}
           OW_IMAGE_FRONTEND=${FRONTEND_IMAGE}
           EOF
           echo "env_b64=$(base64 -w0 .env.deploy)" >> "$GITHUB_OUTPUT"
 
-      - name: Generate ow.env (backend provider secrets)
-        id: ow_env_gen
-        env:
-          OW_SECRET_KEY: ${{ secrets.OW_SECRET_KEY }}
-          OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
-          OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
-          OPEN_WEARABLES_API_KEY: ${{ secrets.OPEN_WEARABLES_API_KEY }}
-          OW_PUBLIC_HOST: ${{ steps.inst.outputs.public_dns }}
-          TARGET_AWS_REGION: ${{ env.AWS_REGION }}
-          TARGET_SNS_TOPIC_ARN: ${{ env.SNS_TOPIC_ARN }}
-          # Providers
-          GARMIN_CLIENT_ID: ${{ secrets.GARMIN_CLIENT_ID }}
-          GARMIN_CLIENT_SECRET: ${{ secrets.GARMIN_CLIENT_SECRET }}
-          OURA_CLIENT_ID: ${{ secrets.OURA_CLIENT_ID }}
-          OURA_CLIENT_SECRET: ${{ secrets.OURA_CLIENT_SECRET }}
-          OURA_WEBHOOK_VERIFICATION_TOKEN: ${{ secrets.OURA_WEBHOOK_VERIFICATION_TOKEN }}
-          WHOOP_CLIENT_ID: ${{ secrets.WHOOP_CLIENT_ID }}
-          WHOOP_CLIENT_SECRET: ${{ secrets.WHOOP_CLIENT_SECRET }}
-          SUUNTO_CLIENT_ID: ${{ secrets.SUUNTO_CLIENT_ID }}
-          SUUNTO_CLIENT_SECRET: ${{ secrets.SUUNTO_CLIENT_SECRET }}
-          POLAR_CLIENT_ID: ${{ secrets.POLAR_CLIENT_ID }}
-          POLAR_CLIENT_SECRET: ${{ secrets.POLAR_CLIENT_SECRET }}
-          # Optional
-
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
-          SVIX_JWT_SECRET: ${{ secrets.SVIX_JWT_SECRET }}
-        run: |
-          cat > ow.env.deploy <<EOF
-          # Core
-          SECRET_KEY=${OW_SECRET_KEY}
-          SVIX_JWT_SECRET=${SVIX_JWT_SECRET}
-          OUTGOING_WEBHOOKS_ENABLED=True
-          ADMIN_EMAIL=${OW_ADMIN_EMAIL}
-          ADMIN_PASSWORD=${OW_ADMIN_PASSWORD}
-          OPEN_WEARABLES_API_KEY=${OPEN_WEARABLES_API_KEY}
-          # Single-domain path routing. Traefik terminates TLS via Let's
-          # Encrypt at ``ow-staging.getlucie.ai``; ``/api/*`` is stripped
-          # and forwarded to ow-api, ``/*`` serves the dashboard.
-          # Whoop/Oura receive redirect_uri rooted at ``/api`` below.
-          API_BASE_URL=https://ow-staging.getlucie.ai
-          SERVER_HOST=https://ow-staging.getlucie.ai
-          FRONTEND_URL=https://ow-staging.getlucie.ai
-          CORS_ORIGINS=["https://ow-staging.getlucie.ai"]
-
-          # Email
-          RESEND_API_KEY=${RESEND_API_KEY}
-          EMAIL_FROM_ADDRESS=noreply@getlucie.ai
-          EMAIL_FROM_NAME=Open Wearables
-
-          # Sentry (hardcoded disabled on staging)
-          SENTRY_ENABLED=False
-          SENTRY_DSN=${SENTRY_DSN}
-          SENTRY_ENV=staging
-
-          # AWS (staging) — EC2 instance role handles auth, no access keys
-          AWS_REGION=${TARGET_AWS_REGION}
-          AWS_BUCKET_NAME=getlucie-ow-xml-staging
-          AWS_SNS_TOPIC_ARN=${TARGET_SNS_TOPIC_ARN}
-
-          # Garmin
-          GARMIN_CLIENT_ID=${GARMIN_CLIENT_ID}
-          GARMIN_CLIENT_SECRET=${GARMIN_CLIENT_SECRET}
-
-          # Oura
-          OURA_CLIENT_ID=${OURA_CLIENT_ID}
-          OURA_CLIENT_SECRET=${OURA_CLIENT_SECRET}
-          OURA_DEFAULT_SCOPE=personal daily activity heartrate workout session spo2 ring_configuration heart_health
-          OURA_WEBHOOK_VERIFICATION_TOKEN=${OURA_WEBHOOK_VERIFICATION_TOKEN}
-
-          # Whoop
-          WHOOP_CLIENT_ID=${WHOOP_CLIENT_ID}
-          WHOOP_CLIENT_SECRET=${WHOOP_CLIENT_SECRET}
-          WHOOP_DEFAULT_SCOPE=offline read:cycles read:sleep read:recovery read:workout read:body_measurement read:profile
-
-          # Suunto
-          SUUNTO_CLIENT_ID=${SUUNTO_CLIENT_ID}
-          SUUNTO_CLIENT_SECRET=${SUUNTO_CLIENT_SECRET}
-
-          # Polar
-          POLAR_CLIENT_ID=${POLAR_CLIENT_ID}
-          POLAR_CLIENT_SECRET=${POLAR_CLIENT_SECRET}
-
-          # Sync
-          SYNC_INTERVAL_SECONDS=3600
-          EOF
-          echo "ow_env_b64=$(base64 -w0 ow.env.deploy)" >> "$GITHUB_OUTPUT"
-
-      - name: Upload deploy tree + env to /app via SSM
+      - name: Upload deploy tree + non-secret env to /app via SSM
         env:
           INSTANCE_ID: ${{ steps.inst.outputs.instance_id }}
           ENV_B64: ${{ steps.env_gen.outputs.env_b64 }}
-          OW_ENV_B64: ${{ steps.ow_env_gen.outputs.ow_env_b64 }}
         run: |
           TAR_B64=$(tar -C . -czf - deploy | base64 -w0)
 
@@ -257,12 +166,17 @@ jobs:
           # short SSM command that decodes and runs it. This avoids every
           # quoting pitfall with `--parameters commands=...` shorthand (which
           # breaks on single quotes, commas, and brackets in payloads).
+          #
+          # Everything in this payload is public now: the deploy tree, the
+          # image tags and the host's own DNS name. It used to carry the whole
+          # credential set as one base64 blob, which GitHub cannot mask (it
+          # masks by literal value) and which `ssm send-command` retains in
+          # command history in exactly that decodable form.
           REMOTE_SCRIPT=$(cat <<REMOTE_EOF
           set -e
           mkdir -p /app
           echo "$TAR_B64" | base64 -d | tar -xzf - -C /app
-          echo "$ENV_B64" | base64 -d > /app/.env
-          echo "$OW_ENV_B64" | base64 -d > /app/ow.env
+          echo "$ENV_B64" | base64 -d > /app/.env.deploy
           chmod +x /app/deploy/scripts/*.sh
           REMOTE_EOF
           )
@@ -322,39 +236,6 @@ jobs:
             exit 1
           fi
 
-      - name: Restrict Lucie webhook subscriptions
-        env:
-          OW_ADMIN_EMAIL: ${{ secrets.OW_ADMIN_EMAIL }}
-          OW_ADMIN_PASSWORD: ${{ secrets.OW_ADMIN_PASSWORD }}
-          OW_API_BASE: https://ow-staging.getlucie.ai/api
-          LUCIE_ENDPOINT_PATTERN: ^https://[^/]*getlucie\.ai/(api/v1/)?webhooks/ow/?$
-        run: |
-          set -euo pipefail
-          TOKEN=$(curl --fail-with-body --silent --show-error \
-            --data-urlencode "username=${OW_ADMIN_EMAIL}" \
-            --data-urlencode "password=${OW_ADMIN_PASSWORD}" \
-            "${OW_API_BASE}/v1/auth/login" | jq -er '.access_token')
-          ENDPOINTS=$(curl --fail-with-body --silent --show-error \
-            -H "Authorization: Bearer ${TOKEN}" \
-            "${OW_API_BASE}/v1/webhooks/endpoints")
-          mapfile -t ENDPOINT_IDS < <(jq -r --arg pattern "${LUCIE_ENDPOINT_PATTERN}" \
-            '.[] | select(.url | test($pattern)) | .id' <<<"${ENDPOINTS}")
-          echo "Found $(jq 'length' <<<"${ENDPOINTS}") endpoint(s), ${#ENDPOINT_IDS[@]} for Lucie"
-          if [[ ${#ENDPOINT_IDS[@]} -eq 0 ]]; then
-            echo "::error::Lucie webhook endpoint was not found"
-            exit 1
-          fi
-          for endpoint_id in "${ENDPOINT_IDS[@]}"; do
-            curl --fail-with-body --silent --show-error \
-              -X PATCH \
-              -H "Authorization: Bearer ${TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d '{"filter_types":["sleep.created","sleep.updated","connection.created"]}' \
-              "${OW_API_BASE}/v1/webhooks/endpoints/${endpoint_id}" \
-              | jq -e '(.filter_types | sort) == (["sleep.created", "sleep.updated", "connection.created"] | sort)' >/dev/null
-          done
-          echo "Restricted ${#ENDPOINT_IDS[@]} Lucie webhook endpoint(s)"
-
       - name: Summary
         env:
           INSTANCE_ID: ${{ steps.inst.outputs.instance_id }}
@@ -364,7 +245,7 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
         run: |
           {
-            echo "## OW staging deployment — EU Sovereign"
+            echo "## OW staging deployment"
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Instance | \`$INSTANCE_ID\` |"

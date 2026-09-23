@@ -69,7 +69,7 @@ DEFERRED_MEASURE_TYPES: dict[int, str] = {
 ACTIVITY_FIELD_MAP: dict[str, SeriesType] = {
     "steps": SeriesType.steps,
     "distance": SeriesType.distance_walking_running,
-    "calories": SeriesType.energy,
+    "calories": SeriesType.active_energy,
 }
 
 TIMESERIES: frozenset[SeriesType] = frozenset(
