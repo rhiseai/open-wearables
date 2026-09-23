@@ -26,7 +26,7 @@ from app.schemas.providers.mobile_sdk import (
     SleepStateStage,
     SyncRequest,
 )
-from app.services.apple.healthkit.sleep_service import (
+from app.services.sdk.sleep_service import (
     _calculate_final_metrics,
     _in_bed_bounds,
     handle_sleep_data,
@@ -439,8 +439,8 @@ class TestInBedBounds:
 class TestPersistSleep:
     """Tests for persist_sleep with different stage compositions."""
 
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
     def test_event_window_covers_in_bed_when_hypnogram_is_shorter(
         self,
         mock_delete_state: MagicMock,
@@ -530,8 +530,8 @@ class TestPersistSleep:
         assert all(s.stage != SleepStageType.IN_BED for s in detail.sleep_stages)
         mock_delete_state.assert_called_once_with(user_id)
 
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
     def test_event_window_keeps_stage_bounds_when_stages_are_wider(
         self,
         mock_delete_state: MagicMock,
@@ -576,8 +576,8 @@ class TestPersistSleep:
         assert record.start_datetime == _dt("2026-05-05T22:00:00Z")
         assert record.end_datetime == _dt("2026-05-06T06:30:00Z")
 
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
     def test_persist_sleep_with_sleeping_stages(
         self,
         mock_delete_state: MagicMock,
@@ -634,8 +634,8 @@ class TestPersistSleep:
         assert all(s.stage == SleepStageType.SLEEPING for s in detail.sleep_stages)
         mock_delete_state.assert_called_once_with(user_id)
 
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
     def test_persist_sleep_keeps_redis_when_not_closing(
         self,
         mock_delete_state: MagicMock,
@@ -676,8 +676,8 @@ class TestPersistSleep:
         mock_event_service.create_or_merge_sleep.assert_called_once()
         mock_delete_state.assert_not_called()
 
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
     def test_persist_sleep_with_detailed_stages(
         self,
         mock_delete_state: MagicMock,
@@ -744,8 +744,8 @@ class TestHandleSleepDataIntegration:
     """Integration tests for handle_sleep_data with real payload structures."""
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_handle_real_payload_sleeping_stages(
         self,
         mock_redis_func: MagicMock,
@@ -798,8 +798,8 @@ class TestHandleSleepDataIntegration:
         assert len(in_bed_stages) == 1
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_handle_detailed_stages_payload(
         self,
         mock_redis_func: MagicMock,
@@ -839,8 +839,8 @@ class TestHandleSleepDataIntegration:
         assert SleepStageType.AWAKE in stage_types
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.persist_sleep")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.persist_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_fresh_night_batch_flushes_without_closing_redis(
         self,
         mock_redis_func: MagicMock,
@@ -950,8 +950,8 @@ class TestNoIntermediateRedisSaves:
     """
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_redis_set_called_once_per_batch(
         self,
         mock_redis_func: MagicMock,
@@ -1001,8 +1001,8 @@ class TestHistoricalBulkUploadMerging:
     """
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_second_payload_merges_via_create_or_merge_sleep(
         self,
         mock_redis_func: MagicMock,
@@ -1067,8 +1067,8 @@ class TestHistoricalBulkUploadMerging:
         assert SleepStageType.REM in stage_types
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
-    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
-    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_follow_up_batch_reuses_same_external_id(
         self,
         mock_redis_func: MagicMock,

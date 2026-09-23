@@ -14,6 +14,7 @@ from botocore.exceptions import (
 from celery import Task, shared_task
 
 from app.config import settings
+from app.constants.sdk_providers import sdk_providers
 from app.database import SessionLocal
 from app.models import User
 from app.repositories.user_repository import UserRepository
@@ -24,14 +25,14 @@ from app.schemas.sync_status import (
     SyncSource,
     SyncStatus,
 )
-from app.services.apple.healthkit.import_service import (
-    ImportService as SDKImportService,
-)
-from app.services.apple.healthkit.import_service import (
-    import_service as sdk_import_service,
-)
 from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
 from app.services.raw_payload_storage import delete_payload_from_s3, get_payload_from_s3
+from app.services.sdk.import_service import (
+    ImportService as SDKImportService,
+)
+from app.services.sdk.import_service import (
+    import_service as sdk_import_service,
+)
 from app.services.sdk_sync_state import is_historical_sync_active, sdk_payload_exceeds_realtime_limit
 from app.services.sync_status_service import (
     emit_sync_completed,
@@ -84,7 +85,7 @@ def _payload_exceeds_realtime_limit(content: str) -> bool:
 
 
 def _get_import_service(provider: str) -> SDKImportService:
-    if provider in ("apple", "samsung", "google"):
+    if provider in sdk_providers():
         return sdk_import_service
     raise ValueError(f"Unsupported provider: {provider}")
 
@@ -137,7 +138,7 @@ def process_sdk_upload(
             payload was offloaded to S3 - see ``payload_ref``.
         content_type: The content type header value
         user_id: User ID to associate with the data
-        provider: Import provider - "apple", "samsung", "google"
+        provider: Import provider - "apple", "samsung", "health_connect"
         batch_id: Unique batch identifier for tracking (optional for backwards compatibility)
         payload_ref: ``s3://bucket/key`` of the stored payload. When set (and ``content`` is
             None) the body is loaded from S3 here, so it never travels through the broker.
