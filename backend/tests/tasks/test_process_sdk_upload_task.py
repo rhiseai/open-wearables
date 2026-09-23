@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from botocore.exceptions import ClientError, EndpointConnectionError
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -183,6 +184,47 @@ class TestOffloadedPayload:
                 provider="apple",
                 payload_ref=_PAYLOAD_REF,
             )
+
+    @patch(f"{_MODULE}.get_payload_from_s3")
+    def test_transient_read_failure_retries(self, mock_get_payload: MagicMock) -> None:
+        failure = EndpointConnectionError(endpoint_url="https://s3.example.test")
+        mock_get_payload.side_effect = failure
+
+        with (
+            patch.object(process_sdk_upload, "retry", side_effect=RuntimeError("retry requested")) as retry,
+            pytest.raises(RuntimeError, match="retry requested"),
+        ):
+            process_sdk_upload(
+                content=None,
+                content_type="application/json",
+                user_id=str(uuid4()),
+                provider="apple",
+                payload_ref=_PAYLOAD_REF,
+            )
+
+        retry.assert_called_once_with(exc=failure, countdown=30)
+
+    @patch(f"{_MODULE}.get_payload_from_s3")
+    def test_missing_payload_does_not_retry(self, mock_get_payload: MagicMock) -> None:
+        failure = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "missing"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+            "GetObject",
+        )
+        mock_get_payload.side_effect = failure
+
+        with (
+            patch.object(process_sdk_upload, "retry") as retry,
+            pytest.raises(ClientError),
+        ):
+            process_sdk_upload(
+                content=None,
+                content_type="application/json",
+                user_id=str(uuid4()),
+                provider="apple",
+                payload_ref=_PAYLOAD_REF,
+            )
+
+        retry.assert_not_called()
 
     def test_neither_content_nor_reference_is_reported(self) -> None:
         result = process_sdk_upload(
