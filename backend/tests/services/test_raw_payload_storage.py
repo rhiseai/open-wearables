@@ -52,6 +52,17 @@ class TestConfigure:
         assert raw_payload_storage._s3_client is mock_client
         assert raw_payload_storage._s3_bucket == "my-bucket"
 
+    def test_configure_transport_without_bucket_fails_startup(self) -> None:
+        with pytest.raises(RuntimeError, match="requires an S3 bucket"):
+            raw_payload_storage.configure("disabled", 1024, s3_bucket=None, transport_enabled=True)
+
+    def test_configure_transport_without_client_fails_startup(self) -> None:
+        with (
+            patch.object(raw_payload_storage, "_create_s3_client", return_value=None),
+            pytest.raises(RuntimeError, match="could not create an S3 client"),
+        ):
+            raw_payload_storage.configure("disabled", 1024, s3_bucket="my-bucket", transport_enabled=True)
+
     def test_configure_s3_client_creation_fails(self) -> None:
         with patch.object(raw_payload_storage, "_create_s3_client", return_value=None):
             raw_payload_storage.configure("s3", 1024, s3_bucket="my-bucket")
@@ -225,6 +236,17 @@ class TestPutPayloadToS3:
 
 
 class TestGetPayloadFromS3:
+    def test_lazily_creates_client_for_a_queued_reference(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = {"Body": MagicMock(read=MagicMock(return_value=b'{"ok":true}'))}
+
+        with patch.object(raw_payload_storage, "_create_s3_client", return_value=mock_client) as create_client:
+            payload = raw_payload_storage.get_payload_from_s3("s3://queued-bucket/raw/payload.json")
+
+        assert payload == '{"ok":true}'
+        create_client.assert_called_once_with(endpoint_url=None)
+        mock_client.get_object.assert_called_once_with(Bucket="queued-bucket", Key="raw/payload.json")
+
     def test_takes_bucket_and_key_from_the_reference(self) -> None:
         """The ref wins over local config, so app/worker drift is not a silent 404."""
         mock_client = _configure_s3(bucket="configured-bucket")

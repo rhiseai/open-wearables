@@ -4,7 +4,14 @@ from logging import getLogger
 from typing import Any
 from uuid import UUID
 
-from celery import shared_task
+from botocore.exceptions import (
+    ClientError,
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
+from celery import Task, shared_task
 
 from app.config import settings
 from app.database import SessionLocal
@@ -36,6 +43,33 @@ from app.services.user_connection_service import user_connection_service
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
+
+_S3_RETRY_BASE_SECONDS = 30
+_S3_RETRY_MAX_SECONDS = 300
+_S3_RETRYABLE_ERROR_CODES = {
+    "InternalError",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ServiceUnavailable",
+    "SlowDown",
+    "Throttling",
+    "ThrottlingException",
+}
+
+
+def _is_retryable_s3_read_error(exc: Exception) -> bool:
+    """Whether another worker attempt can plausibly recover this S3 read."""
+    if isinstance(exc, (ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError)):
+        return True
+    if not isinstance(exc, ClientError):
+        return False
+
+    error = exc.response.get("Error", {})
+    code = str(error.get("Code", ""))
+    status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return (
+        code in _S3_RETRYABLE_ERROR_CODES or status_code == 429 or (isinstance(status_code, int) and status_code >= 500)
+    )
 
 
 def _payload_exceeds_realtime_limit(content: str) -> bool:
@@ -82,8 +116,9 @@ def _batch_outcomes(types: list[str], workouts_saved: int, sleep_saved: int, sco
     return outcomes
 
 
-@shared_task(queue="sdk_sync")
+@shared_task(bind=True, queue="sdk_sync", max_retries=5)
 def process_sdk_upload(
+    task: Task,
     content: str | None,
     content_type: str,
     user_id: str,
@@ -118,12 +153,30 @@ def process_sdk_upload(
         batch_id = str(uuid.uuid4())
 
     # Payload was offloaded to S3, so the body never travelled through the broker. A read
-    # failure propagates: boto3 has already retried the transient cases, and CeleryIntegration
-    # reports the exception to Sentry.
+    # failure propagates after bounded retries. Botocore retries individual HTTP requests;
+    # a Celery retry gives DNS, credentials and S3 itself time to recover without losing the
+    # accepted upload task.
     if content is None and payload_ref:
         try:
             content = get_payload_from_s3(payload_ref)
-        except Exception:
+        except Exception as exc:
+            if _is_retryable_s3_read_error(exc):
+                retry_number = task.request.retries + 1
+                countdown = min(_S3_RETRY_BASE_SECONDS * (2**task.request.retries), _S3_RETRY_MAX_SECONDS)
+                log_structured(
+                    logger,
+                    "warning",
+                    "Retrying SDK payload read from S3",
+                    provider=provider,
+                    action="load_payload_ref_retry",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    payload_ref=payload_ref,
+                    retry_number=retry_number,
+                    countdown_seconds=countdown,
+                    error_type=type(exc).__name__,
+                )
+                raise task.retry(exc=exc, countdown=countdown)
             log_structured(
                 logger,
                 "error",
