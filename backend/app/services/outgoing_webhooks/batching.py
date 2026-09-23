@@ -7,12 +7,31 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
 
 MAX_REALTIME_EVENTS_PER_SDK_BATCH = 64
+RECENT_SESSION_WINDOW = timedelta(days=3)
+_SESSION_EVENT_TYPES = frozenset({"sleep.created", "sleep.updated", "workout.created"})
+
+
+def _is_recent_session_event(event_type: str, payload: dict[str, Any]) -> bool:
+    """Return whether a session event is recent enough to survive historical suppression."""
+    if event_type not in _SESSION_EVENT_TYPES:
+        return False
+    end_time = payload.get("data", {}).get("end_time")
+    if not isinstance(end_time, str):
+        return False
+    try:
+        ended_at = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if ended_at.tzinfo is None:
+        ended_at = ended_at.replace(tzinfo=timezone.utc)
+    return ended_at.astimezone(timezone.utc) >= datetime.now(timezone.utc) - RECENT_SESSION_WINDOW
 
 
 @dataclass
@@ -54,7 +73,8 @@ class SDKWebhookBatch:
         idempotency_key: str | None,
         coalesce_key: str | None,
     ) -> None:
-        if self.historical:
+        emit_from_historical = self.historical and _is_recent_session_event(event_type, payload)
+        if self.historical and not emit_from_historical:
             self.suppressed += 1
             return
         key = coalesce_key or idempotency_key or f"{event_type}:{len(self._events)}"
@@ -62,7 +82,7 @@ class SDKWebhookBatch:
             self.coalesced += 1
             self._events[key] = PendingWebhook(event_type, payload, channels, idempotency_key)
             return
-        if len(self._events) + len(self._timeseries) >= MAX_REALTIME_EVENTS_PER_SDK_BATCH:
+        if not emit_from_historical and len(self._events) + len(self._timeseries) >= MAX_REALTIME_EVENTS_PER_SDK_BATCH:
             self.suppressed += 1
             return
         self._events[key] = PendingWebhook(event_type, payload, channels, idempotency_key)
@@ -104,15 +124,15 @@ class SDKWebhookBatch:
         from app.services.outgoing_webhooks.events import _emit_timeseries_batch_now, _enqueue_dispatch
 
         emitted = 0
+        for pending in self._events.values():
+            if _enqueue_dispatch(
+                pending.event_type,
+                pending.payload,
+                channels=pending.channels,
+                idempotency_key=pending.idempotency_key,
+            ):
+                emitted += 1
         if not self.historical:
-            for pending in self._events.values():
-                if _enqueue_dispatch(
-                    pending.event_type,
-                    pending.payload,
-                    channels=pending.channels,
-                    idempotency_key=pending.idempotency_key,
-                ):
-                    emitted += 1
             for aggregate in self._timeseries.values():
                 emitted += _emit_timeseries_batch_now(
                     user_id=aggregate.user_id,

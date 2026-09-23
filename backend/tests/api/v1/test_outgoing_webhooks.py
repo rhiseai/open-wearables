@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -324,6 +325,66 @@ class TestWebhookEmit:
         mock_task.delay.assert_not_called()
         assert summary["historical"] is True
         assert summary["suppressed"] == 1
+
+    @pytest.mark.parametrize("event", ["sleep.created", "sleep.updated", "workout.created"])
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_historical_sdk_batch_emits_recent_sessions(self, mock_task: MagicMock, event: str) -> None:
+        end_time = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with collect_sdk_webhooks("batch-recent-history", historical=True) as batch:
+            batch.add(
+                event,
+                {"type": event, "data": {"end_time": end_time}},
+                channels=None,
+                idempotency_key=f"{event}.recent",
+                coalesce_key=f"{event}.recent",
+            )
+        summary = batch.flush()
+
+        mock_task.delay.assert_called_once()
+        assert summary["emitted"] == 1
+        assert summary["suppressed"] == 0
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_historical_sdk_batch_suppresses_old_sessions_and_timeseries(self, mock_task: MagicMock) -> None:
+        old_end_time = (datetime.now(timezone.utc) - timedelta(days=4)).isoformat()
+        with collect_sdk_webhooks("batch-old-history", historical=True) as batch:
+            batch.add(
+                "sleep.updated",
+                {"type": "sleep.updated", "data": {"end_time": old_end_time}},
+                channels=None,
+                idempotency_key="sleep.updated.old",
+                coalesce_key="sleep.old",
+            )
+            on_timeseries_batch_saved(
+                user_id=uuid4(),
+                provider="apple",
+                series_type="heart_rate",
+                sample_count=1,
+                samples=[{"timestamp": old_end_time, "value": 60}],
+            )
+        summary = batch.flush()
+
+        mock_task.delay.assert_not_called()
+        assert summary["emitted"] == 0
+        assert summary["suppressed"] == 2
+
+    @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
+    def test_historical_recent_sessions_bypass_realtime_event_cap(self, mock_task: MagicMock) -> None:
+        end_time = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        with collect_sdk_webhooks("batch-large-recent-history", historical=True) as batch:
+            for index in range(65):
+                batch.add(
+                    "workout.created",
+                    {"type": "workout.created", "data": {"end_time": end_time, "index": index}},
+                    channels=None,
+                    idempotency_key=f"workout.created.{index}",
+                    coalesce_key=f"workout.{index}",
+                )
+        summary = batch.flush()
+
+        assert mock_task.delay.call_count == 65
+        assert summary["emitted"] == 65
+        assert summary["suppressed"] == 0
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")
     def test_on_timeseries_skips_unmapped_series_type(self, mock_task: MagicMock) -> None:
