@@ -258,7 +258,10 @@ class TestGetPayloadFromS3:
         mock_client.get_object.assert_called_once_with(Bucket="other-bucket", Key="raw/apple/sdk/x.json")
 
     def test_raises_without_a_client(self) -> None:
-        with pytest.raises(RuntimeError, match="S3 client not configured"):
+        with (
+            patch.object(raw_payload_storage, "_create_s3_client", return_value=None),
+            pytest.raises(RuntimeError, match="S3 client not configured"),
+        ):
             raw_payload_storage.get_payload_from_s3("s3://bucket/key.json")
 
     @pytest.mark.parametrize("ref", ["s3://bucket", "s3://"])
