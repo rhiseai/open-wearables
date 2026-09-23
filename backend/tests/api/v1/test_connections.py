@@ -9,8 +9,9 @@ Tests the /api/v1/users/{user_id}/connections endpoint including:
 - Error cases
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi.testclient import TestClient
@@ -546,45 +547,49 @@ class TestDisconnectWithSDKToken:
         conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
         assert conn.status == ConnectionStatus.ACTIVE
 
-    def test_sdk_token_cannot_disconnect_oauth_fed_hybrid_connection(self, client: TestClient, db: Session) -> None:
-        """Google is hybrid: an OAuth-fed row stays out of the SDK's reach."""
+    def test_sdk_token_cannot_disconnect_cloud_connection(self, client: TestClient, db: Session) -> None:
+        """Google Health is cloud-only: its OAuth-fed row stays out of the SDK's reach."""
         # Arrange
         user = UserFactory()
         UserConnectionFactory(
             user=user,
-            provider="google",
+            provider="google_health",
             status=ConnectionStatus.ACTIVE,
             access_token="secret_access",
             refresh_token="secret_refresh",
         )
 
         # Act
-        response = client.delete(f"/api/v1/users/{user.id}/connections/google", headers=sdk_token_headers(user.id))
+        response = client.delete(
+            f"/api/v1/users/{user.id}/connections/google_health", headers=sdk_token_headers(user.id)
+        )
 
         # Assert
         assert response.status_code == 403
-        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="google").one()
+        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="google_health").one()
         assert conn.status == ConnectionStatus.ACTIVE
         assert conn.access_token == "secret_access"
 
-    def test_sdk_token_disconnects_sdk_fed_hybrid_connection(self, client: TestClient, db: Session) -> None:
-        """The same provider without OAuth tokens is SDK-fed and may be revoked."""
+    def test_sdk_token_disconnects_sdk_fed_connection(self, client: TestClient, db: Session) -> None:
+        """Health Connect is SDK-fed and may be revoked."""
         # Arrange
         user = UserFactory()
         UserConnectionFactory(
             user=user,
-            provider="google",
+            provider="health_connect",
             status=ConnectionStatus.ACTIVE,
             access_token=None,
             refresh_token=None,
         )
 
         # Act
-        response = client.delete(f"/api/v1/users/{user.id}/connections/google", headers=sdk_token_headers(user.id))
+        response = client.delete(
+            f"/api/v1/users/{user.id}/connections/health_connect", headers=sdk_token_headers(user.id)
+        )
 
         # Assert
         assert response.status_code == 204
-        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="google").one()
+        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="health_connect").one()
         assert conn.status == ConnectionStatus.REVOKED
 
     def test_sdk_token_on_nonexistent_connection_returns_404(self, client: TestClient, db: Session) -> None:
@@ -607,14 +612,14 @@ class TestDisconnectWithSDKToken:
         user = UserFactory()
         UserConnectionFactory(
             user=user,
-            provider="google",
+            provider="health_connect",
             status=ConnectionStatus.ACTIVE,
             access_token=None,
             refresh_token=None,
         )
 
         # Act
-        client.delete(f"/api/v1/users/{user.id}/connections/google", headers=sdk_token_headers(user.id))
+        client.delete(f"/api/v1/users/{user.id}/connections/health_connect", headers=sdk_token_headers(user.id))
 
         # Assert
         assert mock_disconnect.call_args.kwargs["oauth"] is None
@@ -859,3 +864,93 @@ class TestDisconnectDeregistration:
         # Assert
         assert response.status_code == 204
         mock_httpx_delete.assert_not_called()
+
+
+class TestConnectionAdoptionEndpoint:
+    """GET /api/v1/connections/stats."""
+
+    def test_returns_per_provider_adoption(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+        now = datetime.now(timezone.utc)
+        UserConnectionFactory(user=UserFactory(), provider="oura", created_at=now - timedelta(days=90))
+        UserConnectionFactory(user=UserFactory(), provider="oura", created_at=now - timedelta(days=1))
+        UserConnectionFactory(user=UserFactory(), provider="whoop", created_at=now - timedelta(days=90))
+        db.commit()
+
+        # Act
+        response = client.get("/api/v1/connections/stats?since_days=7", headers=api_key_headers(api_key.plain_key))
+
+        # Assert
+        assert response.status_code == 200
+        providers = {row["provider"]: row for row in response.json()["providers"]}
+        assert providers["oura"]["total_users"] == 2
+        assert providers["oura"]["new_users"] == 1
+        assert providers["whoop"]["new_users"] == 0
+
+    def test_requires_authentication(self, client: TestClient, db: Session) -> None:
+        # Act
+        response = client.get("/api/v1/connections/stats")
+
+        # Assert
+        assert response.status_code == 401
+
+    def test_rejects_a_negative_window(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+
+        # Act
+        response = client.get("/api/v1/connections/stats?since_days=-1", headers=api_key_headers(api_key.plain_key))
+
+        # Assert: this app renders validation failures as 400, not FastAPI's 422.
+        assert response.status_code == 400
+
+    def test_empty_database_is_an_empty_list_not_an_error(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+
+        # Act
+        response = client.get("/api/v1/connections/stats", headers=api_key_headers(api_key.plain_key))
+
+        # Assert
+        assert response.status_code == 200
+        assert response.json()["providers"] == []
+
+    def test_an_explicit_since_overrides_the_day_window(self, client: TestClient, db: Session) -> None:
+        # Arrange: one connection 3 days old.
+        api_key = ApiKeyFactory()
+        now = datetime.now(timezone.utc)
+        UserConnectionFactory(user=UserFactory(), provider="oura", created_at=now - timedelta(days=3))
+        db.commit()
+
+        # Act: a since that starts after it, alongside a since_days that would include it.
+        # quote() matters: an unencoded "+" in the offset arrives as a space.
+        since = quote((now - timedelta(days=1)).isoformat())
+        response = client.get(
+            f"/api/v1/connections/stats?since_days=30&since={since}",
+            headers=api_key_headers(api_key.plain_key),
+        )
+
+        # Assert: since wins, so the 3-day-old connection is not new.
+        assert response.status_code == 200
+        providers = {row["provider"]: row for row in response.json()["providers"]}
+        assert providers["oura"] == {"provider": "oura", "total_users": 1, "new_users": 0}
+
+    def test_a_naive_since_is_read_as_utc(self, client: TestClient, db: Session) -> None:
+        # Arrange
+        api_key = ApiKeyFactory()
+        now = datetime.now(timezone.utc)
+        UserConnectionFactory(user=UserFactory(), provider="whoop", created_at=now - timedelta(hours=2))
+        db.commit()
+
+        # Act: no offset on the timestamp.
+        naive = quote((now - timedelta(days=1)).replace(tzinfo=None).isoformat())
+        response = client.get(
+            f"/api/v1/connections/stats?since={naive}",
+            headers=api_key_headers(api_key.plain_key),
+        )
+
+        # Assert: comparing naive against tz-aware rows would raise, not return.
+        assert response.status_code == 200
+        providers = {row["provider"]: row for row in response.json()["providers"]}
+        assert providers["whoop"]["new_users"] == 1

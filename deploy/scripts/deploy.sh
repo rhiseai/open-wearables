@@ -2,6 +2,8 @@
 # Deploy OpenWearables with zero-downtime rolling updates.
 #
 # Strategy:
+#   0. Render /app/.env and /app/ow.env from AWS Secrets Manager (the deploy
+#      ships /app/.env.deploy, which holds no credentials)
 #   1. Pull new images
 #   2. Ensure stateful services are up (db, redis, traefik, svix-server) — idempotent
 #   3. Wait for DB to accept connections
@@ -44,6 +46,21 @@ HEALTH_POLL_INTERVAL=5
 log()  { printf '\033[1;36m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[deploy]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[deploy]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# The credentials this stack runs on live in AWS Secrets Manager and the host
+# reads them with its own instance role. Nothing below works until that has
+# happened: the deploy ships /app/.env.deploy (no credentials in it) and this
+# turns it into /app/.env and /app/ow.env.
+log "Rendering /app/.env and /app/ow.env from AWS Secrets Manager..."
+bash "$APP_DIR/deploy/scripts/render-env.sh"
+
+# Re-render at boot too, so the files on disk never go stale. Running
+# containers keep the env they were created with either way — a rotated
+# credential reaches them when a deploy recreates them.
+install -m 0644 "$APP_DIR/deploy/systemd/ow-render-env.service" \
+  /etc/systemd/system/ow-render-env.service
+systemctl daemon-reload
+systemctl enable ow-render-env.service >/dev/null
 
 # Load .env so we can reference DB vars directly.
 set -a
@@ -217,6 +234,18 @@ done
 
 log "Pruning dangling images..."
 docker image prune -f >/dev/null
+
+# Post-deploy convergence. Runs here rather than in CI because it needs the
+# admin credentials, and CI no longer has any (RHISE-3839). jq used to come
+# free on the GitHub runner; on the host it is only present because something
+# else pulled it in, and user_data installs just Docker and the ECR helper.
+if ! command -v jq >/dev/null 2>&1; then
+  log "Installing jq (needed by the webhook step)..."
+  dnf install -y jq
+fi
+
+log "Restricting Lucie webhook subscriptions..."
+bash "$APP_DIR/deploy/scripts/restrict-lucie-webhooks.sh"
 
 log "Deploy complete."
 "${COMPOSE[@]}" ps
