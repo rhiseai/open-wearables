@@ -9,13 +9,22 @@ uv run python scripts/init/create_svix_db.py
 echo 'Applying migrations...'
 uv run alembic upgrade head
 
+# TODO: Remove this after ~2026-11-01 once all deployments have migrated.
+# Splits the legacy 'google' provider into 'health_connect' (SDK) and 'google_health'
+# (cloud OAuth). Must stay ahead of init_provider_settings.py, which seeds a google_health
+# row that the rename would collide with. Idempotent, no-op once split.
+echo 'Running google provider split...'
+uv run python scripts/data_migrations/split_google_provider.py \
+    || echo "Warning: google provider split failed — will retry on next startup."
+
 # Initialize provider settings
 echo 'Initializing provider settings...'
 uv run python scripts/init_provider_settings.py
 
-# Initialize device priority table
+# Initialize priority tables
 echo 'Initializing priorities...'
 uv run python scripts/init_device_priorities.py
+uv run python scripts/init_provider_priorities.py
 
 # Seed admin account (uses ADMIN_EMAIL/ADMIN_PASSWORD env vars, or defaults)
 echo 'Seeding admin account...'
@@ -32,6 +41,14 @@ uv run python scripts/init/seed_series_types.py
 echo 'Running Ultrahuman body_temperature->skin_temperature relabel...'
 uv run python scripts/data_migrations/relabel_ultrahuman_body_temp_to_skin_temp.py \
     || echo "Warning: Ultrahuman temperature relabel failed — will retry on next startup."
+
+
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Relabels Ultrahuman HRV stored as SDNN (id=3) to RMSSD (id=7); the ring measures
+# RMSSD. Scoped to provider='ultrahuman', no-op once corrected.
+echo 'Running Ultrahuman HRV SDNN->RMSSD relabel...'
+uv run python scripts/data_migrations/relabel_ultrahuman_hrv_sdnn_to_rmssd.py \
+    || echo "Warning: Ultrahuman HRV relabel failed — will retry on next startup."
 
 
 # TODO: Remove this after ~2026-12-01 once all deployments have migrated.

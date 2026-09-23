@@ -15,11 +15,11 @@ from app.constants.series_types.sdk.metric_types import (
 )
 from app.schemas.enums import AggregationMethod, SeriesType
 from app.schemas.enums.aggregation_method import get_aggregation_method
-from app.services.apple.healthkit.menstrual_service import _assemble_periods, _Period
-from app.services.apple.sample_normalization import (
+from app.services.providers.apple.sample_normalization import (
     normalize_apple_sample_value,
     parse_apple_raw_value,
 )
+from app.services.sdk.menstrual_service import _assemble_periods, _Period
 
 
 @pytest.mark.parametrize(

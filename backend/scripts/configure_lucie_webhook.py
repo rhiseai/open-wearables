@@ -9,7 +9,6 @@ password, so production automation does not depend on mutable dashboard credenti
 import logging
 import re
 
-from svix.api import EndpointListOptions
 from svix.api.errors.http_error import HttpError
 
 from app.database import SessionLocal
@@ -19,7 +18,6 @@ from app.services.outgoing_webhooks import svix as svix_service
 logger = logging.getLogger(__name__)
 
 _DEVELOPER_PAGE_SIZE = 250
-_ENDPOINT_PAGE_SIZE = 250
 _LUCIE_ENDPOINT_PATTERN = re.compile(r"https://api\.getlucie\.ai/(?:api/v1/)?webhooks/ow/?")
 _LUCIE_FILTER_TYPES = ["sleep.created", "sleep.updated", "connection.created", "sync.completed"]
 
@@ -44,10 +42,7 @@ def configure_lucie_webhook_filters() -> int:
                 endpoint_iterator: str | None = None
                 while True:
                     try:
-                        page = svix_service.list_endpoints(
-                            str(developer.id),
-                            EndpointListOptions(limit=_ENDPOINT_PAGE_SIZE, iterator=endpoint_iterator),
-                        )
+                        page = svix_service.list_endpoints(str(developer.id), iterator=endpoint_iterator)
                     except HttpError as exc:
                         if exc.status_code == 404:
                             break
@@ -61,7 +56,7 @@ def configure_lucie_webhook_filters() -> int:
                             endpoint.id,
                             filter_types=_LUCIE_FILTER_TYPES,
                         )
-                        if sorted(updated.filter_types or []) != sorted(_LUCIE_FILTER_TYPES):
+                        if sorted(updated.event_types or []) != sorted(_LUCIE_FILTER_TYPES):
                             raise RuntimeError("Svix did not persist the required Lucie event filters")
                         configured += 1
 
