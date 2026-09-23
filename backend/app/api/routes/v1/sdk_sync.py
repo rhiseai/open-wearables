@@ -9,7 +9,7 @@ from app.integrations.celery.tasks.process_sdk_upload_task import process_sdk_up
 from app.schemas.providers.mobile_sdk import SyncRequest
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payload
-from app.services.sdk_sync_state import SDK_REALTIME_ITEM_LIMIT, is_historical_sync_active
+from app.services.sdk_sync_state import is_historical_sync_active, sdk_payload_exceeds_realtime_limit
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
 from app.utils.sentry_helpers import log_and_capture_error
@@ -93,7 +93,7 @@ def sync_sdk_data(
     workouts_count = len(workouts) if isinstance(workouts, list) else 0
     sleep_count = len(sleep) if isinstance(sleep, list) else 0
     total_items = records_count + workouts_count + sleep_count
-    historical_export = is_historical_sync_active(user_id, provider) or total_items > SDK_REALTIME_ITEM_LIMIT
+    historical_export = is_historical_sync_active(user_id, provider) or sdk_payload_exceeds_realtime_limit(data)
 
     # Log initial batch receipt with counts
     log_structured(

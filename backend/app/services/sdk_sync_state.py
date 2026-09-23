@@ -15,6 +15,18 @@ _EMPTY_SYNC_SENTINEL = "__sync__"
 # A large upload is treated as historical even if the diagnostic marker raced
 # or Redis was temporarily unavailable.
 SDK_REALTIME_ITEM_LIMIT = 250
+_SDK_BATCH_DATA_TYPES = ("records", "workouts", "sleep")
+
+
+def sdk_payload_exceeds_realtime_limit(data: object) -> bool:
+    """Check the realtime threshold independently for each SDK payload type."""
+    if not isinstance(data, dict):
+        return False
+    return any(
+        isinstance(items, list) and len(items) > SDK_REALTIME_ITEM_LIMIT
+        for key in _SDK_BATCH_DATA_TYPES
+        if (items := data.get(key)) is not None
+    )
 
 
 def _key(user_id: str | UUID, provider: str) -> str:

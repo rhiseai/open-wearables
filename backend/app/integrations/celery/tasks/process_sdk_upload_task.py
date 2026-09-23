@@ -25,7 +25,7 @@ from app.services.apple.healthkit.import_service import (
 )
 from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
 from app.services.raw_payload_storage import delete_payload_from_s3, get_payload_from_s3
-from app.services.sdk_sync_state import SDK_REALTIME_ITEM_LIMIT, is_historical_sync_active
+from app.services.sdk_sync_state import is_historical_sync_active, sdk_payload_exceeds_realtime_limit
 from app.services.sync_status_service import (
     emit_sync_completed,
     emit_sync_failed,
@@ -38,15 +38,15 @@ from app.utils.structured_logging import log_structured
 logger = getLogger(__name__)
 
 
-def _payload_item_count(content: str) -> int:
+def _payload_exceeds_realtime_limit(content: str) -> bool:
     try:
         body = json.loads(content)
     except (json.JSONDecodeError, TypeError):
-        return 0
+        return False
     data = body.get("data") if isinstance(body, dict) else None
     if not isinstance(data, dict):
-        return 0
-    return sum(len(items) for key in ("records", "workouts", "sleep") if isinstance((items := data.get(key)), list))
+        return False
+    return sdk_payload_exceeds_realtime_limit(data)
 
 
 def _get_import_service(provider: str) -> SDKImportService:
@@ -204,11 +204,10 @@ def process_sdk_upload(
         metadata={"batch_id": batch_id},
     )
 
-    item_count = _payload_item_count(content)
     historical_export = (
         bool(historical_export)
         or is_historical_sync_active(user_uuid, provider)
-        or item_count > SDK_REALTIME_ITEM_LIMIT
+        or _payload_exceeds_realtime_limit(content)
     )
 
     with SessionLocal() as db:
