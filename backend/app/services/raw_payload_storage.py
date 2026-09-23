@@ -41,7 +41,13 @@ def configure(
     fit_files_enabled: bool = False,
     transport_enabled: bool = False,
 ) -> None:
-    """Called once at startup from settings."""
+    """Called once at startup from settings.
+
+    SDK payload transport is a reliability boundary: an API that offloads bodies and a
+    worker that cannot read them silently turns accepted uploads into lost tasks.  Keep
+    archival best-effort, but fail startup when transport was explicitly enabled and its
+    S3 client cannot be configured.
+    """
     global _storage_backend, _max_size_bytes, _s3_bucket, _s3_prefix, _s3_client, _fit_files_enabled
     _storage_backend = storage_backend
     _max_size_bytes = max_size_bytes
@@ -51,11 +57,15 @@ def configure(
     if storage_backend == "s3" or fit_files_enabled or transport_enabled:
         _s3_bucket = s3_bucket
         if not _s3_bucket:
+            if transport_enabled:
+                raise RuntimeError("SDK payload transport requires an S3 bucket")
             logger.error("S3 storage requested but no S3 bucket configured")
             _storage_backend = "disabled"
             return
         _s3_client = _create_s3_client(endpoint_url=s3_endpoint_url)
         if _s3_client is None:
+            if transport_enabled:
+                raise RuntimeError("SDK payload transport could not create an S3 client")
             logger.error("Failed to create S3 client - raw payload storage disabled")
             _storage_backend = "disabled"
             return
@@ -113,6 +123,12 @@ def get_payload_from_s3(ref: str) -> str:
 
     Raises on any read failure; the caller decides whether to retry the task.
     """
+    global _s3_client
+    if _s3_client is None:
+        # A task carries its bucket in the reference, so reading it must not depend on the
+        # consumer having the same offload flag as the producer.  This also lets temporary
+        # drain workers safely consume an existing queue after a configuration rollout.
+        _s3_client = _create_s3_client(endpoint_url=None)
     if _s3_client is None:
         raise RuntimeError("Cannot get payload: S3 client not configured")
     bucket, key = _split_ref(ref)
