@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _DEVELOPER_PAGE_SIZE = 250
 _ENDPOINT_PAGE_SIZE = 250
 _LUCIE_ENDPOINT_PATTERN = re.compile(r"https://api\.getlucie\.ai/(?:api/v1/)?webhooks/ow/?")
-_LUCIE_FILTER_TYPES = ["sleep.created", "sleep.updated", "connection.created"]
+_LUCIE_FILTER_TYPES = ["sleep.created", "sleep.updated", "connection.created", "sync.completed"]
 
 
 def configure_lucie_webhook_filters() -> int:
