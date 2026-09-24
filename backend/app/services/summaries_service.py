@@ -84,6 +84,15 @@ BODY_AVERAGED_SERIES = [
 DEFAULT_AVERAGE_PERIOD_DAYS = 7
 DEFAULT_LATEST_WINDOW_HOURS = 4
 
+MERGED_ACTIVITY_SAMPLE_FIELDS: dict[SeriesType, str] = {
+    SeriesType.steps: "steps_sum",
+    SeriesType.active_energy: "active_energy_sum",
+    SeriesType.basal_energy: "basal_energy_sum",
+    SeriesType.distance_walking_running: "distance_sum",
+    SeriesType.flights_climbed: "flights_climbed_sum",
+}
+INTEGER_ACTIVITY_SAMPLE_FIELDS = {SeriesType.steps, SeriesType.flights_climbed}
+
 
 class SummariesService:
     """Service for aggregating daily health summaries."""
@@ -155,6 +164,32 @@ class SummariesService:
             filtered.append(entries_sorted[0])
 
         return filtered
+
+    def _fill_from_same_provider(
+        self,
+        results: list[dict],
+        merged_sample_sums: dict[tuple[date, ProviderName, SeriesType], float],
+    ) -> list[dict]:
+        """Raise additive totals with non-overlapping samples from sibling devices."""
+        for result in results:
+            try:
+                provider = ProviderName(result.get("provider") or result.get("source"))
+            except ValueError:
+                continue
+
+            activity_date = result["activity_date"]
+            for series_type, field in MERGED_ACTIVITY_SAMPLE_FIELDS.items():
+                merged_value = merged_sample_sums.get((activity_date, provider, series_type))
+                if merged_value is None:
+                    continue
+
+                current_value = result.get(field)
+                if current_value is not None and float(current_value) >= merged_value:
+                    continue
+
+                result[field] = int(merged_value) if series_type in INTEGER_ACTIVITY_SAMPLE_FIELDS else merged_value
+
+        return results
 
     def _get_user_max_hr(self, db_session: DbSession, user_id: UUID, reference_date: datetime) -> int:
         """Calculate user's max HR based on age.
@@ -480,8 +515,17 @@ class SummariesService:
         # Merge archived data when archival is enabled
         results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
 
+        merged_sample_sums = self.data_point_repo.get_daily_merged_sample_sums(
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            tuple(MERGED_ACTIVITY_SAMPLE_FIELDS),
+        )
+
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
+        results = self._fill_from_same_provider(results, merged_sample_sums)
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(
