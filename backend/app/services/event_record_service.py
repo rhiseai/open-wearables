@@ -534,17 +534,16 @@ class EventRecordService(
                 merged_rem = int(rem_secs / 60)
                 merged_awake = int(awake_secs / 60)
                 merged_total = merged_deep + merged_light + merged_rem + int(sleeping_secs / 60)
+                # Both sessions count the overlapping minutes as in bed, while the total
+                # above is a union; cap in bed at the merged window, never below the total.
+                window_minutes = int((merged_end - merged_start).total_seconds() // 60)
+                merged_in_bed = max(merged_total, min(merged_in_bed, window_minutes))
             else:
                 merged_deep = _adj_int("sleep_deep_minutes") + (detail.sleep_deep_minutes or 0)
                 merged_light = _adj_int("sleep_light_minutes") + (detail.sleep_light_minutes or 0)
                 merged_rem = _adj_int("sleep_rem_minutes") + (detail.sleep_rem_minutes or 0)
                 merged_awake = _adj_int("sleep_awake_minutes") + (detail.sleep_awake_minutes or 0)
                 merged_total = _adj_int("sleep_total_duration_minutes") + (detail.sleep_total_duration_minutes or 0)
-
-            if overlap_seconds > 0:
-                # Both sessions count the overlapping minutes as in bed; the merged
-                # night cannot be in bed longer than its own window.
-                merged_in_bed = min(merged_in_bed, int((merged_end - merged_start).total_seconds() // 60))
 
             if enforce_invariants:
                 violations = sleep_invariant_violations(
