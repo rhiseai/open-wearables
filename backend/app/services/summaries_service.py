@@ -353,7 +353,7 @@ class SummariesService:
                     provider=result.get("provider") or "unknown",
                     action="sleep_summary_duplicate_sessions",
                     user_id=str(user_id),
-                    sleep_date=result["sleep_date"],
+                    sleep_date=result["sleep_date"].isoformat(),
                     dropped_count=len(duplicates),
                 )
 
