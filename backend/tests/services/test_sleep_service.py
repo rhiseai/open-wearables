@@ -32,6 +32,7 @@ from app.services.sdk.sleep_service import (
     handle_sleep_data,
     persist_sleep,
 )
+from app.utils.sleep_invariants import SleepInvariantViolationError
 
 
 def _dt(iso: str) -> datetime:
@@ -316,8 +317,8 @@ class TestCalculateFinalMetrics:
         assert len(cleaned) == 1
         assert cleaned[0].stage == SleepStageType.SLEEPING
 
-    def test_detailed_plus_sleeping_wrapper_excludes_sleeping(self) -> None:
-        """When detailed phases + sleeping wrapper coexist, sleeping is dropped."""
+    def test_detailed_plus_sleeping_wrapper_counts_only_uncovered_sleeping(self) -> None:
+        """A sleeping wrapper counts only where no detailed phase covers it."""
         stages = [
             SleepStateStage(
                 stage=SleepStageType.SLEEPING,
@@ -343,15 +344,41 @@ class TestCalculateFinalMetrics:
 
         metrics, cleaned = _calculate_final_metrics(stages)
 
-        # sleeping wrapper must NOT be counted
-        assert metrics["sleeping_seconds"] == 0
+        # Wrapper minutes under a phase add nothing: only 22:00-22:10 and 02:00-06:00 remain
+        assert metrics["sleeping_seconds"] == (10 + 240) * 60
         assert metrics["light_seconds"] == 50 * 60
         assert metrics["deep_seconds"] == 2 * 3600
         assert metrics["rem_seconds"] == 1 * 3600
-        # Hypnogram should not contain sleeping
+        total = sum(metrics[k] for k in ("sleeping_seconds", "light_seconds", "deep_seconds", "rem_seconds"))
+        assert total == 8 * 3600
         stage_types = {s.stage for s in cleaned}
-        assert SleepStageType.SLEEPING not in stage_types
         assert SleepStageType.IN_BED not in stage_types
+
+    def test_sleeping_wrapper_fully_covered_by_phases_adds_nothing(self) -> None:
+        """Oura-style wrapper over the same minutes as the phases is not a second night."""
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-04-10T22:10:00Z"),
+                end_time=_dt("2026-04-11T02:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.LIGHT,
+                start_time=_dt("2026-04-10T22:10:00Z"),
+                end_time=_dt("2026-04-10T23:00:00Z"),
+            ),
+            SleepStateStage(
+                stage=SleepStageType.DEEP,
+                start_time=_dt("2026-04-10T23:00:00Z"),
+                end_time=_dt("2026-04-11T02:00:00Z"),
+            ),
+        ]
+
+        metrics, cleaned = _calculate_final_metrics(stages)
+
+        assert metrics["sleeping_seconds"] == 0
+        assert metrics["light_seconds"] + metrics["deep_seconds"] == (50 + 180) * 60
+        assert SleepStageType.SLEEPING not in {s.stage for s in cleaned}
 
     def test_detailed_plus_sleeping_plus_in_bed(self) -> None:
         """Full modern scenario: in_bed + sleeping wrapper + detailed phases."""
@@ -380,15 +407,14 @@ class TestCalculateFinalMetrics:
 
         metrics, cleaned = _calculate_final_metrics(stages)
 
-        # Only detailed phases should be counted
-        assert metrics["sleeping_seconds"] == 0
+        # Wrapper counts only outside the phases: 22:00-22:30 and 02:00-06:00
+        assert metrics["sleeping_seconds"] == 4.5 * 3600
         assert metrics["deep_seconds"] == 1.5 * 3600
         assert metrics["light_seconds"] == 2 * 3600
         # in_bed still calculated from original intervals
         assert metrics["in_bed_seconds"] == 8 * 3600
-        # Hypnogram: only deep + light
         stage_types = {s.stage for s in cleaned}
-        assert stage_types == {SleepStageType.DEEP, SleepStageType.LIGHT}
+        assert stage_types == {SleepStageType.SLEEPING, SleepStageType.DEEP, SleepStageType.LIGHT}
 
 
 class TestInBedBounds:
@@ -1142,3 +1168,219 @@ class TestHistoricalBulkUploadMerging:
         # Totals reflect union, not a double-counted sum of two separate flushes
         assert detail.sleep_light_minutes == 120
         assert detail.sleep_deep_minutes == 50
+
+
+def _sample(stage: str, start: str, end: str, bundle: str, name: str) -> dict:
+    return {
+        "id": f"{bundle}-{stage}-{start}",
+        "stage": stage,
+        "startDate": start,
+        "endDate": end,
+        "source": {"bundleIdentifier": bundle, "name": name},
+    }
+
+
+# Oura writing into Apple Health (RHISE-4198 shape): umbrella asleep over the
+# same minutes as the stages, plus AutoSleep writing its own night.
+OURA_VIA_HEALTHKIT_PAYLOAD = {
+    "provider": "apple",
+    "sdkVersion": "1.0.0",
+    "syncTimestamp": "2026-09-24T09:00:00Z",
+    "data": {
+        "records": [],
+        "workouts": [],
+        "sleep": [
+            _sample("in_bed", "2026-09-23T23:03:00Z", "2026-09-24T05:17:00Z", "com.ouraring.oura", "Oura"),
+            _sample("sleeping", "2026-09-23T23:15:00Z", "2026-09-24T05:10:00Z", "com.ouraring.oura", "Oura"),
+            _sample("light", "2026-09-23T23:15:00Z", "2026-09-24T00:05:00Z", "com.ouraring.oura", "Oura"),
+            _sample("deep", "2026-09-24T00:05:00Z", "2026-09-24T01:20:00Z", "com.ouraring.oura", "Oura"),
+            _sample("light", "2026-09-24T01:20:00Z", "2026-09-24T02:10:00Z", "com.ouraring.oura", "Oura"),
+            _sample("awake", "2026-09-24T02:10:00Z", "2026-09-24T02:25:00Z", "com.ouraring.oura", "Oura"),
+            _sample("rem", "2026-09-24T02:25:00Z", "2026-09-24T03:20:00Z", "com.ouraring.oura", "Oura"),
+            _sample("light", "2026-09-24T03:20:00Z", "2026-09-24T04:30:00Z", "com.ouraring.oura", "Oura"),
+            _sample("rem", "2026-09-24T04:30:00Z", "2026-09-24T05:10:00Z", "com.ouraring.oura", "Oura"),
+            _sample("sleeping", "2026-09-23T22:50:00Z", "2026-09-24T06:10:00Z", "com.tantsissa.AutoSleep", "AutoSleep"),
+        ],
+    },
+}
+
+
+class TestSingleSourceNightAndInvariants:
+    """RHISE-4202: one HealthKit source per night, and no impossible night is written."""
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_oura_via_healthkit_is_not_double_counted(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+    ) -> None:
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+
+        handle_sleep_data(MagicMock(), SyncRequest.model_validate(OURA_VIA_HEALTHKIT_PAYLOAD), str(uuid4()))
+
+        call = mock_event_service.create_or_merge_sleep.call_args
+        detail: EventRecordDetailCreate = call[0][3]
+        assert call.kwargs["enforce_invariants"] is True
+        # 50+75+50+55+70+40 minutes of stages, not 695 (umbrella + stages) or AutoSleep's 440
+        assert detail.sleep_total_duration_minutes == 340
+        assert detail.sleep_time_in_bed_minutes == 374
+        assert detail.sleep_awake_minutes == 15
+        assert (
+            detail.sleep_light_minutes + detail.sleep_deep_minutes + detail.sleep_rem_minutes
+            == detail.sleep_total_duration_minutes
+        )
+
+        state = SleepState.model_validate_json(mock_redis.set.call_args_list[-1][0][1])
+        assert {s.source_key for s in state.stages} == {"com.ouraring.oura", "com.tantsissa.AutoSleep"}
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_nap_and_main_sleep_become_two_nights(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+    ) -> None:
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+        watch = ("com.apple.health.3F2A6C1E", "Apple Watch")
+        payload = {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": "2026-05-02T09:00:00Z",
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    _sample("sleeping", "2026-05-01T14:00:00Z", "2026-05-01T14:40:00Z", *watch),
+                    _sample("light", "2026-05-01T23:00:00Z", "2026-05-02T03:00:00Z", *watch),
+                    _sample("deep", "2026-05-02T03:00:00Z", "2026-05-02T06:30:00Z", *watch),
+                ],
+            },
+        }
+
+        handle_sleep_data(MagicMock(), SyncRequest.model_validate(payload), str(uuid4()))
+
+        totals = [c[0][3].sleep_total_duration_minutes for c in mock_event_service.create_or_merge_sleep.call_args_list]
+        assert totals == [40, 450]
+
+    @patch("app.services.sdk.sleep_service.sentry_sdk")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_night_over_16h_is_not_written(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        mock_sentry: MagicMock,
+    ) -> None:
+        user_id = str(uuid4())
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Sleep App",
+            provider="apple",
+            start_time=_dt("2026-05-01T12:00:00Z"),
+            end_time=_dt("2026-05-02T05:00:00Z"),
+            last_start_timestamp=_dt("2026-05-01T12:00:00Z"),
+            last_end_timestamp=_dt("2026-05-02T05:00:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-05-01T12:00:00Z"),
+                    end_time=_dt("2026-05-02T05:00:00Z"),
+                    source_key="com.example.sleep",
+                ),
+            ],
+        )
+
+        persist_sleep(MagicMock(), user_id, state, close=True)
+
+        mock_event_service.create_or_merge_sleep.assert_not_called()
+        mock_sentry.capture_message.assert_called_once()
+        context = mock_sentry.push_scope.return_value.__enter__.return_value.set_context.call_args[0][1]
+        assert context["violations"] == ["total_sleep_exceeds_16h"]
+        assert context["raw_buckets"] == {"com.example.sleep": {"sleeping": 17 * 3600}}
+        mock_delete_state.assert_called_once_with(user_id)
+
+    @patch("app.services.sdk.sleep_service.sentry_sdk")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_impossible_merge_is_rolled_back_and_reported(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        mock_sentry: MagicMock,
+    ) -> None:
+        mock_event_service.create_or_merge_sleep.side_effect = SleepInvariantViolationError(
+            ["total_sleep_exceeds_time_in_bed"], {"total_sleep_minutes": 850, "time_in_bed_minutes": 480}
+        )
+        db = MagicMock()
+        user_id = str(uuid4())
+        state = SleepState(
+            uuid=str(uuid4()),
+            provider="apple",
+            start_time=_dt("2026-05-01T23:00:00Z"),
+            end_time=_dt("2026-05-02T06:00:00Z"),
+            last_start_timestamp=_dt("2026-05-01T23:00:00Z"),
+            last_end_timestamp=_dt("2026-05-02T06:00:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-05-01T23:00:00Z"),
+                    end_time=_dt("2026-05-02T06:00:00Z"),
+                ),
+            ],
+        )
+
+        persist_sleep(db, user_id, state, close=True)
+
+        db.rollback.assert_called_once()
+        mock_sentry.capture_message.assert_called_once()
+        mock_delete_state.assert_called_once_with(user_id)
+
+    @patch("app.services.sdk.sleep_service.log_structured")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_chosen_and_discarded_sources_are_logged(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        mock_log: MagicMock,
+    ) -> None:
+        stages = [
+            SleepStateStage(
+                stage=SleepStageType.DEEP,
+                start_time=_dt("2026-05-01T23:00:00Z"),
+                end_time=_dt("2026-05-02T01:00:00Z"),
+                source_key="com.ouraring.oura",
+            ),
+            SleepStateStage(
+                stage=SleepStageType.SLEEPING,
+                start_time=_dt("2026-05-01T22:00:00Z"),
+                end_time=_dt("2026-05-02T06:00:00Z"),
+                source_key="com.tantsissa.AutoSleep",
+            ),
+        ]
+        state = SleepState(
+            uuid=str(uuid4()),
+            provider="apple",
+            start_time=_dt("2026-05-01T22:00:00Z"),
+            end_time=_dt("2026-05-02T06:00:00Z"),
+            last_start_timestamp=_dt("2026-05-01T22:00:00Z"),
+            last_end_timestamp=_dt("2026-05-02T06:00:00Z"),
+            stages=stages,
+        )
+
+        persist_sleep(MagicMock(), str(uuid4()), state, close=False)
+
+        chosen = next(c for c in mock_log.call_args_list if c.kwargs.get("action") == "sleep_source_chosen")
+        assert chosen.kwargs["chosen_source"] == "com.ouraring.oura"
+        assert chosen.kwargs["discarded_sources"] == ["com.tantsissa.AutoSleep"]
+        detail: EventRecordDetailCreate = mock_event_service.create_or_merge_sleep.call_args[0][3]
+        assert detail.sleep_total_duration_minutes == 120

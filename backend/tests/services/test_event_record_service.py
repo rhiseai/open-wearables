@@ -13,6 +13,7 @@ from decimal import Decimal
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, HealthScore
@@ -25,6 +26,7 @@ from app.schemas.model_crud.activities import (
 )
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
+from app.utils.sleep_invariants import SleepInvariantViolationError
 from tests.factories import DataSourceFactory, EventRecordFactory, SleepDetailsFactory, UserFactory
 
 
@@ -757,6 +759,127 @@ class TestCreateOrMergeSleep:
         # Detail must be present — no silent data loss
         db.refresh(result)
         assert result.sleep_detail is not None
+        # Without stage intervals both totals are summed, so time in bed stays summed too
+        assert result.sleep_detail.sleep_total_duration_minutes == 300 + 230
+        assert result.sleep_detail.sleep_time_in_bed_minutes == 330 + 250
+
+    def test_overlapping_merge_with_stages_caps_in_bed_at_the_window(self, db: Session) -> None:
+        """Stage totals come from the merged timeline, so in bed is capped at the window, not summed."""
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user)
+        stage = {"stage": "light", "start_time": self._dt(1, 0).isoformat(), "end_time": self._dt(7, 0).isoformat()}
+        existing = EventRecordFactory(
+            mapping=data_source,
+            category="sleep",
+            type_="sleep_session",
+            start_datetime=self._dt(1, 0),
+            end_datetime=self._dt(8, 0),
+            duration_seconds=7 * 3600,
+        )
+        SleepDetailsFactory(
+            event_record=existing,
+            sleep_deep_minutes=0,
+            sleep_light_minutes=360,
+            sleep_rem_minutes=0,
+            sleep_awake_minutes=0,
+            sleep_total_duration_minutes=360,
+            sleep_time_in_bed_minutes=420,
+            sleep_stages=[stage],
+        )
+        record = self._record(data_source, self._dt(2, 0), self._dt(7, 0))
+        detail = self._detail(record.id, deep=0, light=300, rem=0, awake=0, in_bed=300).model_copy(
+            update={"sleep_stages": [SleepStage(stage="light", start_time=self._dt(2, 0), end_time=self._dt(7, 0))]}
+        )
+
+        result = event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
+
+        db.refresh(result)
+        assert result.sleep_detail.sleep_total_duration_minutes == 360
+        assert result.sleep_detail.sleep_time_in_bed_minutes == 7 * 60
+
+    def test_reflush_updates_own_record_not_a_more_recent_neighbour(self, db: Session) -> None:
+        """A session re-flushing must update its own row even when a later record is adjacent.
+
+        Picking the most recent adjacent record merged the session into its neighbour
+        and left its own row behind: two overlapping records for one night, which the
+        daily summary adds up to about twice the sleep.
+        """
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user)
+        own = EventRecordFactory(
+            mapping=data_source,
+            category="sleep",
+            type_="sleep_session",
+            external_id="session-a",
+            start_datetime=self._dt(23, 0, day=20),
+            end_datetime=self._dt(5, 0),
+            duration_seconds=6 * 3600,
+        )
+        SleepDetailsFactory(event_record=own, sleep_total_duration_minutes=330, sleep_time_in_bed_minutes=360)
+        neighbour = EventRecordFactory(
+            mapping=data_source,
+            category="sleep",
+            type_="sleep_session",
+            external_id="session-b",
+            start_datetime=self._dt(6, 0),
+            end_datetime=self._dt(7, 0),
+            duration_seconds=3600,
+        )
+        SleepDetailsFactory(event_record=neighbour, sleep_total_duration_minutes=50, sleep_time_in_bed_minutes=60)
+
+        record = self._record(data_source, self._dt(23, 0, day=20), self._dt(5, 30)).model_copy(
+            update={"external_id": "session-a"}
+        )
+        detail = self._detail(record.id, deep=90, light=180, rem=70, awake=20, in_bed=390)
+
+        result = event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
+
+        assert result.id == own.id
+        assert result.end_datetime == self._dt(5, 30)
+        assert db.get(EventRecord, neighbour.id) is not None
+
+    def test_enforced_invariants_reject_an_impossible_merge(self, db: Session) -> None:
+        """Overlapping stage-less sessions would sum to more than 16 hours of sleep."""
+        user = UserFactory()
+        data_source = DataSourceFactory(user=user)
+        existing = EventRecordFactory(
+            mapping=data_source,
+            category="sleep",
+            type_="sleep_session",
+            external_id="night-1",
+            start_datetime=self._dt(20, 0, day=20),
+            end_datetime=self._dt(9, 0),
+            duration_seconds=13 * 3600,
+        )
+        SleepDetailsFactory(
+            event_record=existing,
+            sleep_total_duration_minutes=600,
+            sleep_time_in_bed_minutes=720,
+            sleep_deep_minutes=None,
+            sleep_light_minutes=None,
+            sleep_rem_minutes=None,
+            sleep_stages=None,
+        )
+
+        record = self._record(data_source, self._dt(21, 0, day=20), self._dt(8, 0)).model_copy(
+            update={"external_id": "night-2"}
+        )
+        detail = EventRecordDetailCreate(
+            record_id=record.id,
+            sleep_total_duration_minutes=500,
+            sleep_time_in_bed_minutes=600,
+            is_nap=False,
+        )
+
+        with pytest.raises(SleepInvariantViolationError) as exc:
+            event_record_service.create_or_merge_sleep(
+                db, user.id, record, detail, self.THRESHOLD, enforce_invariants=True
+            )
+
+        assert exc.value.violations == ["total_sleep_exceeds_16h"]
+        kept = db.get(EventRecord, existing.id)
+        assert kept is not None
+        assert kept.sleep_detail.sleep_total_duration_minutes == 600
 
     def test_merge_concatenates_sleep_stages(self, db: Session) -> None:
         """Sleep stages from both sessions are concatenated and sorted."""

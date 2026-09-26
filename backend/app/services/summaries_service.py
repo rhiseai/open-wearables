@@ -52,6 +52,7 @@ from app.utils.pagination import (
     encode_activity_cursor,
     encode_cursor,
 )
+from app.utils.structured_logging import log_structured
 
 # Activity summary constants
 DEFAULT_MAX_HR = 190  # Assumes ~30 years old when birth_date unavailable
@@ -83,6 +84,55 @@ BODY_AVERAGED_SERIES = [
 # Default settings for body summary
 DEFAULT_AVERAGE_PERIOD_DAYS = 7
 DEFAULT_LATEST_WINDOW_HOURS = 4
+
+# Two main sessions of one source that share at least this much of the shorter
+# one's window are the same night stored twice, not a split night.
+DUPLICATE_SESSION_OVERLAP_SHARE = 0.5
+
+
+def _overlap_share(a: dict, b: dict) -> float:
+    overlap = (min(a["end_time"], b["end_time"]) - max(a["start_time"], b["start_time"])).total_seconds()
+    shorter = min(
+        (a["end_time"] - a["start_time"]).total_seconds(),
+        (b["end_time"] - b["start_time"]).total_seconds(),
+    )
+    if overlap <= 0 or shorter <= 0:
+        return 0.0
+    return overlap / shorter
+
+
+def _duplicate_main_sessions(sessions: list[dict]) -> list[dict]:
+    """Main sessions that repeat a longer main session of the same source.
+
+    The summary adds up every main session of a (date, source, device) group, so
+    a night stored twice would read as twice the sleep. The longest session of
+    each overlapping group is kept.
+    """
+    main = sorted(
+        (s for s in sessions if not s["is_nap"]),
+        key=lambda s: (-(s.get("duration_minutes") or 0), s["start_time"]),
+    )
+    kept: list[dict] = []
+    duplicates: list[dict] = []
+    for session in main:
+        if any(_overlap_share(session, k) >= DUPLICATE_SESSION_OVERLAP_SHARE for k in kept):
+            duplicates.append(session)
+        else:
+            kept.append(session)
+    return duplicates
+
+
+def _sum_or_none(values: list[int | None]) -> int | None:
+    present = [v for v in values if v is not None]
+    return sum(present) if present else None
+
+
+def _recompute_main_sleep(result: dict, sessions: list[dict]) -> None:
+    """Rebuild a summary row's main-sleep totals from its remaining sessions."""
+    main = [s for s in sessions if not s["is_nap"]]
+    result["total_duration_minutes"] = sum(s.get("duration_minutes") or 0 for s in main)
+    for key in ("time_in_bed_minutes", "deep_minutes", "light_minutes", "rem_minutes", "awake_minutes"):
+        result[key] = _sum_or_none([s.get(key) for s in main])
 
 
 class SummariesService:
@@ -291,6 +341,22 @@ class SummariesService:
         # Transform to schema
         data = []
         for result in results:
+            raw_sessions = result.get("sessions") or []
+            duplicates = _duplicate_main_sessions(raw_sessions)
+            if duplicates:
+                raw_sessions = [s for s in raw_sessions if not any(s is d for d in duplicates)]
+                _recompute_main_sleep(result, raw_sessions)
+                log_structured(
+                    self.logger,
+                    "warning",
+                    "Sleep summary dropped duplicate sessions of one night",
+                    provider=result.get("provider") or "unknown",
+                    action="sleep_summary_duplicate_sessions",
+                    user_id=str(user_id),
+                    sleep_date=result["sleep_date"].isoformat(),
+                    dropped_count=len(duplicates),
+                )
+
             # Build sleep stages if any stage data is available
             stages = None
             has_stage_data = any(
@@ -311,7 +377,6 @@ class SummariesService:
             avg_respiratory_rate: float | None = result.get("avg_resp")
             avg_spo2_percent: float | None = result.get("avg_spo2")
 
-            raw_sessions = result.get("sessions") or []
             sessions = [
                 SleepSessionSummary(
                     start_time=s["start_time"],

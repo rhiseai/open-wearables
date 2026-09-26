@@ -10,6 +10,11 @@ class SleepStateStage(BaseModel):
     stage: SleepStageType
     start_time: datetime
     end_time: datetime
+    # HealthKit writer of the sample, used to build a night from a single source.
+    # Optional so Redis states written before these fields existed still parse.
+    source_key: str | None = None
+    source_name: str | None = None
+    device_model: str | None = None
 
 
 class SleepState(BaseModel):

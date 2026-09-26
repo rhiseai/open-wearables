@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.schemas.enums import ProviderName
-from app.services.summaries_service import SummariesService
+from app.services.summaries_service import SummariesService, _duplicate_main_sessions, _recompute_main_sleep
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
@@ -361,3 +361,54 @@ class TestGetActivitySummaries:
             limit=10,
         )
         assert result.data == []
+
+
+# ---------------------------------------------------------------------------
+# Duplicate sessions of one night (RHISE-4202)
+# ---------------------------------------------------------------------------
+
+
+def _session(start: str, end: str, minutes: int, *, is_nap: bool = False, **stages: int) -> dict[str, Any]:
+    return {"start_time": _dt(start), "end_time": _dt(end), "duration_minutes": minutes, "is_nap": is_nap, **stages}
+
+
+class TestDuplicateMainSessions:
+    def test_night_stored_twice_keeps_the_longest(self) -> None:
+        longer = _session("2026-09-23T23:03:00+00:00", "2026-09-24T05:17:00+00:00", 374)
+        repeat = _session("2026-09-23T23:15:00+00:00", "2026-09-24T05:10:00+00:00", 393)
+        shorter = _session("2026-09-23T23:30:00+00:00", "2026-09-24T04:00:00+00:00", 250)
+
+        assert _duplicate_main_sessions([longer, repeat, shorter]) == [longer, shorter]
+
+    def test_split_night_is_not_a_duplicate(self) -> None:
+        first = _session("2026-05-01T22:30:00+00:00", "2026-05-02T02:00:00+00:00", 200)
+        second = _session("2026-05-02T01:55:00+00:00", "2026-05-02T07:00:00+00:00", 290)
+
+        assert _duplicate_main_sessions([first, second]) == []
+
+    def test_naps_are_left_alone(self) -> None:
+        main = _session("2026-05-01T22:00:00+00:00", "2026-05-02T06:00:00+00:00", 450)
+        nap = _session("2026-05-02T05:00:00+00:00", "2026-05-02T05:30:00+00:00", 30, is_nap=True)
+
+        assert _duplicate_main_sessions([main, nap]) == []
+
+    def test_recompute_uses_the_remaining_sessions(self) -> None:
+        kept = _session(
+            "2026-09-23T23:03:00+00:00",
+            "2026-09-24T05:17:00+00:00",
+            340,
+            time_in_bed_minutes=374,
+            deep_minutes=75,
+            light_minutes=170,
+            rem_minutes=95,
+            awake_minutes=15,
+        )
+        nap = _session("2026-09-24T14:00:00+00:00", "2026-09-24T14:30:00+00:00", 30, is_nap=True)
+        result: dict[str, Any] = {"total_duration_minutes": 767, "time_in_bed_minutes": 748, "deep_minutes": 150}
+
+        _recompute_main_sleep(result, [kept, nap])
+
+        assert result["total_duration_minutes"] == 340
+        assert result["time_in_bed_minutes"] == 374
+        assert result["deep_minutes"] == 75
+        assert result["awake_minutes"] == 15

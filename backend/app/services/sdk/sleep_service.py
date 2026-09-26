@@ -5,6 +5,8 @@ from decimal import Decimal
 from logging import getLogger
 from uuid import UUID, uuid4
 
+import sentry_sdk
+
 from app.config import settings
 from app.constants.series_types.sdk import (
     SleepPhase,
@@ -28,17 +30,11 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
+from app.services.sdk.sleep_night import SleepNight, build_sleep_night, sleep_source_key
+from app.utils.sleep_invariants import SleepInvariantViolationError, sleep_invariant_violations
 from app.utils.structured_logging import log_structured
 
 logger = getLogger(__name__)
-
-_STAGE_TO_METRIC: dict[str, str] = {
-    "awake": "awake_seconds",
-    "sleeping": "sleeping_seconds",
-    "light": "light_seconds",
-    "deep": "deep_seconds",
-    "rem": "rem_seconds",
-}
 
 
 def key(user_id: str) -> str:
@@ -123,6 +119,7 @@ def _apply_transition(
     source_name: str | None = None,
     device_model: str | None = None,
     zone_offset: str | None = None,
+    source_key: str | None = None,
 ) -> SleepState:
     """Apply a transition to the sleep state."""
 
@@ -187,6 +184,9 @@ def _apply_transition(
             stage=stage_label,
             start_time=start_time,
             end_time=end_time,
+            source_key=source_key,
+            source_name=source_name,
+            device_model=device_model,
         )
     )
 
@@ -296,6 +296,7 @@ def handle_sleep_data(
                 original_source_name,
                 device_model,
                 sjson.zoneOffset,
+                sleep_source_key(sjson.source),
             )
 
         # Persist the accumulated state to Redis only once after processing the entire batch,
@@ -324,103 +325,12 @@ def handle_sleep_data(
 
 
 def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
+    """Metrics and hypnogram of a session, built from one source's intervals.
+
+    Returns (metrics_dict, cleaned_stages_list). See ``build_sleep_night``.
     """
-    Recalculate metrics from stages, handling overlaps by prioritizing earlier segments.
-    Returns (metrics_dict, cleaned_stages_list).
-
-    Input stages are now list[SleepStateStage] Pydantic models with normalized stage values.
-    """
-    metrics = {
-        "in_bed_seconds": 0,
-        "awake_seconds": 0,
-        "sleeping_seconds": 0,
-        "light_seconds": 0,
-        "deep_seconds": 0,
-        "rem_seconds": 0,
-    }
-
-    # Determine processing strategy based on what stage types are present:
-    # - Only in_bed (no sleeping/light/deep/rem): treat in_bed as sleeping (legacy devices)
-    # - Detailed phases present (light/deep/rem): use only detailed + awake, drop sleeping wrapper
-    # - Only sleeping (no detailed): use sleeping + awake as-is
-    has_detailed = any(s.stage in ("light", "deep", "rem") for s in stages)
-    has_sleep_data = any(s.stage in ("sleeping", "light", "deep", "rem") for s in stages)
-
-    if not has_sleep_data:
-        processable = [
-            SleepStateStage(stage=SleepStageType.SLEEPING, start_time=s.start_time, end_time=s.end_time)
-            if s.stage == "in_bed"
-            else s
-            for s in stages
-            if s.stage != "unknown"
-        ]
-    elif has_detailed:
-        processable = [s for s in stages if s.stage not in ("in_bed", "sleeping", "unknown")]
-    else:
-        processable = [s for s in stages if s.stage not in ("in_bed", "unknown")]
-
-    sorted_processable = sorted(processable, key=lambda x: x.start_time)
-
-    cleaned_stages: list[SleepStage] = []
-    last_end = None
-
-    for stage in sorted_processable:
-        start = stage.start_time
-        end = stage.end_time
-
-        if last_end and start < last_end:
-            start = last_end
-
-        if start >= end:
-            continue
-
-        duration = (end - start).total_seconds()
-
-        # Safe to access .stage (Pydantic model)
-        phase_str = str(stage.stage)
-
-        metric_key = _STAGE_TO_METRIC.get(phase_str)
-        if metric_key:
-            metrics[metric_key] += duration
-
-        cleaned_stages.append(SleepStage(stage=SleepStageType(phase_str), start_time=start, end_time=end))
-        last_end = end
-
-    # 2. Process IN_BED duration separately (union of intervals)
-    in_bed_raw = [s for s in stages if s.stage == "in_bed"]
-    if in_bed_raw:
-        sorted_in_bed = sorted(in_bed_raw, key=lambda x: x.start_time)
-        current_start = None
-        current_end = None
-
-        for stage in sorted_in_bed:
-            start = stage.start_time
-            end = stage.end_time
-
-            if current_start is None:
-                current_start = start
-                current_end = end
-                continue
-
-            if start < current_end:  # ty:ignore[unsupported-operator]
-                current_end = max(current_end, end)  # ty:ignore[invalid-argument-type]
-            else:
-                metrics["in_bed_seconds"] += (current_end - current_start).total_seconds()  # ty:ignore[unsupported-operator]
-                current_start = start
-                current_end = end
-
-        if current_start and current_end:
-            metrics["in_bed_seconds"] += (current_end - current_start).total_seconds()
-    else:
-        metrics["in_bed_seconds"] = (
-            metrics["awake_seconds"]
-            + metrics["sleeping_seconds"]
-            + metrics["light_seconds"]
-            + metrics["deep_seconds"]
-            + metrics["rem_seconds"]
-        )
-
-    return metrics, cleaned_stages
+    night = build_sleep_night(stages)
+    return night.metrics, night.stages
 
 
 def _in_bed_bounds(stages: list[SleepStateStage]) -> tuple[datetime, datetime] | None:
@@ -433,6 +343,45 @@ def _in_bed_bounds(stages: list[SleepStateStage]) -> tuple[datetime, datetime] |
         return None
 
     return min(s.start_time for s in in_bed), max(s.end_time for s in in_bed)
+
+
+def _report_rejected_night(
+    user_id: str,
+    state: SleepState,
+    night: SleepNight,
+    violations: list[str],
+    values: dict,
+) -> None:
+    """Log and send to Sentry a night that breaks the sleep invariants."""
+    log_structured(
+        logger,
+        "warning",
+        "Apple sleep night rejected: impossible totals",
+        provider=state.provider or "unknown",
+        action="sleep_night_rejected",
+        user_id=user_id,
+        session_id=state.uuid,
+        violations=violations,
+        chosen_source=night.source_key or "unknown",
+        discarded_sources=night.discarded_sources,
+        **values,
+    )
+    with sentry_sdk.push_scope() as scope:
+        scope.set_level("warning")
+        scope.set_context(
+            "sleep_night",
+            {
+                "user_id": user_id,
+                "session_id": state.uuid,
+                "window": [state.start_time.isoformat(), state.end_time.isoformat()],
+                "violations": violations,
+                "values": values,
+                "chosen_source": night.source_key,
+                "discarded_sources": night.discarded_sources,
+                "raw_buckets": night.raw_buckets,
+            },
+        )
+        sentry_sdk.capture_message("Apple sleep night rejected: impossible totals")
 
 
 def persist_sleep(
@@ -450,6 +399,10 @@ def persist_sleep(
     Adjacent sessions from a different Redis uuid (historical multi-payload nights)
     are still merged by ``create_or_merge_sleep``.
 
+    The night is built from a single HealthKit source (see ``build_sleep_night``)
+    and must pass the sleep invariants; a night that fails them, alone or merged
+    with an adjacent record, is not written and is reported to Sentry.
+
     Args:
         db_session: Database session
         user_id: User identifier
@@ -458,7 +411,21 @@ def persist_sleep(
             boundary / quiet-gap finalization). When False, Redis keeps accumulating
             stages for the next batch.
     """
-    metrics, cleaned_stages = _calculate_final_metrics(state.stages)
+    night = build_sleep_night(state.stages)
+    metrics, cleaned_stages = night.metrics, night.stages
+
+    if night.discarded_sources:
+        log_structured(
+            logger,
+            "info",
+            "Apple sleep night built from one HealthKit source",
+            provider=state.provider or "unknown",
+            action="sleep_source_chosen",
+            user_id=user_id,
+            session_id=state.uuid,
+            chosen_source=night.source_key or "unknown",
+            discarded_sources=night.discarded_sources,
+        )
 
     if cleaned_stages:
         start_time = cleaned_stages[0].start_time
@@ -467,7 +434,7 @@ def persist_sleep(
         # all of it (e.g. a Whoop night relayed through Apple Health with asleep
         # stages for a sub-window only).  Widen the event window to the in-bed union
         # so the record is never shorter than the time-in-bed it reports.
-        in_bed_bounds = _in_bed_bounds(state.stages)
+        in_bed_bounds = _in_bed_bounds([s for s in state.stages if s.source_key == night.source_key])
         if in_bed_bounds:
             start_time = min(start_time, in_bed_bounds[0])
             end_time = max(end_time, in_bed_bounds[1])
@@ -478,10 +445,8 @@ def persist_sleep(
     source_for_lookup = state.source_name if state.source_name != "unknown" else None
 
     total_duration = (end_time - start_time).total_seconds()
-    total_sleep_seconds = (
-        metrics["sleeping_seconds"] + metrics["light_seconds"] + metrics["deep_seconds"] + metrics["rem_seconds"]
-    )
-    time_in_bed_seconds = max(metrics["in_bed_seconds"], total_sleep_seconds + metrics["awake_seconds"])
+    total_sleep_seconds = night.total_sleep_seconds
+    time_in_bed_seconds = night.time_in_bed_seconds
     sleep_efficiency = (
         Decimal(str(total_sleep_seconds / time_in_bed_seconds * 100)) if time_in_bed_seconds > 0 else None
     )
@@ -515,6 +480,26 @@ def persist_sleep(
         sleep_stages=cleaned_stages or None,
     )
 
+    values = {
+        "total_sleep_minutes": detail.sleep_total_duration_minutes,
+        "time_in_bed_minutes": detail.sleep_time_in_bed_minutes,
+        "deep_minutes": detail.sleep_deep_minutes,
+        "rem_minutes": detail.sleep_rem_minutes,
+        "light_minutes": detail.sleep_light_minutes,
+        "sleeping_minutes": int(metrics["sleeping_seconds"] // 60),
+        "awake_minutes": detail.sleep_awake_minutes,
+    }
+    violations = sleep_invariant_violations(
+        total_sleep_minutes=values["total_sleep_minutes"],
+        time_in_bed_minutes=values["time_in_bed_minutes"],
+        stage_minutes=(values[k] for k in ("deep_minutes", "rem_minutes", "light_minutes", "sleeping_minutes")),
+    )
+    if violations:
+        _report_rejected_night(user_id, state, night, violations, values)
+        if close:
+            delete_sleep_state(user_id)
+        return
+
     try:
         event_record_service.create_or_merge_sleep(
             db_session,
@@ -522,9 +507,15 @@ def persist_sleep(
             sleep_record,
             detail,
             settings.sleep_end_gap_minutes,
+            enforce_invariants=True,
         )
         # Only drop Redis after a successful DB write so a transient error keeps the
         # session available for the next flush / periodic finalization attempt.
+        if close:
+            delete_sleep_state(user_id)
+    except SleepInvariantViolationError as e:
+        db_session.rollback()
+        _report_rejected_night(user_id, state, night, e.violations, {**values, "merged": e.values})
         if close:
             delete_sleep_state(user_id)
     except Exception as e:
