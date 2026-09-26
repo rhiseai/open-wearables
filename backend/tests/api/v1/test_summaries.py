@@ -392,6 +392,56 @@ class TestSleepSummaryEndpoint:
         assert sleep_data["sessions"][0]["zone_offset"] is None
         assert sleep_data["sessions"][1]["zone_offset"] == "+02:00"
 
+    def test_get_sleep_summary_night_stored_twice_is_not_doubled(self, client: TestClient, db: Session) -> None:
+        """RHISE-4198: two overlapping records of one night read as 12h47 inside 6h14 in bed."""
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user)
+        for start, end, total, in_bed in (
+            (
+                datetime(2026, 9, 23, 23, 3, tzinfo=timezone.utc),
+                datetime(2026, 9, 24, 5, 17, tzinfo=timezone.utc),
+                374,
+                374,
+            ),
+            (
+                datetime(2026, 9, 23, 23, 15, tzinfo=timezone.utc),
+                datetime(2026, 9, 24, 5, 10, tzinfo=timezone.utc),
+                340,
+                355,
+            ),
+        ):
+            record = EventRecordFactory(
+                mapping=mapping,
+                category="sleep",
+                start_datetime=start,
+                end_datetime=end,
+                duration_seconds=int((end - start).total_seconds()),
+            )
+            SleepDetailsFactory(
+                event_record=record,
+                sleep_total_duration_minutes=total,
+                sleep_time_in_bed_minutes=in_bed,
+                sleep_deep_minutes=75,
+                sleep_light_minutes=170,
+                sleep_rem_minutes=95,
+                sleep_awake_minutes=15,
+                is_nap=False,
+            )
+
+        api_key = ApiKeyFactory()
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/sleep",
+            headers=api_key_headers(api_key.plain_key),
+            params={"start_date": "2026-09-23T00:00:00Z", "end_date": "2026-09-25T00:00:00Z"},
+        )
+
+        assert response.status_code == 200
+        night = response.json()["data"][0]
+        assert night["duration_minutes"] == 374
+        assert night["time_in_bed_minutes"] == 374
+        assert night["stages"]["deep_minutes"] == 75
+        assert len(night["sessions"]) == 1
+
     def test_get_sleep_summary_no_naps(self, client: TestClient, db: Session) -> None:
         """Test sleep summary returns null for nap fields when no naps exist."""
         user = UserFactory()

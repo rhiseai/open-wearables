@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
+from sqlalchemy import text
 from sqlalchemy.orm import Query
 
 from app.database import DbSession
@@ -68,6 +69,7 @@ from app.services.services import AppService
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
+from app.utils.sleep_invariants import SleepInvariantViolationError, sleep_invariant_violations
 
 
 @dataclass(frozen=True)
@@ -302,10 +304,18 @@ class EventRecordService(
         threshold_minutes: int,
         source: str | None = None,
         provider: str | None = None,
+        external_id: str | None = None,
     ) -> EventRecord | None:
         """Find an existing sleep session adjacent to [start_time, end_time]."""
         return self.crud.find_adjacent_sleep_record(
-            db_session, user_id, start_time, end_time, threshold_minutes, source=source, provider=provider
+            db_session,
+            user_id,
+            start_time,
+            end_time,
+            threshold_minutes,
+            source=source,
+            provider=provider,
+            external_id=external_id,
         )
 
     def create_or_merge_sleep(
@@ -315,6 +325,8 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        *,
+        enforce_invariants: bool = False,
     ) -> EventRecord:
         """Create a sleep record, merging with any adjacent session within threshold_minutes.
 
@@ -325,9 +337,12 @@ class EventRecordService(
         average over sessions that have a non-None score.  The merged record is created
         first, and the old record is deleted only after a successful insert — so a failure
         never loses the original data.
+
+        With ``enforce_invariants`` a merge whose result breaks the sleep invariants
+        raises ``SleepInvariantViolationError`` before anything is written.
         """
         result, action, final_detail = self._create_or_merge_sleep_inner(
-            db_session, user_id, record, detail, threshold_minutes
+            db_session, user_id, record, detail, threshold_minutes, enforce_invariants
         )
         # ``action`` is "created" (insert / fresh merged session) or "updated" (a
         # provider re-sending a session as it finalizes). Emitting on updates —
@@ -392,10 +407,19 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        enforce_invariants: bool = False,
     ) -> tuple[EventRecord, str, EventRecordDetailCreate]:
         # Returns (record, action, final_detail). ``action`` is "created" (new insert
         # or a fresh merged session) or "updated" (an existing session replaced in
         # place), so the caller emits sleep.created vs sleep.updated accordingly.
+
+        # Two writers for the same user (e.g. SDK batches whose Redis lock expired)
+        # would otherwise both see "no adjacent record" and insert overlapping
+        # sessions for one night, which the daily summary then adds up.
+        db_session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"sleep_merge:{user_id}"},
+        )
         adjacent = self.find_adjacent_sleep_record(
             db_session,
             user_id,
@@ -404,6 +428,7 @@ class EventRecordService(
             threshold_minutes,
             source=record.source,
             provider=record.provider,
+            external_id=record.external_id,
         )
 
         if adjacent is not None:
@@ -515,6 +540,31 @@ class EventRecordService(
                 merged_rem = _adj_int("sleep_rem_minutes") + (detail.sleep_rem_minutes or 0)
                 merged_awake = _adj_int("sleep_awake_minutes") + (detail.sleep_awake_minutes or 0)
                 merged_total = _adj_int("sleep_total_duration_minutes") + (detail.sleep_total_duration_minutes or 0)
+
+            if overlap_seconds > 0:
+                # Both sessions count the overlapping minutes as in bed; the merged
+                # night cannot be in bed longer than its own window.
+                merged_in_bed = min(merged_in_bed, int((merged_end - merged_start).total_seconds() // 60))
+
+            if enforce_invariants:
+                violations = sleep_invariant_violations(
+                    total_sleep_minutes=merged_total,
+                    time_in_bed_minutes=merged_in_bed,
+                    stage_minutes=(merged_deep, merged_light, merged_rem),
+                )
+                if violations:
+                    raise SleepInvariantViolationError(
+                        violations,
+                        {
+                            "adjacent_record_id": str(adjacent.id),
+                            "total_sleep_minutes": merged_total,
+                            "time_in_bed_minutes": merged_in_bed,
+                            "deep_minutes": merged_deep,
+                            "light_minutes": merged_light,
+                            "rem_minutes": merged_rem,
+                            "awake_minutes": merged_awake,
+                        },
+                    )
 
             self.logger.info(
                 "Merging adjacent sleep records: %s (%s – %s) + %s (%s – %s)",

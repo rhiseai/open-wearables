@@ -947,6 +947,11 @@ class EventRecordRepository(
                 EventRecord.zone_offset.label("zone_offset"),
                 duration_seconds.label("duration_seconds"),
                 func.coalesce(SleepDetails.is_nap, False).label("is_nap"),
+                SleepDetails.sleep_time_in_bed_minutes,
+                SleepDetails.sleep_deep_minutes,
+                SleepDetails.sleep_light_minutes,
+                SleepDetails.sleep_rem_minutes,
+                SleepDetails.sleep_awake_minutes,
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -974,6 +979,11 @@ class EventRecordRepository(
                     "zone_offset": row.zone_offset,
                     "duration_minutes": int(row.duration_seconds) // 60 if row.duration_seconds is not None else None,
                     "is_nap": bool(row.is_nap),
+                    "time_in_bed_minutes": row.sleep_time_in_bed_minutes,
+                    "deep_minutes": row.sleep_deep_minutes,
+                    "light_minutes": row.sleep_light_minutes,
+                    "rem_minutes": row.sleep_rem_minutes,
+                    "awake_minutes": row.sleep_awake_minutes,
                 }
             )
         return sessions_by_key
@@ -1053,6 +1063,7 @@ class EventRecordRepository(
         threshold_minutes: int,
         source: str | None = None,
         provider: str | None = None,
+        external_id: str | None = None,
     ) -> EventRecord | None:
         """Return the most-recent sleep session adjacent to [start_time, end_time].
 
@@ -1065,6 +1076,9 @@ class EventRecordRepository(
         DataSource has the same provider, preventing cross-provider merges
         (e.g. Oura sessions being merged with Garmin sessions).
         When *source* is provided an additional filter on DataSource.source is applied.
+        When *external_id* is provided an adjacent record with that external id wins
+        over a more recent one, so re-flushing a session updates its own row instead
+        of merging into a neighbour and leaving its own row behind as a duplicate.
         """
         threshold = timedelta(minutes=threshold_minutes)
         filters = [
@@ -1078,12 +1092,15 @@ class EventRecordRepository(
             filters.append(DataSource.provider == provider)
         if source is not None:
             filters.append(DataSource.source == source)
+        ordering = [self.model.start_datetime.desc()]
+        if external_id is not None:
+            ordering.insert(0, case((self.model.external_id == external_id, 0), else_=1))
         return (
             db_session.query(self.model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .options(selectinload(self.model.sleep_detail))
             .filter(*filters)
-            .order_by(self.model.start_datetime.desc())
+            .order_by(*ordering)
             .with_for_update()
             .first()
         )
