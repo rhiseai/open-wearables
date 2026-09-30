@@ -74,6 +74,7 @@ from app.utils.pagination import decode_bucket_cursor, decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+DailyMergedSampleSums = dict[tuple[date, ProviderName, SeriesType], float]
 
 
 class WriteCounts(int):
@@ -1042,6 +1043,100 @@ class DataPointSeriesRepository(
                 }
             )
         return aggregates
+
+    def get_daily_merged_sample_sums(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        series_types: tuple[SeriesType, ...],
+    ) -> DailyMergedSampleSums:
+        """Merge additive samples across devices without double-counting overlap.
+
+        Each device is summed independently within a local-hour bucket. The
+        provider contributes only the largest device sum for that hour, then
+        those hourly values are summed for the local day. Daily-total rows are
+        excluded because they have no meaningful hourly placement; callers can
+        retain a larger provider-reported daily total when applying this result.
+        """
+        if not series_types:
+            return {}
+
+        series_type_ids = tuple(get_series_type_id(series_type) for series_type in series_types)
+        local_timestamp = self.model.recorded_at + cast(
+            func.coalesce(self.model.zone_offset, "+00:00"),
+            Interval,
+        )
+        local_date = cast(local_timestamp, Date)
+        local_hour = func.date_trunc(literal_column("'hour'"), local_timestamp)
+
+        device_hourly = (
+            select(
+                local_date.label("activity_date"),
+                local_hour.label("activity_hour"),
+                DataSource.provider.label("provider"),
+                self.model.series_type_definition_id.label("series_type_id"),
+                self.model.data_source_id.label("data_source_id"),
+                func.sum(self.model.value).label("sample_sum"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .where(
+                DataSource.user_id == user_id,
+                self.model.recorded_at >= start_date - timedelta(days=1),
+                local_date >= cast(start_date, Date),
+                local_date < cast(end_date, Date),
+                self.model.series_type_definition_id.in_(series_type_ids),
+                self.model.is_daily_total.isnot(True),
+            )
+            .group_by(
+                local_date,
+                local_hour,
+                DataSource.provider,
+                self.model.series_type_definition_id,
+                self.model.data_source_id,
+            )
+            .subquery()
+        )
+
+        provider_hourly = (
+            select(
+                device_hourly.c.activity_date,
+                device_hourly.c.activity_hour,
+                device_hourly.c.provider,
+                device_hourly.c.series_type_id,
+                func.max(device_hourly.c.sample_sum).label("sample_sum"),
+            )
+            .group_by(
+                device_hourly.c.activity_date,
+                device_hourly.c.activity_hour,
+                device_hourly.c.provider,
+                device_hourly.c.series_type_id,
+            )
+            .subquery()
+        )
+
+        daily = (
+            select(
+                provider_hourly.c.activity_date,
+                provider_hourly.c.provider,
+                provider_hourly.c.series_type_id,
+                func.sum(provider_hourly.c.sample_sum).label("sample_sum"),
+            )
+            .group_by(
+                provider_hourly.c.activity_date,
+                provider_hourly.c.provider,
+                provider_hourly.c.series_type_id,
+            )
+            .order_by(asc(provider_hourly.c.activity_date))
+        )
+
+        return {
+            (row.activity_date, ProviderName(row.provider), get_series_type_from_id(row.series_type_id)): float(
+                row.sample_sum
+            )
+            for row in db_session.execute(daily)
+        }
 
     def get_daily_active_minutes(
         self,

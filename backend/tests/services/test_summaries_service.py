@@ -343,6 +343,131 @@ class TestGetActivitySummaries:
         assert len(result.data) == 1
         assert result.data[0].steps == 3000
 
+    def test_fills_watch_gaps_from_phone_hours(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch = DataSourceFactory(
+            user=user,
+            provider=ProviderName.APPLE,
+            source="watch",
+            device_model="Watch7,1",
+            device_type="watch",
+        )
+        phone = DataSourceFactory(
+            user=user,
+            provider=ProviderName.APPLE,
+            source="phone",
+            device_model="iPhone15,2",
+            device_type="phone",
+        )
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        DataPointSeriesFactory(
+            data_source=watch,
+            series_type=steps_type,
+            value=500,
+            recorded_at=_dt("2026-01-01T08:00:00+00:00"),
+        )
+        DataPointSeriesFactory(
+            data_source=phone,
+            series_type=steps_type,
+            value=6000,
+            recorded_at=_dt("2026-01-01T15:00:00+00:00"),
+        )
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        assert result.data[0].source.device == "Watch7,1"
+        assert result.data[0].steps == 6500
+
+    def test_does_not_double_count_devices_in_the_same_hour(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch = DataSourceFactory(
+            user=user,
+            provider=ProviderName.APPLE,
+            source="watch",
+            device_model="Watch7,1",
+            device_type="watch",
+        )
+        phone = DataSourceFactory(
+            user=user,
+            provider=ProviderName.APPLE,
+            source="phone",
+            device_model="iPhone15,2",
+            device_type="phone",
+        )
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        DataPointSeriesFactory(
+            data_source=watch,
+            series_type=steps_type,
+            value=500,
+            recorded_at=_dt("2026-01-01T08:00:00+00:00"),
+        )
+        DataPointSeriesFactory(
+            data_source=phone,
+            series_type=steps_type,
+            value=6000,
+            recorded_at=_dt("2026-01-01T08:30:00+00:00"),
+        )
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        assert result.data[0].steps == 6000
+
+    def test_keeps_a_larger_provider_daily_total(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch = DataSourceFactory(
+            user=user,
+            provider=ProviderName.GARMIN,
+            source="garmin_daily",
+            device_model="Fenix 8",
+            device_type="watch",
+        )
+        phone = DataSourceFactory(
+            user=user,
+            provider=ProviderName.GARMIN,
+            source="garmin_samples",
+            device_model="Android phone",
+            device_type="phone",
+        )
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        DataPointSeriesFactory(
+            data_source=watch,
+            series_type=steps_type,
+            value=10000,
+            is_daily_total=True,
+            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
+        )
+        DataPointSeriesFactory(
+            data_source=phone,
+            series_type=steps_type,
+            value=6000,
+            recorded_at=_dt("2026-01-01T15:00:00+00:00"),
+        )
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        assert result.data[0].steps == 10000
+
     def test_does_not_return_other_users_data(self, db: Session, service: SummariesService) -> None:
         user_a = UserFactory()
         user_b = UserFactory()
