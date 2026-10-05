@@ -1001,7 +1001,10 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                # zone_offset shifts a local date by less than a day, so these UTC bounds keep
+                # every sample of the local-date window and let the index scan stop at its end.
                 self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at < end_date + timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id.in_(
@@ -1083,7 +1086,10 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .where(
                 DataSource.user_id == user_id,
+                # zone_offset shifts a local date by less than a day, so these UTC bounds keep
+                # every sample of the local-date window and let the index scan stop at its end.
                 self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at < end_date + timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id.in_(series_type_ids),
@@ -1182,7 +1188,10 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                # zone_offset shifts a local date by less than a day, so these UTC bounds keep
+                # every sample of the local-date window and let the index scan stop at its end.
                 self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at < end_date + timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id == steps_id,
@@ -1285,7 +1294,10 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                # zone_offset shifts a local date by less than a day, so these UTC bounds keep
+                # every sample of the local-date window and let the index scan stop at its end.
                 self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at < end_date + timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id == hr_id,
