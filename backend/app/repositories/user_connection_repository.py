@@ -4,6 +4,7 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -510,32 +511,42 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         Returns the connection and which branch was taken, so the caller can emit
         ``connection.created`` only on a real state change. The upload path calls
         this on every batch, so EXISTING must stay silent.
+
+        The first batches of a new user are processed in parallel and all find no
+        connection. The unique index on ``(user_id, provider)`` lets exactly one insert
+        land; the others read that row back and report EXISTING.
         """
         existing = self.get_by_user_and_provider(db_session, user_id, provider)
-        if existing:
-            # Reactivate if revoked
-            if existing.status != ConnectionStatus.ACTIVE:
-                existing.status = ConnectionStatus.ACTIVE
-                existing.updated_at = datetime.now(timezone.utc)
-                db_session.add(existing)
-                db_session.commit()
-                db_session.refresh(existing)
-                return existing, SdkConnectionOutcome.REACTIVATED
-            return existing, SdkConnectionOutcome.EXISTING
+        if existing is None:
+            # Create new SDK connection (no tokens needed)
+            now = datetime.now(timezone.utc)
+            stmt = (
+                insert(self.model)
+                .values(
+                    id=uuid4(),
+                    user_id=user_id,
+                    provider=provider,
+                    status=ConnectionStatus.ACTIVE,
+                    created_at=now,
+                    updated_at=now,
+                )
+                .on_conflict_do_nothing(index_elements=["user_id", "provider"])
+                .returning(self.model.id)
+            )
+            created_id = db_session.execute(stmt).scalar_one_or_none()
+            db_session.commit()
 
-        # Create new SDK connection (no tokens needed)
-        connection = UserConnection(
-            id=uuid4(),
-            user_id=user_id,
-            provider=provider,
-            access_token=None,
-            refresh_token=None,
-            token_expires_at=None,
-            status=ConnectionStatus.ACTIVE,
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-        db_session.add(connection)
-        db_session.commit()
-        db_session.refresh(connection)
-        return connection, SdkConnectionOutcome.CREATED
+            existing = self.get_by_user_and_provider(db_session, user_id, provider)
+            assert existing is not None
+            if created_id is not None:
+                return existing, SdkConnectionOutcome.CREATED
+
+        # Reactivate if revoked
+        if existing.status != ConnectionStatus.ACTIVE:
+            existing.status = ConnectionStatus.ACTIVE
+            existing.updated_at = datetime.now(timezone.utc)
+            db_session.add(existing)
+            db_session.commit()
+            db_session.refresh(existing)
+            return existing, SdkConnectionOutcome.REACTIVATED
+        return existing, SdkConnectionOutcome.EXISTING
