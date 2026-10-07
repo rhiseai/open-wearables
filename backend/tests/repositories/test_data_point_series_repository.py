@@ -9,11 +9,14 @@ Tests cover:
 - Daily activity queries: local-date windows and the bounded recorded_at scan
 """
 
+import itertools
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
 from sqlalchemy import event, text
 from sqlalchemy.orm import Session
@@ -711,6 +714,62 @@ class TestDataPointSeriesRepository:
 
         counts = series_repo.bulk_create(db, samples)
         assert counts.inserted == n
+
+    def test_bulk_create_merges_a_large_batch_in_chunks(
+        self, db: Session, series_repo: DataPointSeriesRepository, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A batch bigger than one chunk is merged by several statements and fully written.
+
+        statement_timeout applies per statement, so a 90-day Polar continuous heart-rate
+        backfill (about a million rows) has to be split; the counts still cover the batch.
+        """
+        monkeypatch.setattr(DataPointSeriesRepository, "_MERGE_CHUNK_ROWS", 3)
+        # (min, max) recorded_at staged for each merge statement, in execution order.
+        chunk_spans: list[tuple[datetime, datetime]] = []
+        original_execute = psycopg.Cursor.execute
+
+        def recording_execute(self: psycopg.Cursor, query: Any, *args: Any, **kwargs: Any) -> Any:
+            if "WITH merged AS" in str(query):
+                original_execute(self, "SELECT min(recorded_at), max(recorded_at) FROM data_point_series_staging")
+                chunk_spans.append(self.fetchone())
+            return original_execute(self, query, *args, **kwargs)
+
+        monkeypatch.setattr(psycopg.Cursor, "execute", recording_execute)
+
+        user = UserFactory()
+        base = datetime(2099, 1, 1)  # naive, as Polar's continuous heart rate arrives
+
+        def samples(value: int) -> list[TimeSeriesSampleCreate]:
+            # Newest first, so the batch has to be sorted before it is split.
+            return [
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    source="polar",
+                    recorded_at=base + timedelta(minutes=i),
+                    value=value + i,
+                    series_type=SeriesType.heart_rate,
+                )
+                for i in reversed(range(7))
+            ]
+
+        first = series_repo.bulk_create(db, samples(60))
+        assert (first.inserted, first.updated) == (7, 0)
+        # Three statements for seven rows, each chunk later than the one before.
+        assert len(chunk_spans) == 3
+        assert all(prev[1] < nxt[0] for prev, nxt in itertools.pairwise(chunk_spans))
+        stored = (
+            db.query(DataPointSeries.value)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user.id)
+            .order_by(DataPointSeries.recorded_at)
+            .all()
+        )
+        assert [row.value for row in stored] == [60 + i for i in range(7)]
+
+        second = series_repo.bulk_create(db, samples(70))
+        assert (second.inserted, second.updated) == (0, 7)
+        assert len(chunk_spans) == 6
 
     def test_bulk_create_skips_rewriting_unchanged_duplicates(
         self, db: Session, series_repo: DataPointSeriesRepository
