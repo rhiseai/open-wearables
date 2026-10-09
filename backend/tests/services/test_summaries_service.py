@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.schemas.enums import ProviderName
+from app.services.priority_service import priority_service
 from app.services.summaries_service import SummariesService
 from tests.factories import (
     DataPointSeriesFactory,
@@ -468,6 +469,154 @@ class TestGetActivitySummaries:
 
         assert result.data[0].steps == 10000
 
+    def _ring_and_watch(self, db: Session, user: Any, top: ProviderName = ProviderName.OURA) -> tuple[Any, Any]:
+        """A top-ranked ring or band without a device model, and an Apple Watch ranked below it."""
+        ring = DataSourceFactory(user=user, provider=top, source=top.value, device_model=None, device_type="ring")
+        watch = DataSourceFactory(
+            user=user,
+            provider=ProviderName.APPLE,
+            source="watch",
+            device_model="Watch7,1",
+            device_type="watch",
+        )
+        priority_service.update_provider_priority(db, top, 1)
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
+        return ring, watch
+
+    def test_steps_come_from_the_next_provider_when_the_top_one_has_only_heart_rate(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """A ring that synced heart rate but no daily activity record is not a day of zero steps."""
+        user = UserFactory()
+        ring, watch = self._ring_and_watch(db, user)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        for minute in range(2):
+            DataPointSeriesFactory(
+                data_source=ring,
+                series_type=hr_type,
+                value=130,
+                recorded_at=_dt("2026-01-01T09:00:00+00:00") + timedelta(minutes=minute),
+            )
+        for minute in range(3):
+            DataPointSeriesFactory(
+                data_source=watch,
+                series_type=steps_type,
+                value=1200,
+                recorded_at=_dt("2026-01-01T10:00:00+00:00") + timedelta(minutes=minute),
+            )
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        day = result.data[0]
+        assert day.steps == 3600
+        assert (day.source.provider, day.source.device) == ("apple", "Watch7,1")
+        assert day.heart_rate is not None
+        assert day.heart_rate.avg_bpm == 130
+        # The derived minutes follow the samples they are derived from: the step
+        # threshold runs over the watch, the heart-rate zones over the ring.
+        assert day.active_minutes == 3
+        assert day.intensity_minutes is not None
+        assert day.intensity_minutes.moderate == 2
+
+    def test_an_energy_only_provider_does_not_hide_steps(self, db: Session, service: SummariesService) -> None:
+        """Whoop stores a daily active energy and no steps; the steps still come from the next provider."""
+        user = UserFactory()
+        band, watch = self._ring_and_watch(db, user, top=ProviderName.WHOOP)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        energy_type = SeriesTypeDefinitionFactory.get_or_create_energy()
+        basal_type = SeriesTypeDefinitionFactory.get_or_create_basal_energy()
+        DataPointSeriesFactory(
+            data_source=band,
+            series_type=energy_type,
+            value=2500,
+            is_daily_total=True,
+            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
+        )
+        at = _dt("2026-01-01T10:00:00+00:00")
+        DataPointSeriesFactory(data_source=watch, series_type=steps_type, value=3600, recorded_at=at)
+        DataPointSeriesFactory(data_source=watch, series_type=energy_type, value=400, recorded_at=at)
+        DataPointSeriesFactory(data_source=watch, series_type=basal_type, value=1700, recorded_at=at)
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        day = result.data[0]
+        assert day.steps == 3600
+        assert day.source.provider == "apple"
+        # Energy comes whole from the band: its active energy is not topped up with the
+        # watch's basal energy.
+        assert day.active_calories_kcal == 2500
+        assert day.total_calories_kcal == 2500
+
+    def test_each_metric_comes_from_the_first_provider_that_holds_it(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """The top provider keeps the metrics it has; only the ones it lacks fall through."""
+        user = UserFactory()
+        ring, watch = self._ring_and_watch(db, user)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        flights_type = SeriesTypeDefinitionFactory.get_or_create_flights_climbed()
+        DataPointSeriesFactory(
+            data_source=ring,
+            series_type=steps_type,
+            value=2128,
+            is_daily_total=True,
+            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
+        )
+        at = _dt("2026-01-01T10:00:00+00:00")
+        DataPointSeriesFactory(data_source=watch, series_type=steps_type, value=3600, recorded_at=at)
+        DataPointSeriesFactory(data_source=watch, series_type=flights_type, value=12, recorded_at=at)
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        day = result.data[0]
+        assert (day.steps, day.source.provider) == (2128, "oura")
+        assert day.floors_climbed == 12
+
+    def test_a_day_without_steps_from_any_source_has_null_steps(self, db: Session, service: SummariesService) -> None:
+        """Heart rate alone is a day with no step count, not a day of zero steps and zero calories."""
+        user = UserFactory()
+        ring, _watch = self._ring_and_watch(db, user)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        DataPointSeriesFactory(
+            data_source=ring, series_type=hr_type, value=62, recorded_at=_dt("2026-01-01T09:00:00+00:00")
+        )
+
+        result = service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        day = result.data[0]
+        assert (day.steps, day.active_calories_kcal, day.total_calories_kcal) == (None, None, None)
+        assert day.heart_rate is not None
+        assert day.heart_rate.avg_bpm == 62
+
     def test_does_not_return_other_users_data(self, db: Session, service: SummariesService) -> None:
         user_a = UserFactory()
         user_b = UserFactory()
@@ -545,6 +694,24 @@ class TestActivityTotals:
         assert totals.days == len(days) == 3
         assert totals.steps == sum(day.steps or 0 for day in days) == 6000
         assert totals.avg_steps == 2000
+
+    def test_a_heart_rate_only_day_is_a_day_without_steps(self, db: Session, service: SummariesService) -> None:
+        """A day the ring only synced heart rate for counts as a day, but not as zero steps in the average."""
+        user = UserFactory()
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_model=None)
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        start = _dt("2026-01-01T00:00:00+00:00")
+        DataPointSeriesFactory(
+            data_source=ring, series_type=steps_type, value=4000, is_daily_total=True, recorded_at=start
+        )
+        DataPointSeriesFactory(
+            data_source=ring, series_type=hr_type, value=60, recorded_at=start + timedelta(days=1, hours=9)
+        )
+
+        totals = service.get_activity_totals(db, user.id, start, start + timedelta(days=7))
+
+        assert (totals.days, totals.steps, totals.avg_steps) == (2, 4000, 4000)
 
     def test_is_empty_without_data(self, db: Session, service: SummariesService) -> None:
         totals = service.get_activity_totals(
