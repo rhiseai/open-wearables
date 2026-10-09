@@ -629,6 +629,38 @@ class TestCreateOrMergeSleep:
         assert kw["efficiency_percent"] == 88.0
         assert kw["duration_seconds"] == int((self._dt(7, 0, day=22) - self._dt(22, 0)).total_seconds())
 
+    def test_replayed_apple_sleep_batch_keeps_whole_night(self, db: Session) -> None:
+        """A late HealthKit batch can inherit its sample ID as the merged night's ID."""
+        data_source = DataSourceFactory(source="Apple Watch")
+        early = self._record(data_source, self._dt(22), self._dt(2, day=22)).model_copy(
+            update={"external_id": "early-sample", "provider": ProviderName.APPLE}
+        )
+        late = self._record(data_source, self._dt(2, day=22), self._dt(6, day=22)).model_copy(
+            update={"external_id": "late-sample", "provider": ProviderName.APPLE}
+        )
+        early_stage = SleepStage(stage="light", start_time=early.start_datetime, end_time=early.end_datetime)
+        late_stage = SleepStage(stage="deep", start_time=late.start_datetime, end_time=late.end_datetime)
+        early_detail = self._detail(early.id, deep=0, light=240, rem=0, awake=0, in_bed=240).model_copy(
+            update={"sleep_stages": [early_stage]}
+        )
+        late_detail = self._detail(late.id, deep=240, light=0, rem=0, awake=0, in_bed=240).model_copy(
+            update={"sleep_stages": [late_stage]}
+        )
+
+        event_record_service.create_or_merge_sleep(db, data_source.user_id, early, early_detail, self.THRESHOLD)
+        merged = event_record_service.create_or_merge_sleep(db, data_source.user_id, late, late_detail, self.THRESHOLD)
+        assert merged.external_id == "late-sample"
+
+        replayed = event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, late, late_detail, self.THRESHOLD
+        )
+        db.refresh(replayed)
+        assert replayed.start_datetime == early.start_datetime
+        assert replayed.end_datetime == late.end_datetime
+        assert replayed.sleep_detail.sleep_total_duration_minutes == 480
+        assert replayed.sleep_detail.sleep_time_in_bed_minutes == 480
+        assert len(replayed.sleep_detail.sleep_stages) == 2
+
     def test_adjacent_within_threshold_is_merged(self, db: Session) -> None:
         """Sessions within threshold_minutes of each other are merged into one record."""
         user = UserFactory()
