@@ -29,14 +29,16 @@ How it works:
 
 The second list orders device types within a single provider: **Watch**, **Band**, **Ring**, **Phone**, **Scale**, **Other**, and **Unknown**. When the same provider delivers data from two devices, the higher-priority device type wins.
 
-Daily activity totals are the exception. Steps, active and basal energy, walking and running distance, and flights climbed in the daily activity summary also count hours the winning device missed:
+Daily activity summaries are the exception. Each metric of a day comes from the highest-priority provider that stored it on that day, so a ring that synced heart rate but no daily activity record keeps its heart rate while the steps come from the next provider, and a band that reports energy and no steps does not turn the day into zero steps. Active and basal energy are taken together from one provider, and so are the heart-rate statistics, so a day never adds one provider's active energy to another's basal energy. The summary's `source` is the provider that supplied the steps. A day that no provider counted steps for reports `steps: null`, not zero.
+
+Within the provider that supplies an additive metric (steps, active and basal energy, walking and running distance, flights climbed), the total also counts hours the winning device missed:
 
 - Each hour of the user's local day takes the larger sum from that provider's devices, so a walk recorded by both a watch and a phone is counted once.
 - The hourly values are added up for the day. Hours where only the phone recorded anything still count, so a watch worn for part of the day no longer hides the phone's steps for the rest of it.
 - A larger daily total reported by the provider itself is kept.
-- Data from different providers is never combined.
+- Samples from different providers are never added together.
 
-Heart rate, active minutes and the summary's source still come from the winning device only.
+Active minutes and intensity minutes follow the device whose steps or heart rate they are derived from.
 
 Reorder with the arrows and click **Save Changes**. The two lists are saved independently.
 

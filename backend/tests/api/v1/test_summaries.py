@@ -576,6 +576,12 @@ class TestActivitySummaryEndpoint:
         assert activity["heart_rate"]["avg_bpm"] == 98  # avg of 65, 120, 145, 90, 72 = 98.4 -> 98
         assert activity["heart_rate"]["max_bpm"] == 145
         assert activity["heart_rate"]["min_bpm"] == 65
+        # Heart rate alone is not a day of zero steps or zero calories.
+        assert (activity["steps"], activity["active_calories_kcal"], activity["total_calories_kcal"]) == (
+            None,
+            None,
+            None,
+        )
 
     def test_get_activity_summary_with_all_metrics(self, client: TestClient, db: Session) -> None:
         """Test activity summary with all available metrics."""
