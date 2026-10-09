@@ -1,5 +1,6 @@
 from app.services.providers.apple.coverage import (
     HEALTH_SCORES,
+    MEAL_FIELDS,
     MENSTRUAL_CYCLE_FIELDS,
     SLEEP_FIELDS,
     TIMESERIES,
@@ -40,5 +41,6 @@ class AppleStrategy(BaseProviderStrategy):
             workout_fields=WORKOUT_FIELDS,
             sleep_fields=SLEEP_FIELDS,
             menstrual_cycle_fields=MENSTRUAL_CYCLE_FIELDS,
+            meal_fields=MEAL_FIELDS,
             health_scores=HEALTH_SCORES,
         )

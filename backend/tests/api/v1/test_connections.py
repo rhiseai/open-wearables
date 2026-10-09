@@ -333,7 +333,7 @@ class TestDisconnectEndpoint:
             status=ConnectionStatus.ACTIVE,
             access_token="secret_access",
             refresh_token="secret_refresh",
-            token_expires_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            token_expires_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
         )
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.plain_key)

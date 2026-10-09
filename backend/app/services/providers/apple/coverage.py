@@ -58,5 +58,6 @@ MENSTRUAL_CYCLE_FIELDS: frozenset[str] = frozenset(
         "last_updated_at",
     }
 )
+MEAL_FIELDS: frozenset[str] = frozenset({"title", "meal_type", "nutrients"})
 
 HEALTH_SCORES: frozenset[HealthScoreCategory] = frozenset()

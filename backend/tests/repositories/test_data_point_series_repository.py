@@ -6,14 +6,19 @@ Tests cover:
 - get_samples with filtering by series type, device, date range
 - Aggregation methods (get_total_count, get_count_in_range, get_daily_histogram)
 - get_count_by_series_type and get_count_by_provider
+- Daily activity queries: local-date windows and the bounded recorded_at scan
 """
 
-from datetime import datetime, timedelta, timezone
+import itertools
+import re
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 from uuid import UUID, uuid4
 
+import psycopg
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from app.models import DataPointSeries, DataSource
@@ -710,6 +715,62 @@ class TestDataPointSeriesRepository:
         counts = series_repo.bulk_create(db, samples)
         assert counts.inserted == n
 
+    def test_bulk_create_merges_a_large_batch_in_chunks(
+        self, db: Session, series_repo: DataPointSeriesRepository, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A batch bigger than one chunk is merged by several statements and fully written.
+
+        statement_timeout applies per statement, so a 90-day Polar continuous heart-rate
+        backfill (about a million rows) has to be split; the counts still cover the batch.
+        """
+        monkeypatch.setattr(DataPointSeriesRepository, "_MERGE_CHUNK_ROWS", 3)
+        # (min, max) recorded_at staged for each merge statement, in execution order.
+        chunk_spans: list[tuple[datetime, datetime]] = []
+        original_execute = psycopg.Cursor.execute
+
+        def recording_execute(self: psycopg.Cursor, query: Any, *args: Any, **kwargs: Any) -> Any:
+            if "WITH merged AS" in str(query):
+                original_execute(self, "SELECT min(recorded_at), max(recorded_at) FROM data_point_series_staging")
+                chunk_spans.append(self.fetchone())
+            return original_execute(self, query, *args, **kwargs)
+
+        monkeypatch.setattr(psycopg.Cursor, "execute", recording_execute)
+
+        user = UserFactory()
+        base = datetime(2099, 1, 1)  # naive, as Polar's continuous heart rate arrives
+
+        def samples(value: int) -> list[TimeSeriesSampleCreate]:
+            # Newest first, so the batch has to be sorted before it is split.
+            return [
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    source="polar",
+                    recorded_at=base + timedelta(minutes=i),
+                    value=value + i,
+                    series_type=SeriesType.heart_rate,
+                )
+                for i in reversed(range(7))
+            ]
+
+        first = series_repo.bulk_create(db, samples(60))
+        assert (first.inserted, first.updated) == (7, 0)
+        # Three statements for seven rows, each chunk later than the one before.
+        assert len(chunk_spans) == 3
+        assert all(prev[1] < nxt[0] for prev, nxt in itertools.pairwise(chunk_spans))
+        stored = (
+            db.query(DataPointSeries.value)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user.id)
+            .order_by(DataPointSeries.recorded_at)
+            .all()
+        )
+        assert [row.value for row in stored] == [60 + i for i in range(7)]
+
+        second = series_repo.bulk_create(db, samples(70))
+        assert (second.inserted, second.updated) == (0, 7)
+        assert len(chunk_spans) == 6
+
     def test_bulk_create_skips_rewriting_unchanged_duplicates(
         self, db: Session, series_repo: DataPointSeriesRepository
     ) -> None:
@@ -902,3 +963,103 @@ class TestDataPointSeriesRepository:
         by_source = {r["source"]: r["steps_sum"] for r in result}
         assert by_source["garmin"] == 10000
         assert by_source["apple"] == 8000
+
+    # ------------------------------------------------------------------
+    # Daily activity queries — the recorded_at scan stops a day after end_date
+    # ------------------------------------------------------------------
+
+    _WINDOW_START = datetime(2026, 6, 20, tzinfo=timezone.utc)
+    _WINDOW_END = _WINDOW_START + timedelta(days=1)
+
+    def _daily_window_samples(self, user_id: UUID) -> list[TimeSeriesSampleCreate]:
+        """Steps and heart rate for local day 2026-06-20, plus a sample a month later.
+
+        The second pair is recorded 11 h after the window ends in UTC, but at -12:00 it is
+        23:00 on 2026-06-20 locally, so it belongs to the window.
+        """
+        recordings = [
+            (self._WINDOW_START + timedelta(hours=10), "+00:00", 100, 120),
+            (self._WINDOW_END + timedelta(hours=11), "-12:00", 40, 130),
+            (self._WINDOW_START + timedelta(days=30), "+00:00", 5000, 180),
+        ]
+        return [
+            TimeSeriesSampleCreate(
+                id=uuid4(),
+                user_id=user_id,
+                source="apple",
+                device_model="watch",
+                recorded_at=recorded_at,
+                zone_offset=zone_offset,
+                value=value,
+                series_type=series_type,
+                is_daily_total=False,
+            )
+            for recorded_at, zone_offset, steps, heart_rate in recordings
+            for series_type, value in ((SeriesType.steps, steps), (SeriesType.heart_rate, heart_rate))
+        ]
+
+    def _run_daily_query(
+        self, db: Session, series_repo: DataPointSeriesRepository, user_id: UUID, query: str
+    ) -> list[tuple[object, ...]]:
+        start, end = self._WINDOW_START, self._WINDOW_END
+        if query == "aggregates":
+            aggregates = series_repo.get_daily_activity_aggregates(db, user_id, start, end)
+            return [(r["activity_date"], r["steps_sum"], r["hr_min"], r["hr_max"]) for r in aggregates]
+        if query == "merged_sample_sums":
+            sums = series_repo.get_daily_merged_sample_sums(db, user_id, start, end, (SeriesType.steps,))
+            return [(activity_date, value) for (activity_date, _provider, _series_type), value in sums.items()]
+        if query == "active_minutes":
+            active = series_repo.get_daily_active_minutes(db, user_id, start, end, active_threshold=30)
+            return [(r["activity_date"], r["active_minutes"], r["tracked_minutes"]) for r in active]
+        intensity = series_repo.get_daily_intensity_minutes(
+            db, user_id, start, end, light_min=50, light_max=100, moderate_max=150, vigorous_max=200
+        )
+        return [
+            (r["activity_date"], r["light_minutes"], r["moderate_minutes"], r["vigorous_minutes"]) for r in intensity
+        ]
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("aggregates", [(date(2026, 6, 20), 140, 120, 130)]),
+            ("merged_sample_sums", [(date(2026, 6, 20), 140.0)]),
+            ("active_minutes", [(date(2026, 6, 20), 2, 2)]),
+            ("intensity_minutes", [(date(2026, 6, 20), 0, 2, 0)]),
+        ],
+    )
+    def test_daily_query_keeps_local_day_and_ignores_later_samples(
+        self, db: Session, series_repo: DataPointSeriesRepository, query: str, expected: list[tuple[object, ...]]
+    ) -> None:
+        """A sample whose local date is in the window counts even when its UTC time is past end_date;
+        a sample a month later does not count."""
+        user = UserFactory()
+        series_repo.bulk_create(db, self._daily_window_samples(user.id))
+        db.commit()
+
+        assert self._run_daily_query(db, series_repo, user.id, query) == expected
+
+    @pytest.mark.parametrize("query", ["aggregates", "merged_sample_sums", "active_minutes", "intensity_minutes"])
+    def test_daily_query_bounds_recorded_at_a_day_after_end_date(
+        self, db: Session, series_repo: DataPointSeriesRepository, query: str
+    ) -> None:
+        """The scan stops a day after end_date instead of reading every later sample."""
+        user = UserFactory()
+        db.flush()
+        statements: list[tuple[str, dict[str, object]]] = []
+
+        def capture(conn: object, cursor: object, statement: str, parameters: dict[str, object], *_: object) -> None:
+            if "data_point_series" in statement:
+                statements.append((statement, parameters))
+
+        engine = db.get_bind().engine
+        event.listen(engine, "before_cursor_execute", capture)
+        try:
+            self._run_daily_query(db, series_repo, user.id, query)
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+
+        assert len(statements) == 1
+        statement, parameters = statements[0]
+        upper_bound = re.search(r"data_point_series\.recorded_at < %\((\w+)\)s", statement)
+        assert upper_bound is not None
+        assert parameters[upper_bound.group(1)] == self._WINDOW_END + timedelta(days=1)

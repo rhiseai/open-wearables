@@ -49,6 +49,7 @@ from app.repositories.repositories import (
 from app.schemas.enums import (
     BUCKET_SIZES,
     AggregationMethod,
+    DeviceType,
     ProviderName,
     Resolution,
     SeriesType,
@@ -74,6 +75,7 @@ from app.utils.pagination import decode_bucket_cursor, decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+DailyMergedSampleSums = dict[tuple[date, ProviderName, SeriesType], float]
 
 
 class WriteCounts(int):
@@ -186,6 +188,7 @@ class DataPointSeriesRepository(
             "provider",
             "user_connection_id",
             "software_version",
+            "device_type",
             "series_type",
             "data_source_id",
         ):
@@ -205,7 +208,7 @@ class DataPointSeriesRepository(
 
         Optimized for performance:
         - Resolves data sources efficiently (batch fetch + batch insert missing)
-        - Inserts data points in a single batch
+        - Inserts data points with COPY + merge, one statement pair per chunk of rows
 
         Returns the number of rows actually written, split into inserted (new)
         vs updated (refreshed in place via ON CONFLICT).
@@ -234,12 +237,16 @@ class DataPointSeriesRepository(
 
         for provider, provider_creators in by_provider.items():
             unique_identities: set[DataSourceIdentity] = set()
+            reported_types: dict[DataSourceIdentity, DeviceType] = {}
             user_connection_id = provider_creators[0].user_connection_id if provider_creators else None
             for c in provider_creators:
-                unique_identities.add((c.user_id, c.device_model, c.source))
+                identity = (c.user_id, c.device_model, c.source)
+                unique_identities.add(identity)
+                if c.device_type:
+                    reported_types.setdefault(identity, c.device_type)
 
             batch_result = self.data_source_repo.batch_ensure_data_sources(
-                db_session, provider, user_connection_id, unique_identities
+                db_session, provider, user_connection_id, unique_identities, reported_types
             )
             identity_to_source_id.update(batch_result)
 
@@ -261,16 +268,25 @@ class DataPointSeriesRepository(
     # own field names above so the SQL text and the row shape can't drift apart.
     _COPY_COLUMNS_SQL = typing_cast(LiteralString, ", ".join(_StagingRow._fields))  # ty:ignore[redundant-cast]
 
+    # Rows per COPY + merge statement. statement_timeout applies to each statement, and a
+    # single sync can carry about a million rows (a 90-day Polar continuous heart-rate
+    # backfill), which as one merge statement ran past the 30 s limit in production.
+    _MERGE_CHUNK_ROWS = 20_000
+
     def _insert_data_points(
         self,
         db_session: DbSession,
         creators: list[TimeSeriesSampleCreate],
         source_map: dict[DataSourceIdentity, UUID],
     ) -> WriteCounts:
-        """Batch insert data points via COPY into a staging table + one merge statement.
+        """Batch insert data points via COPY into a staging table + a merge statement per chunk.
+
+        Rows go in chunks of ``_MERGE_CHUNK_ROWS`` so no single statement grows with the
+        batch. All chunks run in the caller's transaction, so the batch still commits or
+        rolls back as a whole.
 
         Returns the split of rows actually written (inserted vs updated). The split is
-        derived from ``RETURNING (xmax = 0)`` on the merge statement.
+        derived from ``RETURNING (xmax = 0)`` on each merge statement.
         """
         rows: list[DataPointSeriesRepository._StagingRow] = []
         for creator in creators:
@@ -296,14 +312,18 @@ class DataPointSeriesRepository(
             return WriteCounts(0, 0)
 
         # Dedup within the batch: PostgreSQL cannot upsert the same row twice in one
-        # statement. Keep the last value for each conflicting key.
+        # statement. Keep the last value for each conflicting key. Dedup runs before
+        # chunking, so one key never lands in two chunks.
         deduped: dict[tuple[UUID, int, datetime], DataPointSeriesRepository._StagingRow] = {}
         for row in rows:
             deduped[(row.data_source_id, row.series_type_definition_id, row.recorded_at)] = row
-        rows = list(deduped.values())
+        # Same order as the merge's ORDER BY, across the whole batch: every writer then
+        # takes row locks in one order even when its batch spans several chunks.
+        rows = [deduped[key] for key in sorted(deduped)]
 
         raw_conn: PGConnection | None = db_session.connection().connection.driver_connection
         assert raw_conn is not None, "no DBAPI connection on an active Session"
+        inserted = 0
         with raw_conn.cursor() as cursor:
             # Create the temporary staging table for bulk-importing data points.
             model_columns = DataPointSeries.__table__.c
@@ -316,38 +336,39 @@ class DataPointSeriesRepository(
             )
             staging_ddl = str(CreateTable(staging_table, if_not_exists=True).compile(dialect=postgresql.dialect()))
             cursor.execute(typing_cast(LiteralString, staging_ddl))
-            cursor.execute("TRUNCATE data_point_series_staging")
-            # Raw psycopg connection sharing this Session's transaction - COPY has no
-            # SQLAlchemy Core equivalent, and using a separate connection would commit
-            # outside this transaction.
-            with cursor.copy(f"COPY data_point_series_staging ({self._COPY_COLUMNS_SQL}) FROM STDIN") as copy:
-                for row in rows:
-                    copy.write_row(row)
+            for start in range(0, len(rows), self._MERGE_CHUNK_ROWS):
+                cursor.execute("TRUNCATE data_point_series_staging")
+                # Raw psycopg connection sharing this Session's transaction - COPY has no
+                # SQLAlchemy Core equivalent, and using a separate connection would commit
+                # outside this transaction.
+                with cursor.copy(f"COPY data_point_series_staging ({self._COPY_COLUMNS_SQL}) FROM STDIN") as copy:
+                    for row in rows[start : start + self._MERGE_CHUNK_ROWS]:
+                        copy.write_row(row)
 
-            cursor.execute(
-                f"""
-                    WITH merged AS (
-                        INSERT INTO data_point_series ({self._COPY_COLUMNS_SQL})
-                        SELECT {self._COPY_COLUMNS_SQL} FROM data_point_series_staging
-                        ORDER BY data_source_id, series_type_definition_id, recorded_at
-                        ON CONFLICT (data_source_id, series_type_definition_id, recorded_at)
-                        DO UPDATE SET
-                            external_id = excluded.external_id,
-                            value = excluded.value,
-                            zone_offset = excluded.zone_offset,
-                            is_daily_total = excluded.is_daily_total
-                        WHERE data_point_series.value IS DISTINCT FROM excluded.value
-                           OR data_point_series.external_id IS DISTINCT FROM excluded.external_id
-                           OR data_point_series.zone_offset IS DISTINCT FROM excluded.zone_offset
-                           OR data_point_series.is_daily_total IS DISTINCT FROM excluded.is_daily_total
-                        RETURNING (xmax = 0) AS was_insert
-                    )
-                    SELECT count(*) FILTER (WHERE was_insert) FROM merged
-                """
-            )
-            merge_result = cursor.fetchone()
-            assert merge_result is not None, "count(*) always returns exactly one row"
-            inserted = merge_result[0]
+                cursor.execute(
+                    f"""
+                        WITH merged AS (
+                            INSERT INTO data_point_series ({self._COPY_COLUMNS_SQL})
+                            SELECT {self._COPY_COLUMNS_SQL} FROM data_point_series_staging
+                            ORDER BY data_source_id, series_type_definition_id, recorded_at
+                            ON CONFLICT (data_source_id, series_type_definition_id, recorded_at)
+                            DO UPDATE SET
+                                external_id = excluded.external_id,
+                                value = excluded.value,
+                                zone_offset = excluded.zone_offset,
+                                is_daily_total = excluded.is_daily_total
+                            WHERE data_point_series.value IS DISTINCT FROM excluded.value
+                               OR data_point_series.external_id IS DISTINCT FROM excluded.external_id
+                               OR data_point_series.zone_offset IS DISTINCT FROM excluded.zone_offset
+                               OR data_point_series.is_daily_total IS DISTINCT FROM excluded.is_daily_total
+                            RETURNING (xmax = 0) AS was_insert
+                        )
+                        SELECT count(*) FILTER (WHERE was_insert) FROM merged
+                    """
+                )
+                merge_result = cursor.fetchone()
+                assert merge_result is not None, "count(*) always returns exactly one row"
+                inserted += merge_result[0]
         # One pass over rows already in memory, so the span costs no extra query. This is
         # the span of the data staged for the merge, which is what the sync covered.
         recorded = [row.recorded_at for row in rows if row.recorded_at is not None]
@@ -397,6 +418,7 @@ class DataPointSeriesRepository(
             device_model=creator.device_model,
             software_version=creator.software_version,
             source=creator.source,
+            reported_type=creator.device_type,
         )
 
     def get_samples(
@@ -790,8 +812,11 @@ class DataPointSeriesRepository(
             db_session.query(
                 DataSource.provider,
                 SeriesTypeDefinition.code,
-                func.count(self.model.id).label("count"),
+                # count(*), not count(id): id is not in the (source, type, time) index,
+                # so counting it read every row from the table instead of the index.
+                func.count().label("count"),
             )
+            .select_from(self.model)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .join(SeriesTypeDefinition, self.model.series_type_definition_id == SeriesTypeDefinition.id)
             .filter(DataSource.user_id == user_id)
@@ -803,7 +828,7 @@ class DataPointSeriesRepository(
 
         results = (
             query.group_by(DataSource.provider, SeriesTypeDefinition.code)
-            .order_by(DataSource.provider, func.count(self.model.id).desc())
+            .order_by(DataSource.provider, func.count().desc())
             .all()
         )
         return [(provider, code, count) for provider, code, count in results]
@@ -825,8 +850,10 @@ class DataPointSeriesRepository(
         bucket_start = utc_bucket_start(bucket, self.model.recorded_at)
         key_column = timeline_key_column(group_by)
 
-        query = db_session.query(key_column, bucket_start, func.count(self.model.id).label("count")).join(
-            DataSource, self.model.data_source_id == DataSource.id
+        query = (
+            db_session.query(key_column, bucket_start, func.count().label("count"))
+            .select_from(self.model)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
         )
         if group_by is TimelineGroupBy.SERIES_TYPE:
             query = query.join(SeriesTypeDefinition, self.model.series_type_definition_id == SeriesTypeDefinition.id)
@@ -906,6 +933,22 @@ class DataPointSeriesRepository(
 
         rows = db_session.execute(sql, params).fetchall()
         return {UUID(str(record_id)): int(avg) for record_id, avg in rows}
+
+    def _local_day_window(
+        self, local_date: ColumnElement, start_date: datetime, end_date: datetime
+    ) -> list[ColumnElement[bool]]:
+        """Samples whose local date falls in [start, end).
+
+        Bounded on `recorded_at` as well, a day wider each side to cover any offset:
+        the local date is an expression no index can use, so without it a window
+        scanned from its start to the newest sample.
+        """
+        return [
+            self.model.recorded_at >= start_date - timedelta(days=1),
+            self.model.recorded_at < end_date + timedelta(days=1),
+            local_date >= cast(start_date, Date),
+            local_date < cast(end_date, Date),
+        ]
 
     def get_daily_activity_aggregates(
         self,
@@ -1000,9 +1043,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id.in_(
                     [steps_id, energy_id, basal_energy_id, hr_id, distance_id, flights_id, active_time_id]
                 ),
@@ -1042,6 +1083,103 @@ class DataPointSeriesRepository(
                 }
             )
         return aggregates
+
+    def get_daily_merged_sample_sums(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        series_types: tuple[SeriesType, ...],
+    ) -> DailyMergedSampleSums:
+        """Merge additive samples across devices without double-counting overlap.
+
+        Each device is summed independently within a local-hour bucket. The
+        provider contributes only the largest device sum for that hour, then
+        those hourly values are summed for the local day. Daily-total rows are
+        excluded because they have no meaningful hourly placement; callers can
+        retain a larger provider-reported daily total when applying this result.
+        """
+        if not series_types:
+            return {}
+
+        series_type_ids = tuple(get_series_type_id(series_type) for series_type in series_types)
+        local_timestamp = self.model.recorded_at + cast(
+            func.coalesce(self.model.zone_offset, "+00:00"),
+            Interval,
+        )
+        local_date = cast(local_timestamp, Date)
+        local_hour = func.date_trunc(literal_column("'hour'"), local_timestamp)
+
+        device_hourly = (
+            select(
+                local_date.label("activity_date"),
+                local_hour.label("activity_hour"),
+                DataSource.provider.label("provider"),
+                self.model.series_type_definition_id.label("series_type_id"),
+                self.model.data_source_id.label("data_source_id"),
+                func.sum(self.model.value).label("sample_sum"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .where(
+                DataSource.user_id == user_id,
+                # zone_offset shifts a local date by less than a day, so these UTC bounds keep
+                # every sample of the local-date window and let the index scan stop at its end.
+                self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at < end_date + timedelta(days=1),
+                local_date >= cast(start_date, Date),
+                local_date < cast(end_date, Date),
+                self.model.series_type_definition_id.in_(series_type_ids),
+                self.model.is_daily_total.isnot(True),
+            )
+            .group_by(
+                local_date,
+                local_hour,
+                DataSource.provider,
+                self.model.series_type_definition_id,
+                self.model.data_source_id,
+            )
+            .subquery()
+        )
+
+        provider_hourly = (
+            select(
+                device_hourly.c.activity_date,
+                device_hourly.c.activity_hour,
+                device_hourly.c.provider,
+                device_hourly.c.series_type_id,
+                func.max(device_hourly.c.sample_sum).label("sample_sum"),
+            )
+            .group_by(
+                device_hourly.c.activity_date,
+                device_hourly.c.activity_hour,
+                device_hourly.c.provider,
+                device_hourly.c.series_type_id,
+            )
+            .subquery()
+        )
+
+        daily = (
+            select(
+                provider_hourly.c.activity_date,
+                provider_hourly.c.provider,
+                provider_hourly.c.series_type_id,
+                func.sum(provider_hourly.c.sample_sum).label("sample_sum"),
+            )
+            .group_by(
+                provider_hourly.c.activity_date,
+                provider_hourly.c.provider,
+                provider_hourly.c.series_type_id,
+            )
+            .order_by(asc(provider_hourly.c.activity_date))
+        )
+
+        return {
+            (row.activity_date, ProviderName(row.provider), get_series_type_from_id(row.series_type_id)): float(
+                row.sample_sum
+            )
+            for row in db_session.execute(daily)
+        }
 
     def get_daily_active_minutes(
         self,
@@ -1087,9 +1225,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id == steps_id,
                 self.model.is_daily_total.isnot(True),
             )
@@ -1190,9 +1326,7 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
-                local_date >= cast(start_date, Date),
-                local_date < cast(end_date, Date),
+                *self._local_day_window(local_date, start_date, end_date),
                 self.model.series_type_definition_id == hr_id,
             )
             .group_by(

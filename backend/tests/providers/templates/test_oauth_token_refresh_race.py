@@ -26,7 +26,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.credentials import OAuthTokenResponse
-from app.services.providers.api_client import _get_valid_token
+from app.services.providers.api_client import get_valid_token
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.whoop.oauth import WhoopOAuth
 from tests.factories import UserConnectionFactory, UserFactory
@@ -190,7 +190,7 @@ class TestRefreshTokenRotationGuard:
 
 
 class TestGetValidTokenLocking:
-    """Test suite for the refresh lock in api_client._get_valid_token."""
+    """Test suite for the refresh lock in api_client.get_valid_token."""
 
     @pytest.fixture
     def connection_repo(self) -> UserConnectionRepository:
@@ -232,7 +232,7 @@ class TestGetValidTokenLocking:
 
         # Act
         with patch("app.services.providers.api_client.get_redis_client", return_value=redis_client):
-            access_token = _get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
+            access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
 
         # Assert
         assert access_token == "winner_access_token"
@@ -263,7 +263,7 @@ class TestGetValidTokenLocking:
 
         # Act
         with patch("app.services.providers.api_client.get_redis_client", return_value=redis_client):
-            access_token = _get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
+            access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
 
         # Assert
         assert access_token == "new_access_token"
@@ -295,7 +295,7 @@ class TestGetValidTokenLocking:
             "app.services.providers.api_client.get_redis_client",
             side_effect=RedisError("connection refused"),
         ):
-            access_token = _get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
+            access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
 
         # Assert
         assert access_token == "new_access_token"
@@ -319,7 +319,7 @@ class TestGetValidTokenLocking:
 
         # Act
         with patch("app.services.providers.api_client.get_redis_client", return_value=redis_client):
-            access_token = _get_valid_token(db, connection.user_id, "whoop", connection_repo, oauth)
+            access_token = get_valid_token(db, connection.user_id, "whoop", connection_repo, oauth)
 
         # Assert
         assert access_token == "valid_access_token"
