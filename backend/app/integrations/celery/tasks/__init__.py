@@ -11,6 +11,7 @@ from app.services.providers.garmin.backfill_state import (
 from .archival_task import run_daily_archival
 from .close_stale_sync_runs_task import close_stale_sync_runs
 from .emit_webhook_event_task import emit_webhook_event
+from .extension_events_task import dispatch_extension_events
 from .fill_missing_resilience_scores_task import fill_missing_resilience_scores
 from .fill_missing_sleep_scores_task import fill_missing_sleep_scores
 from .finalize_stale_sleep_task import finalize_stale_sleeps
@@ -36,6 +37,7 @@ from .renew_oura_webhooks_task import renew_oura_webhooks
 from .seed_data_task import generate_seed_data
 from .send_email_task import send_invitation_email_task
 from .sync_vendor_data_task import sync_vendor_data
+from .telemetry_task import send_telemetry_ping
 from .webhook_push_task import process_webhook_push
 from .withings.notify_sync_task import sync_user_subscriptions as sync_withings_user_subscriptions
 
@@ -57,6 +59,7 @@ __all__ = [
     # Resilience score calculation
     "fill_missing_resilience_scores",
     # Other tasks
+    "dispatch_extension_events",
     "close_stale_sync_runs",
     "finalize_stale_sleeps",
     "process_sdk_upload",
@@ -71,6 +74,7 @@ __all__ = [
     "reconcile_provider_webhooks",
     "sync_withings_user_subscriptions",
     "renew_oura_webhooks",
+    "send_telemetry_ping",
     # Outgoing webhooks
     "emit_webhook_event",
 ]

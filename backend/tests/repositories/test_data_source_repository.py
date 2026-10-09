@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.models import DataSource, ProviderPriority, User
 from app.repositories.data_source_repository import DataSourceRepository
-from app.schemas.enums import ProviderName
+from app.schemas.enums import DeviceType, ProviderName
 from tests.factories import UserFactory
 
 # Realistic Apple HealthKit source bundle id: "com.apple.health." + a UUID.
@@ -117,3 +117,56 @@ class TestDataSourceRepository:
                 if not provider_priority_existed:
                     session.query(ProviderPriority).filter(ProviderPriority.provider == ProviderName.APPLE).delete()
                 session.commit()
+
+    def test_sdk_device_type_upgrades_from_other_but_never_flips(self, db: Session) -> None:
+        user = UserFactory()
+        repo = DataSourceRepository(DataSource)
+        identity = {
+            "user_id": user.id,
+            "provider": ProviderName.SAMSUNG,
+            "device_model": "unlisted-model",
+            "source": "tab",
+        }
+        created = repo.ensure_data_source(db, **identity)
+        assert created.device_type == DeviceType.OTHER
+
+        repo.ensure_data_source(db, **identity, reported_type=DeviceType.WATCH)
+        assert repo.get_by_identity(db, **identity).device_type == DeviceType.WATCH
+
+        repo.batch_ensure_data_sources(
+            db,
+            ProviderName.SAMSUNG,
+            None,
+            {(user.id, "unlisted-model", "tab")},
+            {(user.id, "unlisted-model", "tab"): DeviceType.BAND},
+        )
+        assert repo.get_by_identity(db, **identity).device_type == DeviceType.WATCH
+
+    def test_cloud_device_type_is_corrected_on_sync(self, db: Session) -> None:
+        user = UserFactory()
+        repo = DataSourceRepository(DataSource)
+        identity = {
+            "user_id": user.id,
+            "provider": ProviderName.GARMIN,
+            "device_model": "Garmin Index BPM",
+            "source": "garmin",
+        }
+        stored = repo.ensure_data_source(db, **identity)
+        object.__setattr__(stored, "device_type", DeviceType.SCALE.value)
+        db.flush()
+
+        repo.ensure_data_source(db, **identity)
+        assert repo.get_by_identity(db, **identity).device_type == DeviceType.BP_MONITOR
+
+    def test_batch_upgrades_unset_device_type(self, db: Session) -> None:
+        user = UserFactory()
+        repo = DataSourceRepository(DataSource)
+        identity = (user.id, None, "com.fitbit.FitbitMobile")
+        repo.batch_ensure_data_sources(db, ProviderName.HEALTH_CONNECT, None, {identity})
+        ds = repo.get_by_identity(db, user.id, ProviderName.HEALTH_CONNECT, None, "com.fitbit.FitbitMobile")
+        assert ds.device_type is None
+
+        repo.batch_ensure_data_sources(db, ProviderName.HEALTH_CONNECT, None, {identity}, {identity: DeviceType.BAND})
+        db.expire_all()
+        ds = repo.get_by_identity(db, user.id, ProviderName.HEALTH_CONNECT, None, "com.fitbit.FitbitMobile")
+        assert ds.device_type == DeviceType.BAND

@@ -190,6 +190,45 @@ class SeriesType(str, Enum):
     withings_pulse_wave_velocity = "withings_pulse_wave_velocity"
     withings_metabolic_age = "withings_metabolic_age"
 
+    # -------------------------------------------------------------------------
+    # ADDITIONAL NUTRITION (IDs 320-359)
+    # -------------------------------------------------------------------------
+    dietary_fat_saturated = "dietary_fat_saturated"
+    dietary_fat_monounsaturated = "dietary_fat_monounsaturated"
+    dietary_fat_polyunsaturated = "dietary_fat_polyunsaturated"
+    dietary_cholesterol = "dietary_cholesterol"
+    dietary_sodium = "dietary_sodium"
+    dietary_potassium = "dietary_potassium"
+    dietary_calcium = "dietary_calcium"
+    dietary_iron = "dietary_iron"
+    dietary_magnesium = "dietary_magnesium"
+    dietary_phosphorus = "dietary_phosphorus"
+    dietary_zinc = "dietary_zinc"
+    dietary_copper = "dietary_copper"
+    dietary_manganese = "dietary_manganese"
+    dietary_selenium = "dietary_selenium"
+    dietary_chromium = "dietary_chromium"
+    dietary_molybdenum = "dietary_molybdenum"
+    dietary_iodine = "dietary_iodine"
+    dietary_chloride = "dietary_chloride"
+    dietary_vitamin_a = "dietary_vitamin_a"
+    dietary_vitamin_b6 = "dietary_vitamin_b6"
+    dietary_vitamin_b12 = "dietary_vitamin_b12"
+    dietary_vitamin_c = "dietary_vitamin_c"
+    dietary_vitamin_d = "dietary_vitamin_d"
+    dietary_vitamin_e = "dietary_vitamin_e"
+    dietary_vitamin_k = "dietary_vitamin_k"
+    dietary_thiamin = "dietary_thiamin"
+    dietary_riboflavin = "dietary_riboflavin"
+    dietary_niacin = "dietary_niacin"
+    dietary_folate = "dietary_folate"
+    dietary_pantothenic_acid = "dietary_pantothenic_acid"
+    dietary_biotin = "dietary_biotin"
+    dietary_fat_trans = "dietary_fat_trans"
+    dietary_energy_from_fat = "dietary_energy_from_fat"
+    dietary_fat_unsaturated = "dietary_fat_unsaturated"
+    dietary_folic_acid = "dietary_folic_acid"
+
     # =========================================================================
     # OTHER (IDs 500-)
     # =========================================================================
@@ -367,6 +406,44 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (300, SeriesType.withings_pulse_wave_velocity, "m_per_s"),
     (301, SeriesType.withings_metabolic_age, "years"),
     # -------------------------------------------------------------------------
+    # ADDITIONAL NUTRITION (IDs 320-359)
+    # -------------------------------------------------------------------------
+    (320, SeriesType.dietary_fat_saturated, "g"),
+    (321, SeriesType.dietary_fat_monounsaturated, "g"),
+    (322, SeriesType.dietary_fat_polyunsaturated, "g"),
+    (323, SeriesType.dietary_cholesterol, "mg"),
+    (324, SeriesType.dietary_sodium, "mg"),
+    (325, SeriesType.dietary_potassium, "mg"),
+    (326, SeriesType.dietary_calcium, "mg"),
+    (327, SeriesType.dietary_iron, "mg"),
+    (328, SeriesType.dietary_magnesium, "mg"),
+    (329, SeriesType.dietary_phosphorus, "mg"),
+    (330, SeriesType.dietary_zinc, "mg"),
+    (331, SeriesType.dietary_copper, "mg"),
+    (332, SeriesType.dietary_manganese, "mg"),
+    (333, SeriesType.dietary_selenium, "mcg"),
+    (334, SeriesType.dietary_chromium, "mcg"),
+    (335, SeriesType.dietary_molybdenum, "mcg"),
+    (336, SeriesType.dietary_iodine, "mcg"),
+    (337, SeriesType.dietary_chloride, "mg"),
+    (338, SeriesType.dietary_vitamin_a, "mcg"),
+    (339, SeriesType.dietary_vitamin_b6, "mg"),
+    (340, SeriesType.dietary_vitamin_b12, "mcg"),
+    (341, SeriesType.dietary_vitamin_c, "mg"),
+    (342, SeriesType.dietary_vitamin_d, "mcg"),
+    (343, SeriesType.dietary_vitamin_e, "mg"),
+    (344, SeriesType.dietary_vitamin_k, "mcg"),
+    (345, SeriesType.dietary_thiamin, "mg"),
+    (346, SeriesType.dietary_riboflavin, "mg"),
+    (347, SeriesType.dietary_niacin, "mg"),
+    (348, SeriesType.dietary_folate, "mcg"),
+    (349, SeriesType.dietary_pantothenic_acid, "mg"),
+    (350, SeriesType.dietary_biotin, "mcg"),
+    (351, SeriesType.dietary_fat_trans, "g"),
+    (352, SeriesType.dietary_energy_from_fat, "kcal"),
+    (353, SeriesType.dietary_fat_unsaturated, "g"),
+    (354, SeriesType.dietary_folic_acid, "mcg"),
+    # -------------------------------------------------------------------------
     # OTHER (IDs 500-)
     # -------------------------------------------------------------------------
     (500, SeriesType.electrodermal_activity, "count"),
@@ -436,6 +513,7 @@ _CATEGORY_RANGES: list[tuple[range, str]] = [
     (range(260, 280), "Reproductive Health"),
     (range(280, 300), "Mindfulness"),
     (range(300, 320), "Provider-Specific"),
+    (range(320, 360), "Nutrition"),
     (range(500, 600), "Other"),
 ]
 
@@ -449,4 +527,3 @@ for _type_id, _enum, _ in SERIES_TYPE_DEFINITIONS:
 
 # =============================================================================
 # AGGREGATION METHOD DEFINITIONS
-# =============================================================================
