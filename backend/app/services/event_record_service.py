@@ -30,7 +30,7 @@ from app.repositories import (
     EventRecordRepository,
     HealthScoreRepository,
 )
-from app.schemas.enums import HealthScoreCategory, SeriesType, get_series_type_unit
+from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_unit
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -463,7 +463,14 @@ class EventRecordService(
             # Same external_id → re-ingestion of the same session (e.g. webhook
             # retry, score update).  Replace the detail with fresh values instead
             # of accumulating them on top of the existing ones.
-            if record.external_id is not None and adjacent.external_id == record.external_id:
+            same_external_id = record.external_id is not None and adjacent.external_id == record.external_id
+            # Apple SDK session IDs come from the first HealthKit sample in a batch.
+            # Once a later batch has been merged into a night, re-uploading that
+            # batch must not replace the whole night with its smaller window.
+            partial_apple_batch = record.provider == ProviderName.APPLE and (
+                record.start_datetime > adjacent.start_datetime or record.end_datetime < adjacent.end_datetime
+            )
+            if same_external_id and not partial_apple_batch:
                 old_start, old_zone = adjacent.start_datetime, adjacent.zone_offset
                 for field in ("start_datetime", "end_datetime", "zone_offset"):
                     new_val = getattr(record, field, None)
@@ -496,7 +503,12 @@ class EventRecordService(
 
             adj_in_bed = _adj_int("sleep_time_in_bed_minutes")
             new_in_bed = detail.sleep_time_in_bed_minutes or 0
-            merged_in_bed = adj_in_bed + new_in_bed
+            incoming_contained = (
+                record.start_datetime >= adjacent.start_datetime and record.end_datetime <= adjacent.end_datetime
+            )
+            merged_in_bed = (
+                max(adj_in_bed, new_in_bed) if partial_apple_batch and incoming_contained else adj_in_bed + new_in_bed
+            )
 
             # Weighted efficiency: only include sessions that have a non-None score
             # so a missing score on one session does not dilute the merged average.
@@ -519,6 +531,8 @@ class EventRecordService(
             merged_stages: list[SleepStage] | None = None
             if adj_stages or new_stages:
                 merged_stages = sorted(adj_stages + new_stages, key=lambda s: s.start_time)
+                if partial_apple_batch:
+                    merged_stages = list({(s.stage, s.start_time, s.end_time): s for s in merged_stages}.values())
 
             merged_start = min(adjacent.start_datetime, record.start_datetime)
             merged_end = max(adjacent.end_datetime, record.end_datetime)
