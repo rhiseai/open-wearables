@@ -2,7 +2,7 @@ import json
 import uuid
 from logging import getLogger
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 
 from app.config import settings
 from app.constants.sdk_providers import normalize_sdk_provider, sdk_providers
@@ -13,6 +13,7 @@ from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payloa
 from app.services.sdk_sync_state import is_historical_sync_active, sdk_payload_exceeds_realtime_limit
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
+from app.utils.sdk_request_metadata import sdk_request_metadata
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
@@ -35,6 +36,7 @@ def sync_sdk_data(
     user_id: str,
     body: dict,
     auth: SDKAuthDep,
+    request: Request,
 ) -> UploadDataResponse:
     """Import health data from SDK provider asynchronously via Celery.
 
@@ -113,6 +115,7 @@ def sync_sdk_data(
         workouts_count=workouts_count,
         sleep_count=sleep_count,
         total_items=total_items,
+        **sdk_request_metadata(request.headers, body.get("sdkVersion")),
     )
 
     content_str = json.dumps(body)
