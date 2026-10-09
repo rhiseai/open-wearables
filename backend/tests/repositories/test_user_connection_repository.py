@@ -9,15 +9,19 @@ Tests cover:
 - Token expiration queries (get_expiring_tokens)
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from threading import Barrier
+from typing import Any
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import UserConnection
+from app.models import User, UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import SdkConnectionOutcome
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from tests.factories import UserConnectionFactory, UserFactory
 
@@ -716,3 +720,59 @@ class TestProviderAdoption:
 
         # Assert
         assert providers.index("oura") < providers.index("suunto")
+
+
+class TestEnsureSdkConnectionRace:
+    """Two SDK batches of a user without a connection resolve one connection.
+
+    The first batches of a new Apple Health user are processed in parallel. Both see no
+    connection and both create one; the slower one used to hit the unique index on
+    ``(user_id, provider)`` and its batch was never imported.
+    """
+
+    def test_parallel_batches_share_one_connection(self, session_factory: Any) -> None:
+        user_id = uuid4()
+        both_looked_up = Barrier(2, timeout=10)
+
+        with session_factory() as session:
+            session.add(User(id=user_id, email=f"{user_id}@example.com"))
+            session.commit()
+
+        def ensure_connection() -> tuple[UUID, SdkConnectionOutcome]:
+            with session_factory() as session:
+                repo = UserConnectionRepository(UserConnection)
+                get_by_user_and_provider = repo.get_by_user_and_provider
+                first_lookup = True
+
+                def synchronized_lookup(*args: Any, **kwargs: Any) -> UserConnection | None:
+                    nonlocal first_lookup
+                    result = get_by_user_and_provider(*args, **kwargs)
+                    if first_lookup:
+                        first_lookup = False
+                        assert result is None
+                        both_looked_up.wait()
+                    return result
+
+                repo.get_by_user_and_provider = synchronized_lookup  # type: ignore[method-assign]
+                connection, outcome = repo.ensure_sdk_connection(session, user_id, "apple")
+                return connection.id, outcome
+
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda _: ensure_connection(), range(2)))
+
+            assert results[0][0] == results[1][0]
+            # Only the batch that created the row reports it, so connection.created fires once.
+            assert sorted(outcome for _id, outcome in results) == [
+                SdkConnectionOutcome.CREATED,
+                SdkConnectionOutcome.EXISTING,
+            ]
+            with session_factory() as session:
+                stored = session.query(UserConnection).filter(UserConnection.user_id == user_id).all()
+                assert len(stored) == 1
+                assert stored[0].status == ConnectionStatus.ACTIVE
+        finally:
+            with session_factory() as session:
+                session.query(UserConnection).filter(UserConnection.user_id == user_id).delete()
+                session.query(User).filter(User.id == user_id).delete()
+                session.commit()
