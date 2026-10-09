@@ -40,6 +40,7 @@ class WebhookEventType(StrEnum):
     WORKOUT_CREATED = "workout.created"
     SLEEP_CREATED = "sleep.created"
     SLEEP_UPDATED = "sleep.updated"
+    MEAL_CREATED = "meal.created"
     MENSTRUAL_CYCLE_CREATED = "menstrual_cycle.created"
 
     # -------------------------------------------------------------------------
@@ -210,6 +211,7 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
         "session early and then finalize duration/stages/score against the same id; this "
         "event carries the refreshed payload so consumers move off the initial partial reading."
     ),
+    WebhookEventType.MEAL_CREATED: "A new meal or nutrition-log entry was saved.",
     WebhookEventType.MENSTRUAL_CYCLE_CREATED: "A new menstrual cycle record was saved.",
     # Group events
     WebhookEventType.HEART_RATE_CREATED: "Any heart-rate samples (all HR variants) were ingested.",

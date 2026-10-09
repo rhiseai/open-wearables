@@ -88,7 +88,7 @@ def _token_refresh_lock(user_id: UUID, provider_name: str) -> Iterator[None]:
                 logger.warning("Failed to release token refresh lock for %s/%s", user_id, provider_name)
 
 
-def _get_valid_token(
+def get_valid_token(
     db: DbSession,
     user_id: UUID,
     provider_name: str,
@@ -97,7 +97,8 @@ def _get_valid_token(
 ) -> str:
     """Get a valid access token, refreshing if necessary.
 
-    Private function used internally by make_authenticated_request.
+    Used by make_authenticated_request and by calls that send the token outside
+    of it, e.g. provider deregistration.
     """
     connection = connection_repo.get_by_user_and_provider(db, user_id, provider_name)
     if not connection:
@@ -160,6 +161,7 @@ def make_authenticated_request(
     json_data: dict[str, Any] | None = None,
     expect_json: bool = True,
     http2: bool = False,
+    check_body_errors: bool = True,
 ) -> Any:
     """Make authenticated request to provider API.
 
@@ -184,6 +186,9 @@ def make_authenticated_request(
         http2: Enable HTTP/2 for this request (default False). Requires the h2
             package (installed via httpx[http2]).  Use for providers that require
             HTTP/2, e.g. Sensor Bio.  Other providers are unaffected.
+        check_body_errors: Raise when a 200 body carries an ``error`` or a non-200 ``code``
+            (default True). Set to False for providers whose envelope carries its own
+            status, e.g. Withings, so the caller can tell a throttle from a failure.
 
     Returns:
         Any: API response JSON, or dict with status_code if expect_json=False
@@ -195,7 +200,7 @@ def make_authenticated_request(
         raise ValueError("form_data and json_data are mutually exclusive")
 
     # Get valid token (will auto-refresh if needed)
-    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+    access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
 
     # Prepare headers
     request_headers = {
@@ -262,7 +267,7 @@ def make_authenticated_request(
             result = response.json()
 
             # Some APIs (like Suunto) return 200 OK but include error in response body
-            if isinstance(result, dict):
+            if check_body_errors and isinstance(result, dict):
                 # Check for common error patterns
                 # Only treat as error if "error" field has a value (not None/null)
                 has_error = result.get("error") is not None and result.get("error")
@@ -355,7 +360,7 @@ def download_binary_content(
     The URL may contain additional auth params (e.g. token=...) alongside the Bearer header.
     Retries up to MAX_RETRIES times on 429 with exponential backoff.
     """
-    access_token = _get_valid_token(db, user_id, provider_name, connection_repo, oauth)
+    access_token = get_valid_token(db, user_id, provider_name, connection_repo, oauth)
     headers = {"Authorization": f"Bearer {access_token}"}
 
     for attempt in range(MAX_RETRIES + 1):

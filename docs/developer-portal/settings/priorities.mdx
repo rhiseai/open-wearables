@@ -29,6 +29,15 @@ How it works:
 
 The second list orders device types within a single provider: **Watch**, **Band**, **Ring**, **Phone**, **Scale**, **Other**, and **Unknown**. When the same provider delivers data from two devices, the higher-priority device type wins.
 
+Daily activity totals are the exception. Steps, active and basal energy, walking and running distance, and flights climbed in the daily activity summary also count hours the winning device missed:
+
+- Each hour of the user's local day takes the larger sum from that provider's devices, so a walk recorded by both a watch and a phone is counted once.
+- The hourly values are added up for the day. Hours where only the phone recorded anything still count, so a watch worn for part of the day no longer hides the phone's steps for the rest of it.
+- A larger daily total reported by the provider itself is kept.
+- Data from different providers is never combined.
+
+Heart rate, active minutes and the summary's source still come from the winning device only.
+
 Reorder with the arrows and click **Save Changes**. The two lists are saved independently.
 
 See [Multi-account sync](/architecture/multi-account-sync) for how data from several connected accounts is merged.
