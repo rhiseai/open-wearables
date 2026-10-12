@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
 from app.schemas.webhooks.event_types import EVENT_TYPE_DESCRIPTIONS, WebhookEventType
 from app.services.outgoing_webhooks import svix as svix_service
@@ -63,7 +64,11 @@ class TestWebhookEmit:
     @pytest.fixture(autouse=True)
     def _webhooks_enabled(self) -> Generator[None, None, None]:
         # Dispatch only fires when webhooks are enabled; these tests assert it does.
-        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+        # Subscription gating has its own tests, so timeseries events are always on here.
+        with (
+            patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True),
+            patch.object(settings, "outgoing_webhooks_timeseries_events", "all"),
+        ):
             yield
 
     @patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event")

@@ -193,16 +193,17 @@ services:
     # succeeds once they have registered with the broker, so it is a true
     # readiness signal for zero-downtime rolling restarts.
     #
-    # ``worker.sh`` starts two named nodes, io@%h and cpu@%h, so there is no
-    # ``celery@%h`` to ping any more — the default name disappeared the moment
-    # the script passed ``-n``. Both must answer: a container running only the
-    # I/O half is not ready, and counting pongs is what distinguishes that from
-    # "something answered", since ``inspect ping`` succeeds on a partial reply.
+    # ``worker.sh`` starts three named nodes, io@%h, webhook@%h and cpu@%h, so
+    # there is no ``celery@%h`` to ping any more — the default name disappeared
+    # the moment the script passed ``-n``. All must answer: a container running
+    # only part of them is not ready, and counting pongs is what distinguishes
+    # that from "something answered", since ``inspect ping`` succeeds on a
+    # partial reply.
     healthcheck:
       test:
         [
           "CMD-SHELL",
-          "uv run celery -A app.main:celery_app inspect ping -d io@$$HOSTNAME,cpu@$$HOSTNAME 2>/dev/null | grep -c pong | grep -qx 2",
+          "uv run celery -A app.main:celery_app inspect ping -d io@$$HOSTNAME,webhook@$$HOSTNAME,cpu@$$HOSTNAME 2>/dev/null | grep -c pong | grep -qx 3",
         ]
       interval: 15s
       timeout: 10s

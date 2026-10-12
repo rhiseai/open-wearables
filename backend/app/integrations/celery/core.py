@@ -12,6 +12,7 @@ from app.config import settings
 from app.extensions import collect_beat_schedule, collect_event_handlers, events, get_active_extensions
 from app.integrations.otel import init_otel, shutdown_otel
 from app.services import raw_payload_storage
+from app.services.outgoing_webhooks.routing import WEBHOOK_BULK_QUEUE, WEBHOOK_PRIORITY_QUEUE, route_webhook_task
 from app.utils.config_utils import LogFormat
 from app.utils.logging_setup import configure_logging
 
@@ -76,7 +77,7 @@ _worker_service_name = "open-wearables-worker"
 
 
 def _worker_service_name_for(hostname: str | None) -> str:
-    # scripts/start/worker.sh names its workers io@%h and cpu@%h.
+    # scripts/start/worker.sh names its workers io@%h, webhook@%h and cpu@%h.
     prefix = (hostname or "").split("@", 1)[0]
     return f"open-wearables-worker-{prefix}" if prefix and prefix != "celery" else "open-wearables-worker"
 
@@ -194,18 +195,26 @@ def create_celery() -> Celery:
             "sdk_sync": {},
             "garmin_sync": {},
             "webhook_sync": {},
-            "webhook_outgoing": {},
+            WEBHOOK_PRIORITY_QUEUE: {},
+            WEBHOOK_BULK_QUEUE: {},
             "xml_sync": {},
         },
-        task_routes={
-            "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
-            "app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event": {"queue": "webhook_outgoing"},
-            "app.integrations.celery.tasks.process_aws_upload_task.process_aws_upload": {"queue": "xml_sync"},
-            "app.integrations.celery.tasks.process_aws_upload_task.complete_and_process_aws_upload": {
-                "queue": "xml_sync"
+        task_routes=(
+            # emit_webhook_event: webhook_priority or webhook_outgoing, picked per event type.
+            route_webhook_task,
+            {
+                "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
+                "app.integrations.celery.tasks.process_aws_upload_task.process_aws_upload": {"queue": "xml_sync"},
+                "app.integrations.celery.tasks.process_aws_upload_task.complete_and_process_aws_upload": {
+                    "queue": "xml_sync"
+                },
+                "app.integrations.celery.tasks.process_xml_upload_task.process_xml_upload": {"queue": "xml_sync"},
+                # On the dedicated webhook worker, so the depth report still runs when the I/O worker is saturated.
+                "app.integrations.celery.tasks.webhook_queue_monitor_task.report_webhook_queue_depth": {
+                    "queue": WEBHOOK_PRIORITY_QUEUE
+                },
             },
-            "app.integrations.celery.tasks.process_xml_upload_task.process_xml_upload": {"queue": "xml_sync"},
-        },
+        ),
     )
 
     # rediss:// alone isn't enough for Celery — the broker/result transports read
@@ -237,6 +246,12 @@ def create_celery() -> Celery:
         "close-stale-sync-runs": {
             "task": "app.integrations.celery.tasks.close_stale_sync_runs_task.close_stale_sync_runs",
             "schedule": float(settings.sync_run_sweep_interval_seconds),
+            "args": (),
+            "kwargs": {},
+        },
+        "report-webhook-queue-depth": {
+            "task": "app.integrations.celery.tasks.webhook_queue_monitor_task.report_webhook_queue_depth",
+            "schedule": float(settings.webhook_queue_monitor_interval_seconds),
             "args": (),
             "kwargs": {},
         },

@@ -28,6 +28,7 @@ from app.integrations.redis_client import get_redis_client
 from app.main import api
 from app.models import SeriesTypeDefinition
 from app.schemas.enums import SERIES_TYPE_DEFINITIONS
+from app.services.outgoing_webhooks.subscriptions import clear_subscription_cache
 from tests import factories
 
 # Set test environment before importing app modules
@@ -229,6 +230,14 @@ def mock_webhook_dispatch() -> Generator[MagicMock, None, None]:
     with patch("app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event") as mock:
         mock.delay.return_value = None
         yield mock
+
+
+@pytest.fixture(autouse=True)
+def reset_webhook_subscription_cache() -> Generator[None, None, None]:
+    """Keep one test's view of Svix endpoint subscriptions from leaking into the next."""
+    clear_subscription_cache()
+    yield
+    clear_subscription_cache()
 
 
 @pytest.fixture(autouse=True)
