@@ -19,6 +19,7 @@ from app.schemas.webhooks.event_types import WebhookEventType
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
 from app.services.outgoing_webhooks.payloads import split_samples_by_payload_bytes, validate_webhook_payload
+from app.services.outgoing_webhooks.subscriptions import timeseries_event_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,12 @@ def on_sleep_updated(**kwargs: Any) -> None:
     _emit_sleep(WebhookEventType.SLEEP_UPDATED, **kwargs)
 
 
+def should_emit_timeseries(series_type: str) -> bool:
+    """Whether writes of this series type produce a webhook; lets callers skip building samples."""
+    event_type = SERIES_TYPE_TO_GROUP_EVENT.get(series_type)
+    return event_type is not None and svix_service.is_enabled() and timeseries_event_enabled(event_type)
+
+
 def on_timeseries_batch_saved(
     *,
     user_id: UUID,
@@ -306,6 +313,9 @@ def on_timeseries_batch_saved(
     samples: list[dict[str, Any]] | None = None,
 ) -> None:
     """Aggregate this write into the current SDK batch, or emit one group event."""
+    # Checked before batching so unsubscribed types never take one of the batch's event slots.
+    if not should_emit_timeseries(series_type):
+        return
     samples = samples or []
     batch = current_sdk_webhook_batch()
     if batch is not None:

@@ -199,6 +199,50 @@ In practice you will put the API and frontend behind a reverse proxy with TLS in
 
 To add Flower, run another backend container with `command: scripts/start/flower.sh` and publish port `5555`. To enable outgoing webhooks, add a `svix-server` service and a `svix` database; the development `docker-compose.yml` shows the wiring.
 
+## Worker processes
+
+`scripts/start/worker.sh` starts three Celery workers in one container and exits as soon as one of them does:
+
+| Node | Pool | Queues | Concurrency |
+|------|------|--------|-------------|
+| `io@<host>` | threads | `webhook_priority`, `default`, `sdk_sync`, `garmin_sync`, `webhook_sync`, `webhook_outgoing` | `CELERY_IO_CONCURRENCY` (default `16`) |
+| `webhook@<host>` | threads | `webhook_priority` | `CELERY_WEBHOOK_PRIORITY_CONCURRENCY` (default `4`) |
+| `cpu@<host>` | prefork | `xml_sync` | `2` |
+
+A health check that pings the workers should ping all three nodes. The two variables are read by the script, not by the app, so set them on the worker container.
+
+## Outgoing webhook queues
+
+Outgoing webhooks wait in two Redis lists before they reach Svix:
+
+- `webhook_priority` - `connection.*`, `sleep.*`, `workout.*`, `body_composition.*` and `sync.completed`. Consumed by its own worker, so a backlog of bulk events cannot delay them.
+- `webhook_outgoing` - everything else, mostly the per-type timeseries events.
+
+Per-type timeseries events are only emitted while some enabled endpoint receives them (`OUTGOING_WEBHOOKS_TIMESERIES_EVENTS=subscribed`, the default; `all` and `none` are the alternatives). The emit task has no Celery rate limit unless `WEBHOOK_EMIT_RATE_LIMIT` is set (for example `50/s`, applied per worker node); the worker concurrency already bounds how many Svix calls run at once.
+
+### Alarming on queue depth
+
+Beat schedules `report_webhook_queue_depth` every `WEBHOOK_QUEUE_MONITOR_INTERVAL_SECONDS` (default `60`). It logs one structured line per queue with `action=webhook_queue_depth`, `queue`, `depth` and `over_threshold`, at `WARNING` once `depth` exceeds `WEBHOOK_QUEUE_DEPTH_WARN_THRESHOLD` (default `1000`). Attach two alarms to these lines:
+
+- `over_threshold` is true for 10 minutes in a row: the workers are not keeping up.
+- No `webhook_queue_depth` line for 5 minutes: the report is routed to `webhook_priority`, so its absence means beat is down or no worker consumes that queue.
+
+To check by hand, run `LLEN webhook_priority` and `LLEN webhook_outgoing` against the Celery broker with `redis-cli`.
+
+### Draining a backlog
+
+A backlog normally drains by itself once the workers keep up. To speed it up, raise `CELERY_IO_CONCURRENCY` and restart the worker container; queued messages survive the restart.
+
+If the bulk backlog is too old to be worth delivering, purge **only** `webhook_outgoing`:
+
+```bash
+uv run celery -A app.main:celery_app purge -Q webhook_outgoing -f
+```
+
+<Warning>
+  Always pass `-Q webhook_outgoing`. Without `-Q`, `celery purge` empties every queue the app declares, including `webhook_priority` and the sync queues. Never purge `webhook_priority`: its events (for example `connection.created`) are not emitted again, so consumers that act on them would miss them for good. A purge drops the webhooks, not the data; consumers can fetch the affected period from the pull API.
+</Warning>
+
 ## Logs
 
 The backend writes its application logs to stdout (in `legacy`, uvicorn's own lines go to stderr, as before). `LOG_FORMAT` selects their format:

@@ -18,6 +18,7 @@ import httpx
 from jose import jwt
 from svix.api import (
     ApplicationIn,
+    ApplicationListOptions,
     EndpointIn,
     EndpointListOptions,
     EndpointOut,
@@ -167,6 +168,10 @@ def register_event_types() -> bool:
     return all_ok
 
 
+# Applications this process already ensured, so each emitted event costs one Svix call, not two.
+_ensured_applications: set[str] = set()
+
+
 def ensure_application(developer_id: str, developer_email: str) -> str:
     """Return the Svix application UID for a developer, creating it lazily.
 
@@ -176,15 +181,53 @@ def ensure_application(developer_id: str, developer_email: str) -> str:
         return developer_id
     assert _client is not None
     uid = str(developer_id)
+    if uid in _ensured_applications:
+        return uid
     try:
         _client.application.get_or_create(
             ApplicationIn(name=developer_email, uid=uid),
         )
+        _ensured_applications.add(uid)
     except httpx.ConnectError:
         logger.warning("Svix server unreachable — skipping application setup for developer %s", uid)
     except Exception:
         logger.exception("Failed to ensure Svix application for developer %s", uid)
     return uid
+
+
+def forget_application(developer_id: str) -> None:
+    """Make the next ``ensure_application`` call check Svix again (e.g. after a failed send)."""
+    _ensured_applications.discard(str(developer_id))
+
+
+def subscribed_event_types() -> frozenset[str] | None:
+    """Return every event type at least one enabled endpoint receives, across all applications.
+
+    ``None`` means some enabled endpoint has no event filter and so receives every type.
+    Raises when Svix cannot be listed; callers decide how to degrade.
+    """
+    assert _client is not None
+    subscribed: set[str] = set()
+    app_iterator: str | None = None
+    while True:
+        apps = _client.application.list(ApplicationListOptions(limit=250, iterator=app_iterator))
+        for app in apps.data:
+            endpoint_iterator: str | None = None
+            while True:
+                page = _client.endpoint.list(app.id, EndpointListOptions(limit=250, iterator=endpoint_iterator))
+                for endpoint in page.data:
+                    if endpoint.disabled:
+                        continue
+                    if not endpoint.event_types:
+                        return None
+                    subscribed.update(endpoint.event_types)
+                if page.done:
+                    break
+                endpoint_iterator = page.iterator
+        if apps.done:
+            break
+        app_iterator = apps.iterator
+    return frozenset(subscribed)
 
 
 def send(

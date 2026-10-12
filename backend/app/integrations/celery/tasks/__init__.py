@@ -39,6 +39,7 @@ from .send_email_task import send_invitation_email_task
 from .sync_vendor_data_task import sync_vendor_data
 from .telemetry_task import send_telemetry_ping
 from .webhook_push_task import process_webhook_push
+from .webhook_queue_monitor_task import report_webhook_queue_depth
 from .withings.notify_sync_task import sync_user_subscriptions as sync_withings_user_subscriptions
 
 __all__ = [
@@ -77,4 +78,5 @@ __all__ = [
     "send_telemetry_ping",
     # Outgoing webhooks
     "emit_webhook_event",
+    "report_webhook_queue_depth",
 ]

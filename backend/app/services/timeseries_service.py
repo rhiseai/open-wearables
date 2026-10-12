@@ -34,7 +34,7 @@ from app.schemas.utils import (
 )
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
-from app.services.outgoing_webhooks.events import on_timeseries_batch_saved
+from app.services.outgoing_webhooks.events import on_timeseries_batch_saved, should_emit_timeseries
 from app.services.priority_service import priority_service
 from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
@@ -162,6 +162,8 @@ class TimeSeriesService(
                 key = (s.user_id, s.provider or s.source or "unknown", s.series_type.value)
                 groups[key].append(s)
             for (user_id, provider, series_type_value), group_samples in groups.items():
+                if not should_emit_timeseries(series_type_value):
+                    continue
                 sorted_samples = sorted(group_samples, key=lambda s: s.recorded_at)
                 series_type_enum = SeriesType(series_type_value)
                 unit = get_series_type_unit(series_type_enum)

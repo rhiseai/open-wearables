@@ -234,6 +234,10 @@ Fired per ingestion batch — one canonical group event per distinct `(user, pro
 | `environmental.created` | `environmental_audio_exposure`, `uv_exposure`, `weather_temperature`, … |
 | `timeseries.created` | Catch-all for series types not yet explicitly mapped. |
 
+<Note>
+  By default, a timeseries event type is only emitted while at least one enabled endpoint receives it: an endpoint without `filter_types`, or one whose `filter_types` lists it. Each backend process re-reads the endpoint subscriptions every 5 minutes (`OUTGOING_WEBHOOKS_SUBSCRIPTION_CACHE_SECONDS`), so data ingested before then is not delivered to a newly subscribed endpoint; use the pull API to backfill it. Self-hosted deployments choose the behaviour with `OUTGOING_WEBHOOKS_TIMESERIES_EVENTS`: `subscribed` (default), `all` (always emit) or `none` (never emit). `body_composition.created` is not affected by this setting and is always emitted.
+</Note>
+
 ---
 
 ## Payload Reference
@@ -705,6 +709,9 @@ Open Wearables (via Svix) retries failed deliveries automatically with exponenti
   </Accordion>
   <Accordion title="Webhook availability">
     Data ingestion is **never** blocked by webhook failures — if delivery infrastructure is temporarily unavailable, data continues to be stored and events are queued for retry.
+  </Accordion>
+  <Accordion title="Delivery order and queues">
+    Before reaching Svix, events wait in one of two Celery queues. `connection.*`, `sleep.*`, `workout.*`, `body_composition.*` and `sync.completed` use `webhook_priority`, which has a worker of its own; every other event uses `webhook_outgoing`. A backlog of timeseries events therefore does not delay a new connection or a finished night. Events in different queues can arrive out of order. For self-hosted operation (queue depth alarms, draining a backlog) see [Outgoing webhook queues](/deployment/docker#outgoing-webhook-queues).
   </Accordion>
 </AccordionGroup>
 

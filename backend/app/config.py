@@ -337,6 +337,20 @@ class Settings(BaseSettings):
     svix_jwt_secret: SecretStr | None = None
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None
+    # Per-type timeseries events (heart_rate.created, steps.created, ...) are the bulk of all
+    # webhook traffic. "subscribed" emits a type only while an enabled endpoint receives it
+    # (no event filter, or the type in its filter); "all" always emits; "none" never does.
+    # body_composition.created is a product event and is never gated.
+    outgoing_webhooks_timeseries_events: Literal["subscribed", "all", "none"] = "subscribed"
+    # How long each process trusts its view of endpoint subscriptions before re-reading Svix.
+    outgoing_webhooks_subscription_cache_seconds: int = Field(300, ge=0)
+    # Celery rate limit of the emit task, per worker node (e.g. "50/s"). Unset = no limit:
+    # worker concurrency already caps in-flight Svix calls.
+    webhook_emit_rate_limit: str | None = None
+    # Beat logs LLEN of webhook_priority and webhook_outgoing this often (action=webhook_queue_depth),
+    # at warning level once a queue holds more than the threshold.
+    webhook_queue_monitor_interval_seconds: int = Field(60, ge=10)
+    webhook_queue_depth_warn_threshold: int = Field(1000, ge=0)
 
     # TELEMETRY SETTINGS
     # Anonymous usage telemetry: aggregate counts and config flags only, never
