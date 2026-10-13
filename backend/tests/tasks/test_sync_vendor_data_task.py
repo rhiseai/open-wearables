@@ -4,11 +4,15 @@ Tests for sync_vendor_data Celery task.
 Tests synchronization of workout data from external providers (Garmin, Polar, Suunto).
 """
 
+from collections.abc import Callable
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
+from app.models import UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
 from app.services.sync_coordination import try_become_primary
@@ -429,3 +433,141 @@ class TestSyncVendorDataLinkedSkip:
 
         db.refresh(connection)
         assert connection.last_synced_at == before
+
+
+_TASK = "app.integrations.celery.tasks.sync_vendor_data_task"
+_PROVIDER_USER_ID = "oura-account-1"
+
+
+def _delete_mid_sync(db: Session, connection: UserConnection) -> None:
+    """Delete the connection's row behind the task's back and expire the instance, as a
+    provider's db.rollback() does, so the task's next read of it reloads a missing row."""
+    db.execute(
+        delete(UserConnection).where(UserConnection.id == connection.id).execution_options(synchronize_session=False)
+    )
+    db.expire(connection)
+
+
+class TestSyncVendorDataConnectionDeletedMidSync:
+    """A connection deleted mid-sync must not hide the run's outcome or keep the pull lock."""
+
+    @staticmethod
+    def _stored_connection(db: Session) -> UserConnection:
+        """An Oura connection committed before the run, like every real one: a flush that
+        fails during the run then expires it instead of undoing its insert."""
+        connection = UserConnectionFactory(
+            user=UserFactory(), provider="oura", status=ConnectionStatus.ACTIVE, provider_user_id=_PROVIDER_USER_ID
+        )
+        db.commit()
+        return connection
+
+    @staticmethod
+    def _pull_strategy() -> MagicMock:
+        strategy = MagicMock()
+        strategy.capabilities.rest_pull = True
+        strategy.workouts = None
+        return strategy
+
+    @staticmethod
+    def _deleting_load_and_save_all(db: Session, connection: UserConnection) -> Callable[..., dict[str, int]]:
+        def load_and_save_all(*args: object, **kwargs: object) -> dict[str, int]:
+            _delete_mid_sync(db, connection)
+            # What Oura returns when every data type failed and was rolled back.
+            return {"activity": 0, "sleep": 0}
+
+        return load_and_save_all
+
+    @staticmethod
+    def _pull_lock_is_free() -> bool:
+        return try_become_primary("oura", _PROVIDER_USER_ID, uuid4(), scope="pull")[0]
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_live_run_reports_the_provider_error_and_releases_the_lock(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        connection = self._stored_connection(db)
+        user_id = str(connection.user_id)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        strategy = self._pull_strategy()
+
+        def get_provider(provider: str) -> MagicMock:
+            # The first lookup filters the connections. The run's own lookup is a step no
+            # data-type handler wraps, so its error reaches the per-provider handler.
+            if mock_get_provider.call_count == 1:
+                return strategy
+            _delete_mid_sync(db, connection)
+            raise RuntimeError("Provider API unavailable")
+
+        mock_get_provider.side_effect = get_provider
+
+        with patch(f"{_TASK}.emit_sync_failed") as emit_failed:
+            result = sync_vendor_data(user_id)
+
+        assert result["errors"] == {"oura": "Provider API unavailable"}
+        emit_failed.assert_called_once()
+        assert emit_failed.call_args.kwargs["error"] == "Provider API unavailable"
+        assert self._pull_lock_is_free()
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_historical_run_completes_and_releases_the_lock(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """OPEN-WEARABLES-33: Oura swallowed its 401s for a deleted user and rolled back."""
+        connection = self._stored_connection(db)
+        user_id = str(connection.user_id)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        strategy = self._pull_strategy()
+        strategy.data_247.load_and_save_all.side_effect = self._deleting_load_and_save_all(db, connection)
+        mock_get_provider.return_value = strategy
+
+        # Historical runs are also stored through run tracking's own session, which is not under test.
+        with (
+            patch(f"{_TASK}.emit_sync_started"),
+            patch(f"{_TASK}.emit_sync_completed") as emit_completed,
+            patch(f"{_TASK}.try_record_data_types"),
+        ):
+            result = sync_vendor_data(user_id, is_historical=True)
+
+        assert result["errors"] == {}
+        emit_completed.assert_called_once()
+        assert emit_completed.call_args.kwargs["status"] == SyncStatus.SKIPPED
+        assert self._pull_lock_is_free()
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_live_run_reports_the_cursor_error_and_releases_the_lock(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        connection = self._stored_connection(db)
+        user_id = str(connection.user_id)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        strategy = self._pull_strategy()
+        strategy.data_247.load_and_save_all.side_effect = self._deleting_load_and_save_all(db, connection)
+        mock_get_provider.return_value = strategy
+
+        with patch(f"{_TASK}.emit_sync_failed") as emit_failed:
+            result = sync_vendor_data(user_id)
+
+        # Saving the live cursor on the missing row fails, and the run reports that error.
+        assert list(result["errors"]) == ["oura"]
+        assert "has been deleted" in result["errors"]["oura"]
+        emit_failed.assert_called_once()
+        assert emit_failed.call_args.kwargs["error"] == result["errors"]["oura"]
+        assert self._pull_lock_is_free()
