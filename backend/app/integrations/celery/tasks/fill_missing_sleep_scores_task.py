@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from app.config import settings
 from app.database import SessionLocal
+from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -43,6 +44,7 @@ _MISSING_SCORES_QUERY = text("""
       AND sd.sleep_total_duration_minutes > 0
       AND hs.id IS NULL
       AND er.start_datetime >= :cutoff
+      AND (CAST(:user_id AS uuid) IS NULL OR ds.user_id = CAST(:user_id AS uuid))
     ORDER BY ds.user_id, wake_date DESC
 """)
 
@@ -61,7 +63,7 @@ def fill_missing_sleep_scores() -> dict:
     cutoff = datetime.now(timezone.utc) - timedelta(days=settings.score_backfill_days)
 
     with SessionLocal() as db:
-        rows = db.execute(_MISSING_SCORES_QUERY, {"cutoff": cutoff}).fetchall()
+        rows = db.execute(_MISSING_SCORES_QUERY, {"cutoff": cutoff, "user_id": None}).fetchall()
 
         if not rows:
             return {"saved": 0, "skipped": 0}
@@ -81,38 +83,29 @@ def fill_missing_sleep_scores() -> dict:
         total_saved = 0
         total_skipped = 0
 
-        for uid, record_wakes_extended in records_by_user.items():
-            sessions = [(rid, dsid, local_end) for rid, dsid, _, local_end in record_wakes_extended]
-            try:
-                scores_to_save = sleep_score_service.build_internal_sleep_scores(db, uid, sessions)
-            except Exception as e:
-                total_skipped += len(sessions)
-                log_and_capture_error(
-                    e,
-                    logger,
-                    f"Failed to fetch sleep data for user {uid}",
-                    extra={"user_id": str(uid), "task": "fill_missing_sleep_scores"},
-                )
-                continue
-
-            if not scores_to_save:
-                total_skipped += len(sessions)
-                continue
-
-            try:
-                health_score_service.bulk_create(db, scores_to_save)
-                db.commit()
-                total_saved += len(scores_to_save)
-                total_skipped += len(sessions) - len(scores_to_save)
-            except Exception as e:
-                db.rollback()
-                total_skipped += len(sessions)
-                log_and_capture_error(
-                    e,
-                    logger,
-                    f"Failed to save sleep scores for user {uid}",
-                    extra={"user_id": str(uid), "task": "fill_missing_sleep_scores"},
-                )
+        # Discovery is only a list of users to visit. A concurrent sleep merge may
+        # delete or update any candidate before the lock is acquired, so never
+        # build scores from the discovery snapshot.
+        for uid, discovered in records_by_user.items():
+            with SessionLocal() as user_db:
+                try:
+                    event_record_service.lock_sleep_user(user_db, uid)
+                    current = user_db.execute(_MISSING_SCORES_QUERY, {"cutoff": cutoff, "user_id": uid}).fetchall()
+                    sessions = [(rid, dsid, local_end) for _, dsid, rid, _, local_end in current]
+                    scores_to_save = sleep_score_service.build_internal_sleep_scores(user_db, uid, sessions)
+                    health_score_service.bulk_create(user_db, scores_to_save)
+                    user_db.commit()
+                    total_saved += len(scores_to_save)
+                    total_skipped += max(len(discovered), len(sessions)) - len(scores_to_save)
+                except Exception as e:
+                    user_db.rollback()
+                    total_skipped += len(discovered)
+                    log_and_capture_error(
+                        e,
+                        logger,
+                        "Failed to fill sleep scores",
+                        extra={"user_id": str(uid), "task": "fill_missing_sleep_scores"},
+                    )
 
         log_structured(
             logger,

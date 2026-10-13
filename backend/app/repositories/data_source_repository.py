@@ -61,6 +61,8 @@ class DataSourceRepository(
         source: str | None = None,
         original_source_name: str | None = None,
         reported_type: DeviceType | None = None,
+        *,
+        commit: bool = True,
     ) -> DataSource:
         provider = ProviderName(provider)
         existing = self.get_by_identity(db_session, user_id, provider, device_model, source)
@@ -93,7 +95,10 @@ class DataSourceRepository(
         )
         stmt = insert(self.model).values(create_payload.model_dump()).on_conflict_do_nothing()
         db_session.execute(stmt)
-        db_session.commit()
+        if commit:
+            db_session.commit()
+        else:
+            db_session.flush()
 
         result = self.get_by_identity(db_session, user_id, provider, device_model, source)
         assert result is not None

@@ -33,6 +33,7 @@ from app.services.sdk.sleep_service import (
     _in_bed_bounds,
     finish_sleep,
     handle_sleep_data,
+    key,
     persist_sleep,
 )
 from tests.factories import UserFactory
@@ -532,7 +533,7 @@ class TestPersistSleep:
         assert detail.sleep_stages[0].start_time == _dt("2026-05-01T23:00:00Z")
         assert detail.sleep_stages[-1].end_time == _dt("2026-05-02T02:32:00Z")
         assert all(s.stage != SleepStageType.IN_BED for s in detail.sleep_stages)
-        mock_delete_state.assert_called_once_with(user_id)
+        mock_delete_state.assert_called_once_with(user_id, storage_key=key(user_id, state))
 
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.delete_sleep_state")
@@ -629,6 +630,7 @@ class TestPersistSleep:
         detail: EventRecordDetailCreate = call_args[0][3]
 
         assert record.external_id == state_uuid
+        assert detail.sleep_total_duration_minutes is not None
         assert detail.sleep_total_duration_minutes > 0
         assert detail.sleep_deep_minutes == 0
         assert detail.sleep_rem_minutes == 0
@@ -636,7 +638,7 @@ class TestPersistSleep:
         assert detail.sleep_stages is not None
         assert len(detail.sleep_stages) == 3
         assert all(s.stage == SleepStageType.SLEEPING for s in detail.sleep_stages)
-        mock_delete_state.assert_called_once_with(user_id)
+        mock_delete_state.assert_called_once_with(user_id, storage_key=key(user_id, state))
 
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.delete_sleep_state")
@@ -775,11 +777,11 @@ class TestHandleSleepDataIntegration:
 
         handle_sleep_data(db, request, user_id)
 
-        # Sleep state should be saved to Redis before flush
+        # Each data-source state is saved after the database commit
         assert mock_redis.set.called
 
         # Eager flush to Postgres via the shared create_or_merge_sleep path
-        mock_event_service.create_or_merge_sleep.assert_called_once()
+        assert mock_event_service.create_or_merge_sleep.call_count == 2
 
         # The finalize task should be dispatched for housekeeping
         mock_finalize.delay.assert_called_once()
@@ -799,7 +801,8 @@ class TestHandleSleepDataIntegration:
         sleeping_stages = [s for s in state.stages if s.stage == SleepStageType.SLEEPING]
         in_bed_stages = [s for s in state.stages if s.stage == SleepStageType.IN_BED]
         assert len(sleeping_stages) >= 1
-        assert len(in_bed_stages) == 1
+        assert len(in_bed_stages) == 0
+        assert state.device_model == "Watch3,3"
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
     @patch("app.services.sdk.sleep_service.event_record_service")
@@ -823,7 +826,7 @@ class TestHandleSleepDataIntegration:
         handle_sleep_data(db, request, user_id)
 
         # Eager flush on every batch
-        mock_event_service.create_or_merge_sleep.assert_called_once()
+        assert mock_event_service.create_or_merge_sleep.call_count == 2
 
         # Verify saved state
         last_set_call = mock_redis.set.call_args_list[-1]
@@ -974,19 +977,12 @@ class TestNoIntermediateRedisSaves:
 
         handle_sleep_data(db, request, user_id)
 
-        # Count how many times set() was called (each call = one Redis state save).
-        # With the fix, this should be exactly 1 — after the loop finishes.
-        # Before the fix, it was called once per stage (9 times for this payload).
+        # One complete state per exact data source, never one write per stage.
         set_calls = mock_redis.set.call_args_list
-        assert len(set_calls) == 1, (
-            f"Expected exactly 1 Redis save per batch, got {len(set_calls)}. "
-            "Intermediate saves expose partial state to finalize_stale_sleeps."
-        )
-
-        # Verify the single saved state contains ALL stages from the payload
-        state = SleepState.model_validate_json(set_calls[0][0][1])
-        # The payload has 9 stages; in_bed is included but counted under in_bed_seconds
-        assert len(state.stages) >= 8  # at least the 8 watch stages + 1 in_bed
+        assert len(set_calls) == 2
+        states = [SleepState.model_validate_json(call[0][1]) for call in set_calls]
+        assert {state.device_model for state in states} == {"iPhone15,2", "Watch7,1"}
+        assert sum(len(state.stages) for state in states) == len(request.data.sleep)
 
 
 class TestHistoricalBulkUploadMerging:
@@ -1124,7 +1120,7 @@ class TestHistoricalBulkUploadMerging:
                         "stage": "deep",
                         "startDate": (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
                         "endDate": (now - timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
-                        "source": {"device_type": "watch", "device_model": "Watch7,1"},
+                        "source": {"name": "Apple Watch", "device_type": "watch", "device_model": "Watch7,1"},
                     },
                 ],
             },
@@ -1257,9 +1253,9 @@ class TestProviderSleepScore:
         with patch("app.services.sdk.sleep_service.persist_sleep") as mock_persist:
             handle_sleep_data(db, SyncRequest.model_validate(self.SAMSUNG_PAYLOAD), user_id=str(uuid4()))
 
-        finished_state: SleepState = mock_persist.call_args[0][2]
-        assert finished_state.provider == "apple"
-        assert finished_state.sleep_score is None
+        states = {call[0][2].provider: call[0][2] for call in mock_persist.call_args_list}
+        assert states["apple"].sleep_score is None
+        assert states["samsung"].sleep_score == 82
 
     @patch("app.services.sdk.sleep_service.health_score_service")
     @patch("app.services.sdk.sleep_service.event_record_service")
