@@ -143,6 +143,10 @@ def sync_vendor_data(
                     is_historical,
                 )
             ]
+            # Read what the loop needs while the rows are loaded. A provider that rolls the
+            # session back expires these instances, and reading one again reloads its row,
+            # which raises if the connection was deleted mid-sync (e.g. with its user).
+            targets = [(c, c.provider, c.provider_user_id, c.last_synced_at) for c in connections]
 
             if not connections:
                 log_structured(
@@ -163,8 +167,7 @@ def sync_vendor_data(
                 user_id=user_id,
             )
 
-            for connection in connections:
-                provider_name = connection.provider
+            for connection, provider_name, provider_user_id, last_synced_at in targets:
                 log_structured(
                     logger,
                     "info",
@@ -191,9 +194,9 @@ def sync_vendor_data(
                 # is primary; concurrent duplicates skip and wait for the fan-out.
                 # Fan-out tasks (_skip_linked_fan_out=True) bypass this check entirely.
                 shared_token: str = ""
-                if connection.provider_user_id and not _skip_linked_fan_out:
+                if provider_user_id and not _skip_linked_fan_out:
                     is_pull_primary, shared_token, existing_primary = try_become_primary(
-                        provider_name, connection.provider_user_id, user_uuid, scope="pull"
+                        provider_name, provider_user_id, user_uuid, scope="pull"
                     )
                     if not is_pull_primary and existing_primary:
                         # If the lock holder no longer has an active connection (e.g. user
@@ -210,9 +213,9 @@ def sync_vendor_data(
                                 user_id=user_id,
                                 stale_primary_user_id=str(existing_primary),
                             )
-                            release_stale_primary(provider_name, connection.provider_user_id, scope="pull")
+                            release_stale_primary(provider_name, provider_user_id, scope="pull")
                             is_pull_primary, shared_token, existing_primary = try_become_primary(
-                                provider_name, connection.provider_user_id, user_uuid, scope="pull"
+                                provider_name, provider_user_id, user_uuid, scope="pull"
                             )
 
                     if not is_pull_primary:
@@ -268,7 +271,7 @@ def sync_vendor_data(
 
                 try:
                     # Inside the try: the finally below is what stops the renewal thread.
-                    bind_primary_lease(provider_name, connection.provider_user_id, user_uuid, shared_token)
+                    bind_primary_lease(provider_name, provider_user_id, user_uuid, shared_token)
 
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
@@ -285,7 +288,7 @@ def sync_vendor_data(
                     # This ensures live syncs never re-pull history.
                     effective_start = start_date
                     if effective_start is None:
-                        last = connection.last_synced_at
+                        last = last_synced_at
                         if last is not None:
                             if last.tzinfo is None:
                                 last = last.replace(tzinfo=timezone.utc)
@@ -371,7 +374,7 @@ def sync_vendor_data(
                     # Sync 247 data (sleep, recovery, activity) and SAVE to database
                     if hasattr(strategy, "data_247") and strategy.data_247:
                         # Determine if this is first sync (for API compatibility with providers)
-                        is_first_sync = connection.last_synced_at is None
+                        is_first_sync = last_synced_at is None
 
                         _emit_sync_status(
                             emit_sync_progress,
@@ -473,16 +476,14 @@ def sync_vendor_data(
                     if not is_historical:
                         user_connection_repo.update_last_synced_at(db, connection)
 
-                    if shared_token and connection.provider_user_id:
+                    if shared_token and provider_user_id:
                         # Stop renewing first, or the renewer can retake the lock we just released.
                         clear_primary_lease()
-                        release_primary(
-                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
-                        )
+                        release_primary(provider_name, provider_user_id, user_uuid, shared_token, scope="pull")
                         # Fan-out: trigger sync for every other OW profile sharing this
                         # provider account so they receive the same data.
                         linked_connections = user_connection_repo.get_all_by_provider_user_id(
-                            db, provider_name, connection.provider_user_id
+                            db, provider_name, provider_user_id
                         )
                         for linked_conn in linked_connections:
                             if linked_conn.user_id == user_uuid:
@@ -578,11 +579,9 @@ def sync_vendor_data(
                         try_record_data_types(run_id, data_type_outcomes, scope=sync_scope)
 
                 except Exception as e:
-                    if shared_token and connection.provider_user_id:
+                    if shared_token and provider_user_id:
                         clear_primary_lease()
-                        release_primary(
-                            provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
-                        )
+                        release_primary(provider_name, provider_user_id, user_uuid, shared_token, scope="pull")
                     _emit_sync_status(
                         emit_sync_failed,
                         user_uuid,
