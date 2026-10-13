@@ -1,13 +1,12 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal
 from logging import Logger, getLogger
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import event as sa_event
-from sqlalchemy.orm import Query
+from sqlalchemy.orm import Query, Session, SessionTransaction
 
 from app.config import settings
 from app.database import DbSession
@@ -42,7 +41,6 @@ from app.schemas.model_crud.activities import (
     SleepInclude,
     WorkoutInclude,
 )
-from app.schemas.model_crud.activities.sleep import SleepStage
 from app.schemas.model_crud.activities.zones import HRZones, PowerZones
 from app.schemas.responses.activity import (
     Macros,
@@ -74,9 +72,11 @@ from app.services.outgoing_webhooks.events import (
 from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
+from app.services.sleep_reconciliation import merge_sleep_parts
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
+from app.utils.structured_logging import log_structured
 
 
 @dataclass(frozen=True)
@@ -361,6 +361,33 @@ class EventRecordService(
             self.event_record_detail_repo.bulk_create(db_session, refreshed, detail_type="meal")
         return len(inserted)
 
+    def lock_sleep_user(self, db_session: DbSession, user_id: UUID) -> None:
+        """Hold the shared sleep/score writer lock until the caller finishes its transaction."""
+        self.crud.lock_sleep_user(db_session, user_id)
+
+    @staticmethod
+    def _sleep_detail_snapshot(record: EventRecord) -> EventRecordDetailCreate:
+        detail = record.sleep_detail
+        values = (
+            {
+                name: getattr(detail, name)
+                for name in (
+                    "sleep_total_duration_minutes",
+                    "sleep_time_in_bed_minutes",
+                    "sleep_efficiency_score",
+                    "sleep_deep_minutes",
+                    "sleep_rem_minutes",
+                    "sleep_light_minutes",
+                    "sleep_awake_minutes",
+                    "is_nap",
+                    "sleep_stages",
+                )
+            }
+            if detail
+            else {}
+        )
+        return EventRecordDetailCreate(record_id=record.id, **values)
+
     def create_or_merge_sleep(
         self,
         db_session: DbSession,
@@ -368,75 +395,107 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        *,
+        commit: bool = True,
     ) -> EventRecord:
-        """Create a sleep record, merging with any adjacent session within threshold_minutes.
+        """Reconcile one writer's complete adjacent sleep component atomically.
 
-        When an adjacent session already exists in the database within the gap threshold,
-        the two records are merged: the time window expands to cover both, stage minutes
-        are summed (or recomputed from the merged stage timeline when windows overlap and
-        stages are available), and efficiency is recalculated as a time-in-bed-weighted
-        average over sessions that have a non-None score.  The merged record is created
-        first, and the old record is deleted only after a successful insert — so a failure
-        never loses the original data.
+        A same-ID cloud session is an authoritative replacement; Apple IDs name
+        samples, so Apple batches accumulate without shrinking a stored night.
+        Existing row identity survives merges. Absorbed rows are deleted and
+        flushed before expanding that row onto an occupied unique time window.
+        ``commit=False`` leaves transaction ownership to the SDK batch caller.
+        Webhooks contain snapshots and are dispatched only on the outer commit.
         """
-        result, action, final_detail = self._create_or_merge_sleep_inner(
-            db_session, user_id, record, detail, threshold_minutes
-        )
-        # ``action`` is "created" (insert / fresh merged session) or "updated" (a
-        # provider re-sending a session as it finalizes). Emitting on updates —
-        # via the distinct sleep.updated event — is what lets consumers move off
-        # an early partial reading; the content-aware idempotency key dedups
-        # identical retries.
-        if action is not None:
-            eff = final_detail.sleep_efficiency_score
-            has_stages = any(
-                [
-                    final_detail.sleep_awake_minutes,
-                    final_detail.sleep_light_minutes,
-                    final_detail.sleep_deep_minutes,
-                    final_detail.sleep_rem_minutes,
-                ]
+        try:
+            self.lock_sleep_user(db_session, user_id)
+            result, action, final_detail = self._create_or_merge_sleep_inner(
+                db_session, user_id, record, detail, threshold_minutes
             )
-            device_type = None
-            if svix_service.is_enabled() and result.data_source_id is not None:
-                data_source = self.data_source_repo.get(db_session, result.data_source_id)
-                if data_source is not None:
-                    device_type = data_source.device_type
+            if action is not None:
+                self._queue_sleep_webhook(db_session, user_id, record, result, action, final_detail)
+            if commit:
+                db_session.commit()
+            else:
+                db_session.flush()
+            return result
+        except Exception:
+            if commit:
+                db_session.rollback()
+            raise
 
-            emit = on_sleep_updated if action == "updated" else on_sleep_created
-            emit(
-                record_id=result.id,
-                user_id=user_id,
-                provider=record.provider or record.source_name,
-                device=record.device_model,
-                start_time=result.start_datetime.isoformat(),
-                end_time=result.end_datetime.isoformat(),
-                zone_offset=record.zone_offset,
-                duration_seconds=result.duration_seconds,
-                efficiency_percent=float(eff) if eff is not None else None,
-                stages={
-                    "awake_minutes": final_detail.sleep_awake_minutes,
-                    "light_minutes": final_detail.sleep_light_minutes,
-                    "deep_minutes": final_detail.sleep_deep_minutes,
-                    "rem_minutes": final_detail.sleep_rem_minutes,
-                }
-                if has_stages
-                else None,
-                is_nap=final_detail.is_nap,
-                source_app=record.source,
-                device_type=device_type,
-                sleep_duration_seconds=(
-                    final_detail.sleep_total_duration_minutes * 60
-                    if final_detail.sleep_total_duration_minutes is not None
-                    else None
-                ),
-                sleep_stage_intervals=(
-                    [stage.model_dump(mode="json") for stage in final_detail.sleep_stages]
-                    if final_detail.sleep_stages
-                    else None
-                ),
+    def _queue_sleep_webhook(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        incoming: EventRecordCreate,
+        result: EventRecord,
+        action: str,
+        detail: EventRecordDetailCreate,
+    ) -> None:
+        """Queue only plain values; savepoint commits and rollbacks never publish them."""
+        device_type = None
+        if svix_service.is_enabled():
+            data_source = self.data_source_repo.get(db_session, result.data_source_id)
+            if data_source is not None:
+                device_type = data_source.device_type
+        has_stages = any(
+            (
+                detail.sleep_awake_minutes,
+                detail.sleep_light_minutes,
+                detail.sleep_deep_minutes,
+                detail.sleep_rem_minutes,
             )
-        return result
+        )
+        payload = {
+            "record_id": result.id,
+            "user_id": user_id,
+            "provider": incoming.provider or incoming.source_name,
+            "device": incoming.device_model,
+            "start_time": result.start_datetime.isoformat(),
+            "end_time": result.end_datetime.isoformat(),
+            "zone_offset": result.zone_offset,
+            "duration_seconds": result.duration_seconds,
+            "efficiency_percent": float(detail.sleep_efficiency_score)
+            if detail.sleep_efficiency_score is not None
+            else None,
+            "stages": {
+                "awake_minutes": detail.sleep_awake_minutes,
+                "light_minutes": detail.sleep_light_minutes,
+                "deep_minutes": detail.sleep_deep_minutes,
+                "rem_minutes": detail.sleep_rem_minutes,
+            }
+            if has_stages
+            else None,
+            "is_nap": detail.is_nap,
+            "source_app": incoming.source,
+            "device_type": device_type,
+            "sleep_duration_seconds": (
+                detail.sleep_total_duration_minutes * 60 if detail.sleep_total_duration_minutes is not None else None
+            ),
+            "sleep_stage_intervals": (
+                [stage.model_dump(mode="json") for stage in detail.sleep_stages] if detail.sleep_stages else None
+            ),
+        }
+        pending = db_session.info.setdefault("sleep_webhooks", {})
+        previous = pending.get(result.id)
+        pending[result.id] = (previous[0] if previous and previous[0] == "created" else action, payload)
+        if db_session.info.get("sleep_webhook_listeners"):
+            return
+        db_session.info["sleep_webhook_listeners"] = True
+
+        @sa_event.listens_for(db_session, "after_commit")
+        def _dispatch_sleep_webhooks(session: Session) -> None:
+            if session.in_nested_transaction():
+                return
+            for event_action, values in session.info.pop("sleep_webhooks", {}).values():
+                emit = on_sleep_updated if event_action == "updated" else on_sleep_created
+                emit(**values)
+
+        @sa_event.listens_for(db_session, "after_soft_rollback")
+        def _discard_sleep_webhooks(session: Session, transaction: SessionTransaction) -> None:
+            if not transaction.nested:
+                session.info.pop("sleep_webhooks", None)
 
     def _create_or_merge_sleep_inner(
         self,
@@ -445,251 +504,97 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
-    ) -> tuple[EventRecord, str, EventRecordDetailCreate]:
-        # Returns (record, action, final_detail). ``action`` is "created" (new insert
-        # or a fresh merged session) or "updated" (an existing session replaced in
-        # place), so the caller emits sleep.created vs sleep.updated accordingly.
-        adjacent = self.find_adjacent_sleep_record(
+    ) -> tuple[EventRecord, str | None, EventRecordDetailCreate]:
+        data_source_id = self.crud.resolve_sleep_data_source(db_session, record)
+        record = record.model_copy(update={"data_source_id": data_source_id})
+        authoritative = record.provider != ProviderName.APPLE and record.external_id is not None
+        candidates = self.crud.find_sleep_merge_candidates(
             db_session,
-            user_id,
+            data_source_id,
             record.start_datetime,
             record.end_datetime,
             threshold_minutes,
-            source=record.source,
-            provider=record.provider,
+            record.external_id,
+            replace_own_window=authoritative,
         )
-
-        if adjacent is not None:
-            # Same external_id → re-ingestion of the same session (e.g. webhook
-            # retry, score update).  Replace the detail with fresh values instead
-            # of accumulating them on top of the existing ones.
-            same_external_id = record.external_id is not None and adjacent.external_id == record.external_id
-            # Apple SDK session IDs come from the first HealthKit sample in a batch.
-            # Once a later batch has been merged into a night, re-uploading that
-            # batch must not replace the whole night with its smaller window.
-            partial_apple_batch = record.provider == ProviderName.APPLE and (
-                record.start_datetime > adjacent.start_datetime or record.end_datetime < adjacent.end_datetime
-            )
-            if same_external_id and not partial_apple_batch:
-                old_start, old_zone = adjacent.start_datetime, adjacent.zone_offset
-                for field in ("start_datetime", "end_datetime", "zone_offset"):
-                    new_val = getattr(record, field, None)
-                    if new_val is not None:
-                        setattr(adjacent, field, new_val)
-                adjacent.duration_seconds = int((adjacent.end_datetime - adjacent.start_datetime).total_seconds())
-                db_session.flush()
-                self.event_record_detail_repo.delete_by_record_id(db_session, adjacent.id, "sleep")
-                self.event_record_detail_repo.create_and_flush(
-                    db_session,
-                    detail.model_copy(update={"record_id": adjacent.id}),
-                    detail_type="sleep",
-                )
-                self._recompute_sleep_scores(
-                    db_session,
-                    user_id,
-                    {
-                        self._local_sleep_date(old_start, old_zone),
-                        self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset),
-                    },
-                )
-                db_session.commit()
-                # In-place update of an existing session → sleep.updated.
-                return adjacent, "updated", detail
-
-            adj_detail: SleepDetails | None = adjacent.sleep_detail
-
-            def _adj_int(attr: str) -> int:
-                return (getattr(adj_detail, attr) or 0) if adj_detail else 0
-
-            adj_in_bed = _adj_int("sleep_time_in_bed_minutes")
-            new_in_bed = detail.sleep_time_in_bed_minutes or 0
-            incoming_contained = (
-                record.start_datetime >= adjacent.start_datetime and record.end_datetime <= adjacent.end_datetime
-            )
-            merged_in_bed = (
-                max(adj_in_bed, new_in_bed) if partial_apple_batch and incoming_contained else adj_in_bed + new_in_bed
-            )
-
-            # Weighted efficiency: only include sessions that have a non-None score
-            # so a missing score on one session does not dilute the merged average.
-            merged_efficiency: Decimal | None = None
-            eff_numerator = 0.0
-            eff_denominator = 0
-            if adj_detail and adj_detail.sleep_efficiency_score and adj_in_bed > 0:
-                eff_numerator += float(adj_detail.sleep_efficiency_score) * adj_in_bed
-                eff_denominator += adj_in_bed
-            if detail.sleep_efficiency_score and new_in_bed > 0:
-                eff_numerator += float(detail.sleep_efficiency_score) * new_in_bed
-                eff_denominator += new_in_bed
-            if eff_denominator > 0:
-                merged_efficiency = Decimal(str(round(eff_numerator / eff_denominator, 2)))
-
-            # Merge sleep_stages: convert DB dicts back to SleepStage, concatenate, sort
-            adj_stages_raw = (adj_detail.sleep_stages if adj_detail else None) or []
-            adj_stages = [SleepStage.model_validate(s) for s in adj_stages_raw]
-            new_stages = list(detail.sleep_stages or [])
-            merged_stages: list[SleepStage] | None = None
-            if adj_stages or new_stages:
-                merged_stages = sorted(adj_stages + new_stages, key=lambda s: s.start_time)
-                if partial_apple_batch:
-                    merged_stages = list({(s.stage, s.start_time, s.end_time): s for s in merged_stages}.values())
-
-            merged_start = min(adjacent.start_datetime, record.start_datetime)
-            merged_end = max(adjacent.end_datetime, record.end_datetime)
-
-            # Compute per-stage minute totals.  When the windows actually overlap
-            # and stage intervals are available, recompute from the merged timeline
-            # (clipping overlaps — consistent with Apple SDK's _calculate_final_metrics)
-            # to avoid double-counting the overlapping period.  For non-overlapping
-            # sessions simple summation is exact.
-            overlap_seconds = max(
-                0,
-                (
-                    min(adjacent.end_datetime, record.end_datetime)
-                    - max(adjacent.start_datetime, record.start_datetime)
-                ).total_seconds(),
-            )
-            if overlap_seconds > 0 and merged_stages:
-                deep_secs = light_secs = rem_secs = awake_secs = sleeping_secs = 0.0
-                last_end = None
-                for s in merged_stages:  # already sorted above
-                    s_start, s_end = s.start_time, s.end_time
-                    if last_end is not None and s_start < last_end:
-                        s_start = last_end
-                    if s_start >= s_end:
-                        continue
-                    dur = (s_end - s_start).total_seconds()
-                    stage_str = str(s.stage)
-                    if stage_str == "deep":
-                        deep_secs += dur
-                    elif stage_str == "light":
-                        light_secs += dur
-                    elif stage_str == "rem":
-                        rem_secs += dur
-                    elif stage_str == "awake":
-                        awake_secs += dur
-                    elif stage_str == "sleeping":
-                        sleeping_secs += dur
-                    last_end = s_end
-                merged_deep = int(deep_secs / 60)
-                merged_light = int(light_secs / 60)
-                merged_rem = int(rem_secs / 60)
-                merged_awake = int(awake_secs / 60)
-                merged_total = merged_deep + merged_light + merged_rem + int(sleeping_secs / 60)
-            else:
-                merged_deep = _adj_int("sleep_deep_minutes") + (detail.sleep_deep_minutes or 0)
-                merged_light = _adj_int("sleep_light_minutes") + (detail.sleep_light_minutes or 0)
-                merged_rem = _adj_int("sleep_rem_minutes") + (detail.sleep_rem_minutes or 0)
-                merged_awake = _adj_int("sleep_awake_minutes") + (detail.sleep_awake_minutes or 0)
-                merged_total = _adj_int("sleep_total_duration_minutes") + (detail.sleep_total_duration_minutes or 0)
-
-            self.logger.info(
-                "Merging adjacent sleep records: %s (%s – %s) + %s (%s – %s)",
-                adjacent.id,
-                adjacent.start_datetime,
-                adjacent.end_datetime,
-                record.id,
-                record.start_datetime,
-                record.end_datetime,
-            )
-
-            merged_detail_fields = {
-                "sleep_deep_minutes": merged_deep,
-                "sleep_light_minutes": merged_light,
-                "sleep_rem_minutes": merged_rem,
-                "sleep_awake_minutes": merged_awake,
-                "sleep_total_duration_minutes": merged_total,
-                "sleep_time_in_bed_minutes": merged_in_bed,
-                "sleep_efficiency_score": merged_efficiency,
-                "is_nap": bool(adj_detail.is_nap if adj_detail else False) and bool(detail.is_nap or False),
-                "sleep_stages": merged_stages,
-            }
-
-            # When the merged window is identical to the existing record's window
-            # (new session fully contained within adjacent), inserting a new record
-            # would violate the unique constraint on (data_source_id, start, end).
-            # Detect this upfront and update the detail in-place instead.
-            same_window = (
-                merged_start == adjacent.start_datetime
-                and merged_end == adjacent.end_datetime
-                and record.data_source_id is not None
-                and record.data_source_id == adjacent.data_source_id
-            )
-
-            if same_window:
-                self.event_record_detail_repo.delete_by_record_id(db_session, adjacent.id, "sleep")
-                self.event_record_detail_repo.create_and_flush(
-                    db_session,
-                    detail.model_copy(update={"record_id": adjacent.id, **merged_detail_fields}),
-                    detail_type="sleep",
-                )
-                self._recompute_sleep_scores(
-                    db_session,
-                    user_id,
-                    {self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset)},
-                )
-                db_session.commit()
-                # Same-window re-ingestion replaced the detail with merged values
-                # → sleep.updated so consumers get the refreshed session.
-                return adjacent, "updated", detail.model_copy(update={**merged_detail_fields})
-
-            record = record.model_copy(
+        own = [
+            candidate
+            for candidate in candidates
+            if record.external_id is not None and candidate.external_id == record.external_id
+        ]
+        survivor = min(own or candidates, key=lambda candidate: (candidate.start_datetime, candidate.id), default=None)
+        old_dates = {
+            self._to_local(boundary, candidate.zone_offset).date()
+            for candidate in candidates
+            for boundary in (candidate.start_datetime, candidate.end_datetime)
+        }
+        parts = [
+            (candidate.start_datetime, candidate.end_datetime, self._sleep_detail_snapshot(candidate))
+            for candidate in candidates
+            if not (authoritative and candidate in own)
+        ]
+        parts.append((record.start_datetime, record.end_datetime, detail))
+        start, end, final_detail = merge_sleep_parts(parts)
+        if survivor is None:
+            creation = record.model_copy(
                 update={
-                    "id": uuid4(),
-                    "start_datetime": merged_start,
-                    "end_datetime": merged_end,
-                    "duration_seconds": int((merged_end - merged_start).total_seconds()),
+                    "start_datetime": start,
+                    "end_datetime": end,
+                    "duration_seconds": int((end - start).total_seconds()),
                 }
             )
-            created_record = self.crud.create_and_flush(db_session, record)
-
-            if created_record.id == adjacent.id:
-                # data_source_id was None (resolved at insert time) and the
-                # constraint returned the existing row — treat as same_window.
-                self.event_record_detail_repo.delete_by_record_id(db_session, adjacent.id, "sleep")
-                self.event_record_detail_repo.create_and_flush(
-                    db_session,
-                    detail.model_copy(update={"record_id": adjacent.id, **merged_detail_fields}),
-                    detail_type="sleep",
-                )
-                self._recompute_sleep_scores(
-                    db_session,
-                    user_id,
-                    {self._local_sleep_date(adjacent.start_datetime, adjacent.zone_offset)},
-                )
-                db_session.commit()
-                # Same-window re-ingestion replaced the detail with merged values
-                # → sleep.updated so consumers get the refreshed session.
-                return adjacent, "updated", detail.model_copy(update={**merged_detail_fields})
-
-            merged_final_detail = detail.model_copy(update={"record_id": created_record.id, **merged_detail_fields})
-            self.event_record_detail_repo.create_and_flush(
-                db_session,
-                merged_final_detail,
-                detail_type="sleep",
-            )
-            adj_start, adj_zone = adjacent.start_datetime, adjacent.zone_offset
-            self.crud.delete_flush(db_session, adjacent)
+            survivor = self.crud.create_and_flush(db_session, creation)
+            if survivor.category != "sleep" or survivor.type != "sleep_session":
+                raise ValueError("Sleep window is occupied by another event category")
+            final_detail = final_detail.model_copy(update={"record_id": survivor.id})
+            self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type="sleep")
             self._recompute_sleep_scores(
                 db_session,
                 user_id,
-                {
-                    self._local_sleep_date(adj_start, adj_zone),
-                    self._local_sleep_date(created_record.start_datetime, created_record.zone_offset),
-                },
+                {self._to_local(boundary, record.zone_offset).date() for boundary in (start, end)},
             )
-            db_session.commit()
-            return created_record, "created", merged_final_detail
+            return survivor, "created", final_detail
 
-        created_record = self.crud.create_and_flush(db_session, record)
-        new_detail = detail.model_copy(update={"record_id": created_record.id})
-        self.event_record_detail_repo.create_and_flush(
-            db_session,
-            new_detail,
-            detail_type="sleep",
+        final_detail = final_detail.model_copy(update={"record_id": survivor.id})
+        duplicates = [candidate for candidate in candidates if candidate.id != survivor.id]
+        zone_offset = record.zone_offset if record.zone_offset is not None else survivor.zone_offset
+        unchanged = (
+            not duplicates
+            and survivor.start_datetime == start
+            and survivor.end_datetime == end
+            and survivor.zone_offset == zone_offset
+            and self._sleep_detail_snapshot(survivor) == final_detail
         )
-        db_session.commit()
-        return created_record, "created", new_detail
+        if unchanged:
+            return survivor, None, final_detail
+
+        # Free any target slot before the surviving row is expanded. Everything
+        # stays in the same transaction so a later error restores every old row.
+        self.crud.preserve_sleep_provider_scores(db_session, survivor, duplicates)
+        self.crud.delete_sleep_candidates(db_session, duplicates)
+        survivor.start_datetime = start
+        survivor.end_datetime = end
+        survivor.zone_offset = zone_offset
+        survivor.duration_seconds = int((end - start).total_seconds())
+        db_session.flush()
+        self.event_record_detail_repo.delete_by_record_id(db_session, survivor.id, "sleep")
+        self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type="sleep")
+        db_session.expire(survivor, ["sleep_detail"])
+        old_dates.update(self._to_local(boundary, zone_offset).date() for boundary in (start, end))
+        self._recompute_sleep_scores(db_session, user_id, old_dates)
+        log_structured(
+            self.logger,
+            "info",
+            "Reconciled adjacent sleep records",
+            action="sleep_records_reconciled",
+            user_id=str(user_id),
+            record_id=str(survivor.id),
+            absorbed_record_ids=[str(candidate.id) for candidate in duplicates],
+        )
+        # Drop snapshots of rows absorbed by another merge in this transaction.
+        for duplicate in duplicates:
+            db_session.info.get("sleep_webhooks", {}).pop(duplicate.id, None)
+        return survivor, "updated", final_detail
 
     @staticmethod
     def _emit_event_record_webhook(

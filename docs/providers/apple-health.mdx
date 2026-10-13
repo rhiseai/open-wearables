@@ -96,6 +96,16 @@ See the [Flutter SDK documentation](/sdk/flutter#supported-health-data-types) fo
   Cycle-start flags (`HKMenstrualCycleStart`) are taken from the in-flight SDK payload only — timeseries rows do not store HealthKit metadata. Re-grouping across historical syncs therefore relies on a gap &gt; 1 day heuristic; rare back-to-back periods with no gap may merge until a later sync carries an explicit cycle-start flag.
 </Note>
 
+## Sleep upload integrity and recovery
+
+The SDK sync endpoint returns `202 Accepted` when the upload is queued. This is not proof that its sleep sessions were persisted: check the completed sync status and stored sessions. Apple sleep batches are accumulated within the existing exact data source, so replaying part of a night reconciles its stored sessions instead of replacing the night with that fragment. Other devices and sources remain separate, and the existing summary priority rules choose which source to display.
+
+For old overlapping duplicate sessions, `backend/scripts/data_migrations/reconcile_apple_sleep.py` provides a manual, account-scoped dry run and an explicit `--apply` mode. Both the account and local wake-date window are required; its module docstring documents the run procedure, audit output and skipped ambiguous cases. This tool is not run at startup. Review its before snapshots and the normal database backup before an approved apply, then verify the surviving session and repeat the dry run to confirm no overlapping duplicate remains.
+
+Before a repair pilot, finish or drain older SDK and stale-sleep worker generations: older code can still write the legacy per-user Redis state during a rolling deployment. Legacy state is saved under its recorded source identity; stages already mixed across sources cannot be separated retrospectively. Stored hypnograms are cleaned intervals rather than raw HealthKit samples, so contradictory stage labels can still require a fresh HealthKit replay. Legacy aggregate sleep not represented by its stages remains a lower bound until enough interval evidence arrives; this does not reconstruct the missing stages.
+
+A lone shortened session cannot reveal its missing samples. Once the corrected server is deployed, Lucie's existing targeted `wearables.apple_sleep_repair` rollout can ask a compatible iPhone to replay the last 92 days of HealthKit sleep. A successful upload still requires an audit of the restored Open Wearables window, stages and duration. Historical `sleep.updated` delivery or an explicitly forced Lucie refresh must also rebuild each affected historical date; SDK `sync.completed` alone refreshes today's Lucie data. Confirm the historical sleep card before ending the repair inclusion. Replays are incremental: missing samples do not declare a deletion or an authoritative full-night replacement.
+
 ## Apple Health as a Data Bridge
 
 Even if a provider is **not yet directly supported** by Open Wearables, its data can still be collected by syncing it into Apple Health first.

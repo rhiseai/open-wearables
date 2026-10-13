@@ -94,7 +94,7 @@ class TestFinalizeStaleSleepsTask:
 
         # Assert
         mock_load_state.assert_called_once_with(user_id)
-        mock_finish_sleep.assert_called_once_with(db, user_id, mock_sleep_state)
+        mock_finish_sleep.assert_called_once_with(db, user_id, mock_sleep_state, commit=False)
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state")
@@ -255,8 +255,8 @@ class TestFinalizeStaleSleepsTask:
         assert mock_load_state.call_count == 3
         assert mock_finish_sleep.call_count == 2  # Only user 1 and 3
 
-        mock_finish_sleep.assert_any_call(db, user_id_1, state_1)
-        mock_finish_sleep.assert_any_call(db, user_id_3, state_3)
+        mock_finish_sleep.assert_any_call(db, user_id_1, state_1, commit=False)
+        mock_finish_sleep.assert_any_call(db, user_id_3, state_3, commit=False)
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.log_and_capture_error")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
@@ -334,7 +334,7 @@ class TestFinalizeStaleSleepsTask:
         mock_log_error.assert_called_once()  # Error should be logged for user 1
 
         # Verify user 2 was still processed despite user 1 error
-        mock_finish_sleep.assert_any_call(db, user_id_2, state_2)
+        mock_finish_sleep.assert_any_call(db, user_id_2, state_2, commit=False)
 
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client")
