@@ -20,6 +20,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
+from app.services.providers.deregistration_error import ProviderDeregistrationError
 from app.services.providers.oura.oauth import OuraOAuth
 from app.services.user_connection_service import user_connection_service
 from app.services.user_service import user_service
@@ -231,34 +232,55 @@ class TestUserServiceDelete:
 
     @pytest.mark.parametrize(
         "revoke_outcome",
-        [200, 401, 500, httpx.ReadTimeout, httpx.ConnectError],
-        ids=["success", "unauthorized", "server-error", "timeout", "connection-error"],
+        [200, 401, 500, httpx.ReadTimeout, httpx.ConnectError, RuntimeError, HTTPException],
+        ids=[
+            "success",
+            "unauthorized",
+            "server-error",
+            "timeout",
+            "connection-error",
+            "unexpected-error",
+            "refresh-unauthorized",
+        ],
     )
-    def test_delete_continues_after_provider_revoke(
-        self, db: Session, revoke_outcome: int | type[httpx.RequestError]
-    ) -> None:
+    def test_delete_continues_after_provider_revoke(self, db: Session, revoke_outcome: int | type[Exception]) -> None:
         """A failed Oura revoke must still attempt later providers and remove the user."""
         user = UserFactory()
         token = "synthetic-oura-deletion-token"
         following = UserConnectionFactory(
             user=user, provider="polar", created_at=datetime.now(timezone.utc) - timedelta(hours=1)
         )
-        oura = UserConnectionFactory(user=user, provider="oura", access_token=token)
+        oura = UserConnectionFactory(
+            user=user,
+            provider="oura",
+            access_token=token,
+            token_expires_at=datetime.now(timezone.utc)
+            + (timedelta(hours=-1) if revoke_outcome is HTTPException else timedelta(days=1)),
+        )
         user_id, connection_ids = user.id, (oura.id, following.id)
         following_token, following_provider_id = following.access_token, following.provider_user_id
         oura_oauth = OuraOAuth(user_service.crud, user_connection_service.crud, "oura", "https://api.ouraring.com")
         following_oauth = MagicMock()
         request = httpx.Request("POST", "https://api.ouraring.com/oauth/revoke", params={"access_token": token})
         response = httpx.Response(revoke_outcome, request=request) if isinstance(revoke_outcome, int) else None
-        error = (
-            revoke_outcome(f"Revoke failed for {request.url}", request=request)
-            if not isinstance(revoke_outcome, int)
-            else None
-        )
+        error = None
+        if revoke_outcome is HTTPException:
+            error = HTTPException(401, detail=f"Refresh rejected {token}", headers={"Authorization": f"Bearer {token}"})
+        elif not isinstance(revoke_outcome, int):
+            error = (
+                revoke_outcome(f"Revoke failed for {request.url}", request=request)
+                if issubclass(revoke_outcome, httpx.RequestError)
+                else revoke_outcome(f"Revoke failed for {request.url}")
+            )
 
         with (
             patch("app.services.user_service.ProviderFactory") as factory,
-            patch("app.services.providers.oura.oauth.httpx.post", return_value=response, side_effect=error) as post,
+            patch(
+                "app.services.providers.oura.oauth.httpx.post",
+                return_value=response,
+                side_effect=None if revoke_outcome is HTTPException else error,
+            ) as post,
+            patch.object(oura_oauth, "refresh_access_token", side_effect=error) as refresh,
             patch("app.services.user_connection_service.log_and_capture_error") as report,
             patch("app.services.user_service.release_stale_primary"),
             patch("app.services.user_service.force_release_backfill_lock"),
@@ -274,20 +296,44 @@ class TestUserServiceDelete:
         assert all(user_connection_service.get(db, connection_id) is None for connection_id in connection_ids)
         assert factory.return_value.get_provider.call_args_list == [call("oura"), call("polar")]
         following_oauth.deregister_user.assert_called_once_with(following_token, provider_user_id=following_provider_id)
-        post.assert_called_once_with(
-            "https://api.ouraring.com/oauth/revoke", params={"access_token": token}, timeout=30.0
-        )
+        if revoke_outcome is HTTPException:
+            refresh.assert_called_once()
+            post.assert_not_called()
+        else:
+            refresh.assert_not_called()
+            post.assert_called_once_with(
+                "https://api.ouraring.com/oauth/revoke", params={"access_token": token}, timeout=30.0
+            )
         if revoke_outcome == 200:
             report.assert_not_called()
         else:
             report.assert_called_once()
             captured = report.call_args.args[0]
-            assert report.call_args.kwargs["extra"] == {"user_id": str(user_id), "provider": "oura"}
-            if isinstance(revoke_outcome, int):
-                assert isinstance(captured, httpx.HTTPStatusError)
-                assert captured.response.status_code == revoke_outcome
+            if revoke_outcome is HTTPException:
+                assert isinstance(captured, HTTPException)
+                assert captured.status_code == 401
+                assert captured.headers is None
+                expected_context = {"error_type": "HTTPException", "status_code": 401}
             else:
-                assert captured is error
+                assert isinstance(captured, ProviderDeregistrationError)
+                assert captured.error_type == (
+                    "HTTPStatusError" if isinstance(revoke_outcome, int) else revoke_outcome.__name__
+                )
+                assert captured.status_code == (revoke_outcome if isinstance(revoke_outcome, int) else None)
+                assert captured.method == (None if revoke_outcome is RuntimeError else "POST")
+                assert captured.endpoint == (
+                    None if revoke_outcome is RuntimeError else "https://api.ouraring.com/oauth/revoke"
+                )
+                expected_context = captured.context
+            assert report.call_args.kwargs["extra"] == {"user_id": str(user_id), "provider": "oura", **expected_context}
+            assert captured is not error
+            assert captured.__cause__ is None
+            assert captured.__context__ is None
+            assert not hasattr(captured, "request")
+            assert not hasattr(captured, "response")
+            assert token not in str(captured)
+            assert token not in repr(vars(captured))
+            assert token not in repr(report.call_args)
 
 
 class TestUserServiceGetCountInRange:
