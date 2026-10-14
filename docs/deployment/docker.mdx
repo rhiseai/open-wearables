@@ -259,6 +259,8 @@ Structured app log lines keep the same fields in `legacy` and `json`: `timestamp
 
 `LOG_LEVEL` also changes what Sentry sees from standard-library log records (`logger.error(...)` and similar) of app, Celery and uvicorn code: with `CRITICAL`, their errors no longer create Sentry events, and above `INFO` their `INFO` records no longer become breadcrumbs. Libraries with a level of their own (`httpx`, `httpcore`) still report to Sentry as before. `log_structured` lines never reach Sentry, whatever the level, and exceptions captured explicitly (`capture_exception`) or left unhandled always do. `WARN` and `FATAL` are accepted as aliases. Any other value, for example one your platform sets for another tool, is ignored with a warning at startup, as if `LOG_LEVEL` were not set.
 
+Sentry error events, breadcrumbs, and transactions omit HTTP URL queries and fragments, OAuth credential fields, and bearer authorization values, including copies embedded in exception and formatted log text. Frame local variables are not captured. Provider names, exception types, stack locations, HTTP status codes, and endpoint paths remain available for diagnosis. This filtering applies to Sentry payloads; it does not change provider requests or console logs.
+
 <Note>
   The default will change from `legacy` to `text` in a future release. Set `LOG_FORMAT` explicitly if you depend on the current output.
 </Note>

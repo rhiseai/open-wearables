@@ -10,15 +10,20 @@ Tests cover:
 """
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock, call, patch
 from uuid import uuid4
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
+from app.services.providers.oura.oauth import OuraOAuth
+from app.services.user_connection_service import user_connection_service
 from app.services.user_service import user_service
-from tests.factories import UserFactory
+from tests.factories import UserConnectionFactory, UserFactory
 
 
 class TestUserServiceCreate:
@@ -223,6 +228,66 @@ class TestUserServiceDelete:
 
         # Act & Assert - should not raise error
         user_service.delete(db, fake_id, raise_404=False)
+
+    @pytest.mark.parametrize(
+        "revoke_outcome",
+        [200, 401, 500, httpx.ReadTimeout, httpx.ConnectError],
+        ids=["success", "unauthorized", "server-error", "timeout", "connection-error"],
+    )
+    def test_delete_continues_after_provider_revoke(
+        self, db: Session, revoke_outcome: int | type[httpx.RequestError]
+    ) -> None:
+        """A failed Oura revoke must still attempt later providers and remove the user."""
+        user = UserFactory()
+        token = "synthetic-oura-deletion-token"
+        following = UserConnectionFactory(
+            user=user, provider="polar", created_at=datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        oura = UserConnectionFactory(user=user, provider="oura", access_token=token)
+        user_id, connection_ids = user.id, (oura.id, following.id)
+        following_token, following_provider_id = following.access_token, following.provider_user_id
+        oura_oauth = OuraOAuth(user_service.crud, user_connection_service.crud, "oura", "https://api.ouraring.com")
+        following_oauth = MagicMock()
+        request = httpx.Request("POST", "https://api.ouraring.com/oauth/revoke", params={"access_token": token})
+        response = httpx.Response(revoke_outcome, request=request) if isinstance(revoke_outcome, int) else None
+        error = (
+            revoke_outcome(f"Revoke failed for {request.url}", request=request)
+            if not isinstance(revoke_outcome, int)
+            else None
+        )
+
+        with (
+            patch("app.services.user_service.ProviderFactory") as factory,
+            patch("app.services.providers.oura.oauth.httpx.post", return_value=response, side_effect=error) as post,
+            patch("app.services.user_connection_service.log_and_capture_error") as report,
+            patch("app.services.user_service.release_stale_primary"),
+            patch("app.services.user_service.force_release_backfill_lock"),
+        ):
+            factory.return_value.get_provider.side_effect = [
+                SimpleNamespace(oauth=oura_oauth),
+                SimpleNamespace(oauth=following_oauth),
+            ]
+            deleted = user_service.delete(db, user_id)
+
+        assert deleted is not None
+        assert user_service.get(db, user_id) is None
+        assert all(user_connection_service.get(db, connection_id) is None for connection_id in connection_ids)
+        assert factory.return_value.get_provider.call_args_list == [call("oura"), call("polar")]
+        following_oauth.deregister_user.assert_called_once_with(following_token, provider_user_id=following_provider_id)
+        post.assert_called_once_with(
+            "https://api.ouraring.com/oauth/revoke", params={"access_token": token}, timeout=30.0
+        )
+        if revoke_outcome == 200:
+            report.assert_not_called()
+        else:
+            report.assert_called_once()
+            captured = report.call_args.args[0]
+            assert report.call_args.kwargs["extra"] == {"user_id": str(user_id), "provider": "oura"}
+            if isinstance(revoke_outcome, int):
+                assert isinstance(captured, httpx.HTTPStatusError)
+                assert captured.response.status_code == revoke_outcome
+            else:
+                assert captured is error
 
 
 class TestUserServiceGetCountInRange:

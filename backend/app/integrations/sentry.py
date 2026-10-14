@@ -3,6 +3,7 @@ from sentry_sdk.integrations.celery import CeleryIntegration
 
 from app import __version__
 from app.config import settings
+from app.utils.sentry_redaction import before_breadcrumb, before_send
 
 
 def init_sentry() -> None:
@@ -14,6 +15,10 @@ def init_sentry() -> None:
             server_name=settings.SENTRY_SERVER_NAME,
             release=release,
             traces_sample_rate=settings.SENTRY_SAMPLES_RATE,
+            include_local_variables=False,
+            before_send=before_send,
+            before_send_transaction=before_send,
+            before_breadcrumb=before_breadcrumb,
             integrations=[
                 CeleryIntegration(
                     monitor_beat_tasks=True,

@@ -12,11 +12,15 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+import httpx
+import pytest
 from sqlalchemy.orm import Session
 
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
+from app.services.providers.oura.oauth import OuraOAuth
 from app.services.user_connection_service import user_connection_service
+from app.services.user_service import user_service
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -531,3 +535,56 @@ class TestUserConnectionServiceDeregisterFromProvider:
         user_connection_service.deregister_from_provider(db, user.id, "garmin", oauth)
 
         oauth.deregister_user.assert_not_called()
+
+
+class TestUserConnectionServiceDisconnect:
+    """Provider revoke failures must remain observable without blocking local disconnect."""
+
+    @pytest.mark.parametrize(
+        "revoke_outcome",
+        [200, 401, 500, httpx.ReadTimeout, httpx.ConnectError],
+        ids=["success", "unauthorized", "server-error", "timeout", "connection-error"],
+    )
+    def test_disconnect_clears_tokens_after_provider_revoke(
+        self, db: Session, revoke_outcome: int | type[httpx.RequestError]
+    ) -> None:
+        user = UserFactory()
+        token = "synthetic-oura-disconnect-token"
+        connection = UserConnectionFactory(user=user, provider="oura", access_token=token)
+        oauth = OuraOAuth(user_service.crud, user_connection_service.crud, "oura", "https://api.ouraring.com")
+        request = httpx.Request("POST", "https://api.ouraring.com/oauth/revoke", params={"access_token": token})
+        response = httpx.Response(revoke_outcome, request=request) if isinstance(revoke_outcome, int) else None
+        error = (
+            revoke_outcome(f"Revoke failed for {request.url}", request=request)
+            if not isinstance(revoke_outcome, int)
+            else None
+        )
+
+        with (
+            patch("app.services.providers.oura.oauth.httpx.post", return_value=response, side_effect=error) as post,
+            patch("app.services.user_connection_service.log_and_capture_error") as report,
+            patch("app.services.user_connection_service.on_connection_revoked") as emit,
+        ):
+            user_connection_service.disconnect(db, user.id, "oura", oauth=oauth)
+
+        post.assert_called_once_with(
+            "https://api.ouraring.com/oauth/revoke", params={"access_token": token}, timeout=30.0
+        )
+        db.refresh(connection)
+        assert connection.status == ConnectionStatus.REVOKED
+        assert connection.access_token is None
+        assert connection.refresh_token is None
+        assert connection.token_expires_at is None
+        emit.assert_called_once()
+        assert emit.call_args.kwargs["reason"] == "user_disconnected"
+        if revoke_outcome == 200:
+            report.assert_not_called()
+        else:
+            report.assert_called_once()
+            captured = report.call_args.args[0]
+            assert report.call_args.kwargs["extra"] == {"user_id": str(user.id), "provider": "oura"}
+            if isinstance(revoke_outcome, int):
+                assert isinstance(captured, httpx.HTTPStatusError)
+                assert captured.response.status_code == revoke_outcome
+            else:
+                assert captured is error
