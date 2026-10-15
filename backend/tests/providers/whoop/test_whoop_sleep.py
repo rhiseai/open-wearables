@@ -123,6 +123,14 @@ class TestWhoopSleepZoneOffset:
         [record] = _sleep_records(db, user.id)
         assert record.zone_offset == "+07:00"
 
+    def test_utc_night_stores_z_as_zero_offset(self, db: Session, data_247: Whoop247Data) -> None:
+        user = UserFactory()
+
+        _load(data_247, db, user.id, {**FIRST_NIGHT, "timezone_offset": "Z"})
+
+        [record] = _sleep_records(db, user.id)
+        assert record.zone_offset == "+00:00"
+
     def test_pulled_night_keeps_timezone_offset(self, db: Session, data_247: Whoop247Data) -> None:
         """The periodic pull (``/v2/activity/sleep`` pages) stores the offset like the webhook path."""
         user = UserFactory()
