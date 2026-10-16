@@ -16,6 +16,7 @@ from app.schemas.responses.upload import (
 )
 from app.services.outgoing_webhooks.events import on_connection_created, on_connection_revoked
 from app.services.providers.api_client import get_valid_token
+from app.services.providers.deregistration_error import ProviderDeregistrationError, safe_deregistration_error
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
@@ -217,19 +218,26 @@ class UserConnectionService(
                 user_id=str(user_id),
             )
         except Exception as e:
+            safe_error = safe_deregistration_error(e)
+            error_context = (
+                safe_error.context
+                if isinstance(safe_error, ProviderDeregistrationError)
+                else {"error_type": type(e).__name__, "status_code": safe_error.status_code}
+            )
             log_structured(
                 self.logger,
                 "error",
-                f"Failed to deregister user from provider API: {e}",
+                "Failed to deregister user from provider API",
                 provider=provider,
                 task="deregister_user",
                 user_id=str(user_id),
+                **error_context,
             )
             log_and_capture_error(
-                e,
+                safe_error,
                 self.logger,
-                f"Failed to deregister user {user_id} from {provider} API: {e}",
-                extra={"user_id": str(user_id), "provider": provider},
+                "Failed to deregister user from provider API",
+                extra={"user_id": str(user_id), "provider": provider, **error_context},
             )
 
 
