@@ -2,7 +2,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import and_, asc, desc, tuple_
+from sqlalchemy import Date, and_, asc, desc
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -113,35 +113,42 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         Returns list of dicts with keys: recovery_date, provider, source, device_model,
         device_type, record_id, recorded_at, recovery_score, resting_heart_rate,
         hrv_rmssd_milli, spo2_percentage.
-        Fetches limit+1 rows so callers can detect has_more without a separate COUNT query.
+        Pages whole days, as get_sleep_summaries does: every score of up to limit + 1
+        days past the cursor, so a caller that keeps one source per day can detect
+        has_more without a separate COUNT query and no day is split across pages.
         Ordering matches get_sleep_summaries: ASC by default, DESC when paginating backward.
         """
-        # Outer join so scores without a data_source (older rows) still come back.
-        query = (
-            db_session.query(HealthScore, DataSource)
-            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
-            .filter(
-                HealthScore.user_id == user_id,
-                HealthScore.category == HealthScoreCategory.RECOVERY,
-                HealthScore.recorded_at >= start_date,
-                HealthScore.recorded_at < end_date,
-            )
+        recovery_date = HealthScore.recorded_at.cast(Date)
+        in_range = (
+            HealthScore.user_id == user_id,
+            HealthScore.category == HealthScoreCategory.RECOVERY,
+            HealthScore.recorded_at >= start_date,
+            HealthScore.recorded_at < end_date,
         )
 
+        # The page's days. The cursor names the day the last page ended on.
+        dates_query = db_session.query(recovery_date).filter(*in_range).group_by(recovery_date)
+        order = asc
         if cursor:
-            cursor_ts, cursor_id, direction = decode_cursor(cursor)
+            cursor_ts, _, direction = decode_cursor(cursor)
+            cursor_date = cursor_ts.date()
             if direction == "prev":
-                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) < (cursor_ts, cursor_id)).order_by(
-                    desc(HealthScore.recorded_at), desc(HealthScore.id)
-                )
+                order = desc
+                dates_query = dates_query.filter(recovery_date < cursor_date)
             else:
-                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) > (cursor_ts, cursor_id)).order_by(
-                    asc(HealthScore.recorded_at), asc(HealthScore.id)
-                )
-        else:
-            query = query.order_by(asc(HealthScore.recorded_at), asc(HealthScore.id))
+                dates_query = dates_query.filter(recovery_date > cursor_date)
+        page_dates = [row[0] for row in dates_query.order_by(order(recovery_date)).limit(limit + 1)]
+        if not page_dates:
+            return []
 
-        rows = query.limit(limit + 1).all()
+        # Outer join so scores without a data_source (older rows) still come back.
+        rows = (
+            db_session.query(HealthScore, DataSource)
+            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
+            .filter(*in_range, recovery_date.in_(page_dates))
+            .order_by(order(HealthScore.recorded_at), order(HealthScore.id))
+            .all()
+        )
 
         return [
             {

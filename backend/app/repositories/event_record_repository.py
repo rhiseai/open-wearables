@@ -909,6 +909,10 @@ class EventRecordRepository(
     ) -> list[dict]:
         """Get daily sleep summaries aggregated by date, source, and device_model.
 
+        A page is whole nights: every source's row for up to ``limit + 1`` sleep dates
+        past the cursor, so a caller that keeps one source per night can tell from the
+        extra night that there is a next page, and no night is split across pages.
+
         Returns list of dicts with keys:
         - sleep_date, min_start_time, max_end_time, total_duration_minutes
         - provider, source, device_model, device_type, record_id
@@ -927,6 +931,34 @@ class EventRecordRepository(
             EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
             Date,
         )
+        in_range = (
+            DataSource.user_id == user_id,
+            EventRecord.category == "sleep",
+            EventRecord.end_datetime >= start_date - timedelta(days=1),
+            local_sleep_date >= cast(start_date, Date),
+            local_sleep_date < cast(end_date, Date),
+        )
+
+        # The page's nights. The cursor names the night the last page ended on; its
+        # record id is not needed, since that night came back whole.
+        dates_query = (
+            db_session.query(local_sleep_date)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(*in_range)
+            .group_by(local_sleep_date)
+        )
+        order = asc
+        if cursor:
+            cursor_ts, _, direction = decode_cursor(cursor)
+            cursor_date = cursor_ts.date()
+            if direction == "prev":
+                order = desc
+                dates_query = dates_query.filter(local_sleep_date < cursor_date)
+            else:
+                dates_query = dates_query.filter(local_sleep_date > cursor_date)
+        page_dates = [row[0] for row in dates_query.order_by(order(local_sleep_date)).limit(limit + 1)]
+        if not page_dates:
+            return []
 
         # Build base aggregated query as subquery
         # Join with SleepDetails to get sleep stage data
@@ -995,13 +1027,7 @@ class EventRecordRepository(
             )
             .join(DataSource, EventRecord.data_source_id == DataSource.id)
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
-            .filter(
-                DataSource.user_id == user_id,
-                EventRecord.category == "sleep",
-                EventRecord.end_datetime >= start_date - timedelta(days=1),
-                local_sleep_date >= cast(start_date, Date),
-                local_sleep_date < cast(end_date, Date),
-            )
+            .filter(*in_range, local_sleep_date.in_(page_dates))
             .group_by(
                 local_sleep_date,
                 DataSource.provider,
@@ -1074,25 +1100,8 @@ class EventRecordRepository(
             physio_lateral.c.avg_spo2,
         ).outerjoin(physio_lateral, true())
 
-        # Handle cursor pagination
-        if cursor:
-            cursor_ts, cursor_id, direction = decode_cursor(cursor)
-            cursor_date = cursor_ts.date()
-
-            if direction == "prev":
-                # Backward pagination: get items BEFORE cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) < (cursor_date, cursor_id))
-                query = query.order_by(desc(subquery.c.sleep_date), desc(record_id_col))
-            else:
-                # Forward pagination: get items AFTER cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) > (cursor_date, cursor_id))
-                query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
-        else:
-            # No cursor: default ordering
-            query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
-
-        # Limit + 1 to check for has_more
-        results = query.limit(limit + 1).all()
+        # Page order: oldest night first, newest first when paging backward.
+        results = query.order_by(order(subquery.c.sleep_date), order(record_id_col)).all()
 
         # Transform results to dict format
         summaries = []

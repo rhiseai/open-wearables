@@ -1,6 +1,6 @@
 """Tests for SummariesService."""
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from logging import getLogger
 from typing import Any
 from uuid import uuid4
@@ -8,13 +8,14 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from app.schemas.enums import ProviderName
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.services.priority_service import priority_service
 from app.services.summaries_service import SummariesService
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
     EventRecordFactory,
+    HealthScoreFactory,
     PersonalRecordFactory,
     SeriesTypeDefinitionFactory,
     SleepDetailsFactory,
@@ -262,6 +263,50 @@ class TestGetSleepSummaries:
         assert result.pagination.has_more is True
         assert result.pagination.next_cursor is not None
 
+    def test_pages_whole_nights_when_two_sources_record_each_night(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        # Two sources a night put two rows behind every summary, so a page counted in
+        # rows held half its nights, said there was no next page, and split a night.
+        user = UserFactory()
+        sources = [
+            DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura"),
+            DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk"),
+        ]
+        priority_service.update_provider_priority(db, ProviderName.OURA, 1)
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
+        nights = [date(2026, 1, 1) + timedelta(days=i) for i in range(8)]
+        for night in nights:
+            wake = datetime.combine(night, time(7), tzinfo=timezone.utc)
+            for ds in sources:
+                EventRecordFactory(
+                    data_source=ds,
+                    category="sleep",
+                    type="sleep",
+                    start_datetime=wake - timedelta(hours=8),
+                    end_datetime=wake,
+                    duration_seconds=8 * 3600,
+                    zone_offset="+00:00",
+                )
+        start, end = _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-10T00:00:00+00:00")
+
+        pages = []
+        cursor = None
+        while len(pages) < 5:
+            page = service.get_sleep_summaries(db, user.id, start, end, cursor=cursor, limit=3)
+            pages.append(page)
+            if not page.pagination.has_more:
+                break
+            cursor = page.pagination.next_cursor
+
+        assert [[summary.date for summary in page.data] for page in pages] == [nights[:3], nights[3:6], nights[6:]]
+        assert {summary.source.provider for page in pages for summary in page.data} == {"oura"}
+
+        # Back from the last page lands on the middle one.
+        back = service.get_sleep_summaries(db, user.id, start, end, cursor=pages[2].pagination.previous_cursor, limit=3)
+        assert sorted(summary.date for summary in back.data) == nights[3:6]
+        assert back.pagination.has_more is True
+
 
 # ---------------------------------------------------------------------------
 # get_recovery_summaries
@@ -300,6 +345,40 @@ class TestGetRecoverySummaries:
         summary = result.data[0]
         assert summary.avg_hrv_sdnn_ms is None
         assert summary.avg_hrv_rmssd_ms == 63.2
+
+    def test_pages_whole_days_when_two_providers_score_each_day(self, db: Session, service: SummariesService) -> None:
+        # As with sleep: two scores a day halved a page counted in scores and split a day.
+        user = UserFactory()
+        priority_service.update_provider_priority(db, ProviderName.WHOOP, 1)
+        priority_service.update_provider_priority(db, ProviderName.OURA, 2)
+        days = [date(2026, 1, 1) + timedelta(days=i) for i in range(8)]
+        for provider in (ProviderName.WHOOP, ProviderName.OURA):
+            ds = DataSourceFactory(user=user, provider=provider, source=provider.value)
+            for day in days:
+                HealthScoreFactory(
+                    data_source=ds,
+                    category=HealthScoreCategory.RECOVERY,
+                    provider=provider,
+                    recorded_at=datetime.combine(day, time(8), tzinfo=timezone.utc),
+                )
+        start, end = _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-10T00:00:00+00:00")
+
+        pages = []
+        cursor = None
+        while len(pages) < 5:
+            page = service.get_recovery_summaries(db, user.id, start, end, cursor=cursor, limit=3)
+            pages.append(page)
+            if not page.pagination.has_more:
+                break
+            cursor = page.pagination.next_cursor
+
+        assert [[summary.date for summary in page.data] for page in pages] == [days[:3], days[3:6], days[6:]]
+        assert {summary.source.provider for page in pages for summary in page.data} == {"whoop"}
+
+        back = service.get_recovery_summaries(
+            db, user.id, start, end, cursor=pages[2].pagination.previous_cursor, limit=3
+        )
+        assert sorted(summary.date for summary in back.data) == days[3:6]
 
 
 # ---------------------------------------------------------------------------
