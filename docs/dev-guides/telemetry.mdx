@@ -72,11 +72,12 @@ not include archived data. Each provider and event category is counted up to 1,0
 every existing bucket exact: 1,000,000 rows is `100k-1M`, and any larger count is `1M+`. Providers with no
 matching rows are omitted. The cap does not sample records or estimate counts.
 
-Collection uses the existing source-leading indexes and stops consuming matching live fact rows when
-the provider reaches the cap, including when its records span several data sources. It avoids counting
-the remainder of that provider's fact history merely to produce the same `1M+` bucket. Fields are
-collected in separate statements; under the default isolation level, concurrent writes can change
-counts between fields.
+Collection uses a PostgreSQL recursive query to visit each provider's data sources in increasing UUID
+order. Each source is counted through the existing source-leading indexes with the provider's remaining
+row budget. The query stops visiting sources once the provider reaches the cap, including when its
+records span several sources. It avoids counting the remainder of that provider's fact history merely
+to produce the same `1M+` bucket. Fields are collected in separate statements; under the default
+isolation level, concurrent writes can change counts between fields.
 
 This limits fact-row consumption, not total collection time or physical reads. Enumerating data sources
 still grows with the number of sources; user and connection counts still scan their matching rows.

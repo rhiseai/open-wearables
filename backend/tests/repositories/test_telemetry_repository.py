@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy.orm import Session
@@ -79,12 +80,21 @@ class TestCounts:
         assert count_bucket(telemetry_repository.TELEMETRY_COUNT_SATURATION) == "1M+"
 
     @pytest.mark.parametrize("total", [0, 10, 11, 17])
-    def test_data_point_counts_saturate_per_provider_across_sources(self, db: Session, total: int) -> None:
-        sources = [DataSourceFactory(provider="garmin"), DataSourceFactory(provider="garmin")]
+    @pytest.mark.parametrize("single_source", [False, True])
+    def test_data_point_counts_saturate_per_provider_across_sources(
+        self, db: Session, total: int, single_source: bool
+    ) -> None:
+        DataSourceFactory(provider="garmin", id=UUID(int=0))
+        sources = [
+            DataSourceFactory(provider="garmin", id=UUID(int=1)),
+            DataSourceFactory(provider="garmin", id=UUID(int=3)),
+        ]
+        DataSourceFactory(provider="garmin", id=UUID(int=2))
+        DataSourceFactory(provider="garmin", id=UUID(int=4))
         sparse = DataSourceFactory(provider="oura")
         DataSourceFactory(provider="apple")
         for index in range(total):
-            DataPointSeriesFactory(data_source=sources[index % len(sources)])
+            DataPointSeriesFactory(data_source=sources[0 if single_source else index % len(sources)])
         DataPointSeriesFactory(data_source=sparse)
         db.flush()
 
@@ -94,16 +104,25 @@ class TestCounts:
         assert counts == ({"garmin": min(total, 11), "oura": 1} if total else {"oura": 1})
 
     @pytest.mark.parametrize("category", ["workout", "sleep"])
-    def test_event_counts_filter_category_before_saturation(self, db: Session, category: str) -> None:
-        sources = [DataSourceFactory(provider="garmin"), DataSourceFactory(provider="garmin")]
+    @pytest.mark.parametrize("category_only_later", [False, True])
+    def test_event_counts_filter_category_before_saturation(
+        self, db: Session, category: str, category_only_later: bool
+    ) -> None:
+        sources = [
+            DataSourceFactory(provider="garmin", id=UUID(int=1)),
+            DataSourceFactory(provider="garmin", id=UUID(int=2)),
+        ]
         sparse = DataSourceFactory(provider="oura")
         DataSourceFactory(provider="apple")
-        for source in sources:
+        for index, source in enumerate(sources):
             for _ in range(13):
                 EventRecordFactory(data_source=source, category="menstrual_cycle")
-            for _ in range(7):
+            matching_count = (0 if index == 0 else 14) if category_only_later else 7
+            for _ in range(matching_count):
                 EventRecordFactory(data_source=source, category=category)
         EventRecordFactory(data_source=sparse, category=category)
+        for _ in range(13):
+            EventRecordFactory(data_source=sparse, category="menstrual_cycle")
         db.flush()
 
         with patch.object(telemetry_repository, "TELEMETRY_COUNT_SATURATION", 11):

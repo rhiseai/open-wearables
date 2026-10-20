@@ -1,8 +1,10 @@
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-from sqlalchemy import distinct, func, literal, or_, select, true, update
+from sqlalchemy import BigInteger, cast, distinct, func, literal, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import FromClause, LateralFromClause
 
 from app.database import DbSession
 from app.models import (
@@ -111,37 +113,71 @@ class TelemetryRepository:
     ) -> dict[str, int]:
         """Count live facts up to the largest telemetry bucket, per provider.
 
-        A limit inside the correlated source lookup retains an index-driven
-        LATERAL lookup instead of joining and aggregating the entire fact table.
-        The provider-level limit stops consuming rows once its bucket is known,
-        including when those rows span several sources. Source enumeration and
+        Walk each provider's sources in increasing UUID order. Aggregate one
+        source at a time with only the remaining row budget, stopping when the
+        provider saturates or has no next source. Unlike joining limited rows,
+        this avoids a nested-loop iteration for every fact. Source traversal and
         MVCC visibility checks still have costs; this is not a wall-clock bound.
         """
-        providers = select(DataSource.provider).distinct().subquery("telemetry_providers")
-        matching_rows = (
-            select(literal(1)).select_from(model).where(model.data_source_id == DataSource.id).correlate(DataSource)
+        first_sources = (
+            select(DataSource.provider, DataSource.id.label("source_id"))
+            .distinct(DataSource.provider)
+            .order_by(DataSource.provider, DataSource.id)
+            .subquery("telemetry_first_sources")
         )
-        if category is not None:
-            matching_rows = matching_rows.where(EventRecord.category == category)
-        source_rows = matching_rows.limit(TELEMETRY_COUNT_SATURATION).lateral("telemetry_source_rows")
-        limited_rows = (
-            select(literal(1))
-            .select_from(DataSource)
-            .join(source_rows, true())
-            .where(DataSource.provider == providers.c.provider)
-            .limit(TELEMETRY_COUNT_SATURATION)
-            .correlate(providers)
-            .subquery("telemetry_limited_rows")
+
+        def count_source(
+            source_id: ColumnElement[UUID],
+            budget: int | ColumnElement[int],
+            correlated: tuple[FromClause, ...],
+            name: str,
+        ) -> LateralFromClause:
+            rows = select(literal(1)).select_from(model).where(model.data_source_id == source_id)
+            if category is not None:
+                rows = rows.where(EventRecord.category == category)
+            limited = rows.limit(budget).correlate(*correlated).subquery(name + "_rows")
+            return select(cast(func.count(), BigInteger).label("row_count")).select_from(limited).lateral(name)
+
+        first_count = count_source(
+            first_sources.c.source_id, TELEMETRY_COUNT_SATURATION, (first_sources,), "telemetry_first_count"
         )
-        provider_count = (
-            select(func.count().label("row_count")).select_from(limited_rows).lateral("telemetry_provider_count")
+        counts = (
+            select(
+                first_sources.c.provider,
+                first_sources.c.source_id.label("last_id"),
+                first_count.c.row_count.label("total"),
+            )
+            .select_from(first_sources)
+            .join(first_count, true())
+            .cte("telemetry_counts", recursive=True)
         )
-        query = (
-            select(providers.c.provider, provider_count.c.row_count)
-            .select_from(providers)
-            .join(provider_count, true())
-            .where(provider_count.c.row_count > 0)
+        next_source = (
+            select(DataSource.id.label("source_id"))
+            .where(DataSource.provider == counts.c.provider, DataSource.id > counts.c.last_id)
+            .order_by(DataSource.id)
+            .limit(1)
+            .correlate(counts)
+            .lateral("telemetry_next_source")
         )
+        next_count = count_source(
+            next_source.c.source_id,
+            literal(TELEMETRY_COUNT_SATURATION, type_=BigInteger) - counts.c.total,
+            (counts, next_source),
+            "telemetry_next_count",
+        )
+        counts = counts.union_all(
+            select(
+                counts.c.provider,
+                next_source.c.source_id.label("last_id"),
+                (counts.c.total + next_count.c.row_count).label("total"),
+            )
+            .select_from(counts)
+            .join(next_source, true())
+            .join(next_count, true())
+            .where(counts.c.total < TELEMETRY_COUNT_SATURATION)
+        )
+        maximum = func.max(counts.c.total)
+        query = select(counts.c.provider, maximum.label("row_count")).group_by(counts.c.provider).having(maximum > 0)
         return {
             provider.value if hasattr(provider, "value") else provider: count
             for provider, count in db.execute(query).all()
