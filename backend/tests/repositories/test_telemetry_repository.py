@@ -1,12 +1,23 @@
 """Tests for TelemetryRepository."""
 
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+from uuid import UUID
 
+import pytest
 from sqlalchemy.orm import Session
 
+from app.repositories import telemetry_repository
 from app.repositories.telemetry_repository import TelemetryRepository
 from app.schemas.auth import ConnectionStatus
-from tests.factories import DataSourceFactory, EventRecordFactory, UserConnectionFactory, UserFactory
+from app.services.telemetry_service import count_bucket
+from tests.factories import (
+    DataPointSeriesFactory,
+    DataSourceFactory,
+    EventRecordFactory,
+    UserConnectionFactory,
+    UserFactory,
+)
 
 DAY = timedelta(days=1)
 
@@ -64,6 +75,61 @@ class TestClaimSend:
 
 
 class TestCounts:
+    def test_saturation_preserves_the_largest_published_bucket(self) -> None:
+        assert count_bucket(telemetry_repository.TELEMETRY_COUNT_SATURATION - 1) == "100k-1M"
+        assert count_bucket(telemetry_repository.TELEMETRY_COUNT_SATURATION) == "1M+"
+
+    @pytest.mark.parametrize("total", [0, 10, 11, 17])
+    @pytest.mark.parametrize("single_source", [False, True])
+    def test_data_point_counts_saturate_per_provider_across_sources(
+        self, db: Session, total: int, single_source: bool
+    ) -> None:
+        DataSourceFactory(provider="garmin", id=UUID(int=0))
+        sources = [
+            DataSourceFactory(provider="garmin", id=UUID(int=1)),
+            DataSourceFactory(provider="garmin", id=UUID(int=3)),
+        ]
+        DataSourceFactory(provider="garmin", id=UUID(int=2))
+        DataSourceFactory(provider="garmin", id=UUID(int=4))
+        sparse = DataSourceFactory(provider="oura")
+        DataSourceFactory(provider="apple")
+        for index in range(total):
+            DataPointSeriesFactory(data_source=sources[0 if single_source else index % len(sources)])
+        DataPointSeriesFactory(data_source=sparse)
+        db.flush()
+
+        with patch.object(telemetry_repository, "TELEMETRY_COUNT_SATURATION", 11):
+            counts = TelemetryRepository().count_data_points_by_provider(db)
+
+        assert counts == ({"garmin": min(total, 11), "oura": 1} if total else {"oura": 1})
+
+    @pytest.mark.parametrize("category", ["workout", "sleep"])
+    @pytest.mark.parametrize("category_only_later", [False, True])
+    def test_event_counts_filter_category_before_saturation(
+        self, db: Session, category: str, category_only_later: bool
+    ) -> None:
+        sources = [
+            DataSourceFactory(provider="garmin", id=UUID(int=1)),
+            DataSourceFactory(provider="garmin", id=UUID(int=2)),
+        ]
+        sparse = DataSourceFactory(provider="oura")
+        DataSourceFactory(provider="apple")
+        for index, source in enumerate(sources):
+            for _ in range(13):
+                EventRecordFactory(data_source=source, category="menstrual_cycle")
+            matching_count = (0 if index == 0 else 14) if category_only_later else 7
+            for _ in range(matching_count):
+                EventRecordFactory(data_source=source, category=category)
+        EventRecordFactory(data_source=sparse, category=category)
+        for _ in range(13):
+            EventRecordFactory(data_source=sparse, category="menstrual_cycle")
+        db.flush()
+
+        with patch.object(telemetry_repository, "TELEMETRY_COUNT_SATURATION", 11):
+            counts = TelemetryRepository().count_events_by_provider(db, category)
+
+        assert counts == {"garmin": 11, "oura": 1}
+
     def test_counts_on_an_empty_instance_are_zero(self, db: Session) -> None:
         repo = TelemetryRepository()
 

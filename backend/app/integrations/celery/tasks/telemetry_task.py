@@ -12,6 +12,7 @@ from celery import shared_task
 
 from app.database import SessionLocal
 from app.services.telemetry_service import telemetry_service
+from app.utils.sentry_helpers import log_and_capture_error
 
 logger = getLogger(__name__)
 
@@ -25,6 +26,12 @@ def send_telemetry_ping(event: str = "daily") -> str:
     with SessionLocal() as db:
         try:
             return telemetry_service.send_ping(db, event=event)
-        except Exception:
-            logger.warning("Telemetry ping delivery failed (event=%s)", event, exc_info=True)
+        except Exception as exc:
+            log_and_capture_error(
+                exc,
+                logger,
+                "Telemetry ping delivery failed",
+                level="warning",
+                extra={"event": event},
+            )
             return "failed"
