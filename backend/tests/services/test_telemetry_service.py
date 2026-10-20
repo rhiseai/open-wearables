@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.config import Settings, settings
@@ -183,6 +185,34 @@ class TestOptOutSettings:
 
 
 class TestSendPing:
+    def test_aggregation_failure_releases_claim_after_database_rollback(self, db: Session) -> None:
+        previous = datetime.now(timezone.utc) - timedelta(days=2)
+        state = telemetry_service.get_or_create_state(db)
+        state.last_sent_at = previous
+        db.commit()
+
+        def fail_aggregation(session: Session) -> dict[str, int]:
+            session.execute(text("SELECT 1 / 0"))
+            raise AssertionError("PostgreSQL must reject division by zero")
+
+        with (
+            patch.object(settings, "telemetry_enabled", True),
+            patch.object(telemetry_service.repo, "count_data_points_by_provider", side_effect=fail_aggregation),
+            patch("app.services.telemetry_service.httpx.post") as post,
+            pytest.raises(DBAPIError),
+        ):
+            telemetry_service.send_ping(db, event="daily")
+
+        post.assert_not_called()
+        db.expire_all()
+        assert telemetry_service.get_or_create_state(db).last_sent_at == previous
+        with (
+            patch.object(settings, "telemetry_enabled", True),
+            patch("app.services.telemetry_service.httpx.post", return_value=MagicMock()) as retry,
+        ):
+            assert telemetry_service.send_ping(db, event="daily") == "sent"
+        retry.assert_called_once()
+
     def test_disabled_via_settings_sends_nothing(self, db: Session) -> None:
         with (
             patch.object(settings, "telemetry_enabled", False),

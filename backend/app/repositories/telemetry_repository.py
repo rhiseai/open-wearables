@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from sqlalchemy import distinct, func, or_, select, update
+from sqlalchemy import distinct, func, literal, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 
 from app.database import DbSession
@@ -17,6 +17,9 @@ from app.models import (
 from app.schemas.auth import ConnectionStatus
 
 _ACTIVE = UserConnection.status == ConnectionStatus.ACTIVE
+
+# Values at or above this threshold all map to the existing "1M+" usage bucket.
+TELEMETRY_COUNT_SATURATION = 1_000_001
 
 
 class TelemetryRepository:
@@ -106,14 +109,39 @@ class TelemetryRepository:
         model: type[DataPointSeries] | type[EventRecord],
         category: str | None = None,
     ) -> dict[str, int]:
-        query = (
-            select(DataSource.provider, func.count())
-            .select_from(model)
-            .join(DataSource, model.data_source_id == DataSource.id)
-            .group_by(DataSource.provider)
+        """Count live facts up to the largest telemetry bucket, per provider.
+
+        A limit inside the correlated source lookup retains an index-driven
+        LATERAL lookup instead of joining and aggregating the entire fact table.
+        The provider-level limit stops consuming rows once its bucket is known,
+        including when those rows span several sources. Source enumeration and
+        MVCC visibility checks still have costs; this is not a wall-clock bound.
+        """
+        providers = select(DataSource.provider).distinct().subquery("telemetry_providers")
+        matching_rows = (
+            select(literal(1)).select_from(model).where(model.data_source_id == DataSource.id).correlate(DataSource)
         )
         if category is not None:
-            query = query.where(EventRecord.category == category)
+            matching_rows = matching_rows.where(EventRecord.category == category)
+        source_rows = matching_rows.limit(TELEMETRY_COUNT_SATURATION).lateral("telemetry_source_rows")
+        limited_rows = (
+            select(literal(1))
+            .select_from(DataSource)
+            .join(source_rows, true())
+            .where(DataSource.provider == providers.c.provider)
+            .limit(TELEMETRY_COUNT_SATURATION)
+            .correlate(providers)
+            .subquery("telemetry_limited_rows")
+        )
+        provider_count = (
+            select(func.count().label("row_count")).select_from(limited_rows).lateral("telemetry_provider_count")
+        )
+        query = (
+            select(providers.c.provider, provider_count.c.row_count)
+            .select_from(providers)
+            .join(provider_count, true())
+            .where(provider_count.c.row_count > 0)
+        )
         return {
             provider.value if hasattr(provider, "value") else provider: count
             for provider, count in db.execute(query).all()
