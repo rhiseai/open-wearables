@@ -269,7 +269,7 @@ def emit(event: SyncStatusEvent) -> None:
             level = "warning"
         case _:
             level = "info"
-    extra = {
+    extra: dict[str, Any] = {
         key: value
         for key, value in {
             "items_processed": event.items_processed,

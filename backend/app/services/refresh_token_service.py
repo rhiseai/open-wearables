@@ -11,6 +11,7 @@ from app.models import RefreshToken
 from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import TokenResponse, TokenType
 from app.services.sdk_token_service import create_sdk_user_token
+from app.utils.auth_diagnostics import AuthBoundary, AuthOutcome, AuthReason, log_auth_decision
 from app.utils.security import create_access_token
 
 
@@ -49,7 +50,7 @@ class RefreshTokenService:
             revoked_at=None,
         )
         self.repo.create(db_session, token)
-        self.logger.debug(f"Created SDK refresh token for user {user_id}, app {app_id}")
+        self.logger.debug("Created SDK refresh token")
         return token_id
 
     def create_developer_refresh_token(self, db_session: DbSession, developer_id: UUID) -> str:
@@ -74,7 +75,7 @@ class RefreshTokenService:
             revoked_at=None,
         )
         self.repo.create(db_session, token)
-        self.logger.debug(f"Created developer refresh token for developer {developer_id}")
+        self.logger.debug("Created developer refresh token")
         return token_id
 
     def refresh_token(self, db_session: DbSession, refresh_token_str: str) -> TokenResponse:
@@ -95,6 +96,9 @@ class RefreshTokenService:
         """
         token = self.repo.get_valid_token(db_session, refresh_token_str)
         if not token:
+            log_auth_decision(
+                AuthReason.REFRESH_INVALID_OR_REVOKED, AuthOutcome.REJECTED, boundary=AuthBoundary.REFRESH
+            )
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or revoked refresh token",
@@ -115,26 +119,28 @@ class RefreshTokenService:
                 user_id=token.user_id,  # ty:ignore[invalid-argument-type]
                 app_id=token.app_id,  # ty:ignore[invalid-argument-type]
             )
-            self.logger.debug(f"Refreshed SDK token for user {token.user_id} (rotated)")
+            self.logger.debug("Refreshed SDK token (rotated)")
         elif token.token_type == TokenType.DEVELOPER:
             access_token = create_access_token(subject=str(token.developer_id))
             new_refresh_token = self.create_developer_refresh_token(
                 db_session,
                 developer_id=token.developer_id,  # ty:ignore[invalid-argument-type]
             )
-            self.logger.debug(f"Refreshed developer token for developer {token.developer_id} (rotated)")
+            self.logger.debug("Refreshed developer token (rotated)")
         else:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Unknown token type: {token.token_type}",
             )
 
-        return TokenResponse(
+        response = TokenResponse(
             access_token=access_token,
             token_type="bearer",
             refresh_token=new_refresh_token,
             expires_in=settings.access_token_expire_minutes * 60,
         )
+        log_auth_decision(AuthReason.REFRESH_ROTATED, AuthOutcome.ACCEPTED, boundary=AuthBoundary.REFRESH)
+        return response
 
     def revoke_token(self, db_session: DbSession, refresh_token_str: str) -> bool:
         """Revoke a refresh token.
@@ -157,7 +163,7 @@ class RefreshTokenService:
             )
 
         self.repo.revoke_token(db_session, token)
-        self.logger.debug(f"Revoked refresh token {refresh_token_str[:10]}...")
+        self.logger.debug("Revoked refresh token")
         return True
 
 
