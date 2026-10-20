@@ -22,13 +22,29 @@ Idempotent: eligibility is "recorded_at is not local midnight", which is exactly
 migrated row is not. Cycles Whoop synthesized on local-midnight boundaries are already
 on the right key and are skipped for the same reason.
 
+Bootstrap runs before application logging is configured. Diagnostics therefore use
+explicit JSON with aggregate counts and exception class names only, independently of
+LOG_FORMAT. Row timestamp previews and CLI tracebacks from migration execution are
+omitted: database exceptions can contain SQL, parameters and health data. Import or
+configuration failures before the CLI is entered retain their existing Python behavior.
+Programmatic main() attempts rollback without replacing the migration exception if
+that explicit rollback fails. Session context-manager cleanup retains its normal
+exception behavior. The CLI exits nonzero, and app.sh retains its existing non-fatal
+retry-on-next-startup policy. No completion marker is written. Table updates are
+reported as staged until the shared transaction commits.
+"committed" does not mean all rows were resolved: contested targets stay untouched and
+are reported separately. Dry runs and attempts moving no rows have distinct outcomes.
+
 Usage (inside Docker):
     docker compose exec app uv run python scripts/data_migrations/rekey_whoop_cycle_days.py --dry-run
     docker compose exec app uv run python scripts/data_migrations/rekey_whoop_cycle_days.py
 """
 
 import argparse
+import json
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -37,6 +53,26 @@ from app.database import SessionLocal
 
 # Whoop's longest real cycle is ~29h; past that the next onset opens a later cycle.
 _MAX_CYCLE_SPAN = "30 hours"
+_SCRIPT_ID = "rekey_whoop_cycle_days"
+
+
+def _emit(level: str, action: str, message: str, **attributes: str | int | bool | None) -> None:
+    """Emit bootstrap JSON without runtime formatters, exception text or trace context."""
+    print(
+        json.dumps(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": level,
+                "logger": "bootstrap.data_migrations",
+                "message": message,
+                "provider": "whoop",
+                "action": action,
+                "script": _SCRIPT_ID,
+                **attributes,
+            }
+        ),
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -143,15 +179,18 @@ def _rekey(db: Session, table: _Table, *, dry_run: bool) -> int:
             FROM ({_mapping(table)}) m
         """)
     ).one()
+    _emit(
+        "info",
+        "bootstrap_data_migration_inspected",
+        "Inspected Whoop cycle rows",
+        table=table.name,
+        eligible=eligible,
+        contested=contested,
+        dry_run=dry_run,
+    )
     if not eligible:
-        print(f"{table.label}: nothing to do -- no start-keyed Whoop cycle rows found.")
         return 0
 
-    print(f"{table.label}: {eligible} row(s) eligible, {contested} left alone (target already taken)")
-    for old, new in db.execute(
-        text(f"SELECT recorded_at, new_recorded_at FROM ({_movable(table)}) v ORDER BY recorded_at DESC LIMIT 5")
-    ):
-        print(f"    {old} -> {new}")
     if dry_run:
         return 0
 
@@ -163,29 +202,73 @@ def _rekey(db: Session, table: _Table, *, dry_run: bool) -> int:
             WHERE tgt.id = v.id
         """)
     ).rowcount  # ty: ignore[unresolved-attribute]
-    print(f"  re-keyed {moved}")
+    _emit(
+        "info",
+        "bootstrap_data_migration_staged",
+        "Staged Whoop cycle row updates",
+        table=table.name,
+        rows_staged=moved,
+    )
     return moved
 
 
 def rekey_whoop_cycle_days(db: Session, *, dry_run: bool) -> int:
     """Re-key Whoop cycle rows onto the day they cover. Does not commit -- caller owns the transaction."""
-    moved = sum(_rekey(db, table, dry_run=dry_run) for table in (_HEALTH_SCORE, _DATA_POINT_SERIES))
-    if dry_run:
-        print("\nDry run -- no changes made.")
-    return moved
+    return sum(_rekey(db, table, dry_run=dry_run) for table in (_HEALTH_SCORE, _DATA_POINT_SERIES))
 
 
 def main(dry_run: bool) -> None:
     with SessionLocal() as db:
-        moved = rekey_whoop_cycle_days(db, dry_run=dry_run)
-        if dry_run or not moved:
-            return
-        db.commit()
-        print("Done.")
+        try:
+            moved = rekey_whoop_cycle_days(db, dry_run=dry_run)
+            if not dry_run and moved:
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception as rollback_error:
+                # Cleanup or its diagnostics must not replace the migration failure.
+                with suppress(Exception):
+                    _emit(
+                        "error",
+                        "bootstrap_data_migration_rollback_failed",
+                        "Whoop cycle re-key rollback failed",
+                        exception_class=type(rollback_error).__name__,
+                    )
+            raise
+        outcome = "dry_run" if dry_run else "committed" if moved else "no_rows_moved"
+        _emit(
+            "info",
+            "bootstrap_data_migration_finished",
+            "Whoop cycle re-key attempt finished",
+            outcome=outcome,
+            rows_moved=moved,
+        )
+
+
+def cli(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
+    args = parser.parse_args(argv)
+    try:
+        main(dry_run=args.dry_run)
+    except Exception as exc:
+        cause = getattr(exc, "orig", None)
+        if cause is None:
+            cause = exc.__cause__
+        # A closed output stream must not expose the original SQL exception through
+        # an unhandled logging error's implicit traceback context.
+        with suppress(OSError, ValueError):
+            _emit(
+                "error",
+                "bootstrap_data_migration_failed",
+                "Whoop cycle re-key attempt failed",
+                exception_class=type(exc).__name__,
+                cause_class=type(cause).__name__ if cause is not None else None,
+            )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Preview affected rows without modifying data")
-    args = parser.parse_args()
-    main(dry_run=args.dry_run)
+    raise SystemExit(cli())
