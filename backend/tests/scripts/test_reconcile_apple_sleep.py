@@ -2,6 +2,7 @@
 
 import importlib.util
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
 from typing import Any, cast
@@ -172,6 +173,32 @@ def test_skips_stage_less_duplicates_and_lone_tail(db: Session) -> None:
     assert audit[0]["status"] == "skipped"
     assert audit[0]["reason"] == "missing_stage_evidence"
     assert db.query(EventRecord).filter(EventRecord.data_source_id == source.id).count() == 2
+
+
+def test_apply_clamps_a_lone_night_whose_replays_were_summed_into_time_in_bed(db: Session) -> None:
+    source = _source()
+    night = _sleep(source, _START, _START + timedelta(hours=8))
+    detail = night.sleep_detail
+    assert detail is not None
+    detail.sleep_time_in_bed_minutes = 1320
+    detail.sleep_efficiency_score = Decimal("36.36")
+    detail.sleep_stages = [*detail.sleep_stages, *detail.sleep_stages]
+    db.flush()
+
+    dry = script.reconcile_apple_sleep(db, user_id=source.user_id, since=_DAY, until=_DAY)
+    audit = script.reconcile_apple_sleep(db, user_id=source.user_id, since=_DAY, until=_DAY, apply=True)
+    second = script.reconcile_apple_sleep(db, user_id=source.user_id, since=_DAY, until=_DAY, apply=True)
+
+    assert dry[0]["status"] == "would_reconcile"
+    assert audit[0]["status"] == "reconciled"
+    after = audit[0]["after"]
+    assert after["id"] == str(night.id)
+    assert datetime.fromisoformat(after["start_datetime"]) == _START
+    assert after["details"]["sleep_time_in_bed_minutes"] == 480
+    assert after["details"]["sleep_total_duration_minutes"] == 480
+    assert after["details"]["sleep_efficiency_score"] == Decimal("100.00")
+    assert len(after["details"]["sleep_stages"]) == 1
+    assert second[0]["status"] == "unchanged"
 
 
 def test_gap_adjacent_sessions_without_overlap_are_not_repaired(db: Session) -> None:

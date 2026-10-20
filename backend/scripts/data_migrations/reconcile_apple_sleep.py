@@ -3,12 +3,16 @@
 
 Older ingestion could leave two sessions from one data_source with overlapping windows.
 Extending either into the other's exact window then violated ix_event_record_source_time.
+Older ingestion also added a replayed night's time in bed to the stored total, leaving a lone
+session with more time in bed than its own window (19–23 h for one night). Reconciling that
+row with itself clamps time in bed to the window and recomputes stages and efficiency.
 This tool reuses live ingestion's canonical reconciler; it does not invent missing HealthKit
 samples, combine sources, change source priorities, or repair a lone truncated night.
 
 Both --user-id and an inclusive local wake-date window (--since/--until) are required.
 Dry-run is the default; --apply takes the same PostgreSQL user lock as ingestion, re-reads
-the rows, then reconciles only components containing actual overlapping duplicate rows.
+the rows, then reconciles only components containing actual overlapping duplicate rows and
+lone sessions whose time in bed exceeds their window.
 The full transitive gap-adjacent component must remain inside the requested date scope,
 its external IDs must not also name a disconnected session, and every contributing row
 must have stored stages. Otherwise the component is reported as
@@ -98,6 +102,16 @@ def _has_overlap(rows: Sequence[tuple[EventRecord, DataSource]]) -> bool:
     return False
 
 
+def _time_in_bed_exceeds_window(rows: Sequence[tuple[EventRecord, DataSource]]) -> bool:
+    """A lone session holding more time in bed than its window: replays summed into one row."""
+    if len(rows) != 1:
+        return False
+    record = rows[0][0]
+    window_minutes = int((record.end_datetime - record.start_datetime).total_seconds() // 60)
+    detail = record.sleep_detail
+    return detail is not None and (detail.sleep_time_in_bed_minutes or 0) > window_minutes
+
+
 def _snapshot(record: EventRecord) -> dict[str, Any]:
     detail = record.sleep_detail
     return {
@@ -165,7 +179,7 @@ def reconcile_apple_sleep(
             )
         elif any(record.sleep_detail is None or not record.sleep_detail.sleep_stages for record, _ in component):
             item.update(status="skipped", reason="missing_stage_evidence")
-        elif not _has_overlap(component):
+        elif not _has_overlap(component) and not _time_in_bed_exceeds_window(component):
             item.update(status="unchanged", reason="no_overlapping_duplicates")
         elif not apply:
             item.update(status="would_reconcile")
@@ -209,7 +223,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--until", required=True, type=date.fromisoformat, help="Last local wake date, inclusive")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Report only (the default)")
-    mode.add_argument("--apply", action="store_true", help="Commit scoped, stage-backed duplicate reconciliation")
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Commit scoped, stage-backed reconciliation of duplicates and inflated nights",
+    )
     args = parser.parse_args(argv)
     if args.since > args.until:
         parser.error("--since must be on or before --until")
