@@ -113,6 +113,15 @@ WITHINGS_WEBHOOK_TOKEN=replace-with-a-random-secret
     | `WITHINGS_DEFAULT_SCOPE` | OAuth scopes requested during authorization. See the [OAuth Scopes Reference](#oauth-scopes-reference) below |
     | `WITHINGS_WEBHOOK_TOKEN` | Shared secret appended to your webhook callback URL as a `token` query parameter. Required only if you plan to enable webhooks - see that step below |
 
+    <Note>
+    The staging deployment loads credentials from AWS Secrets Manager through `deploy/scripts/render-env.sh`:
+
+    - `lucie-staging/ow/providers/withings-client-id` supplies `WITHINGS_CLIENT_ID`.
+    - `lucie-staging/ow/providers/withings-client-secret` supplies `WITHINGS_CLIENT_SECRET`.
+
+    Store each credential as a raw, single-line `SecretString`. Both are required; a missing or empty credential stops the deployment. Deploy staging after creating or rotating them so the API, worker, and scheduler containers are recreated with the updated environment. A container restart alone does not reload credentials. The default scopes and periodic pull mode need no additional secret.
+    </Note>
+
     <Warning>
     **Withings scopes are comma-separated, not space-separated.** `WITHINGS_DEFAULT_SCOPE=user.info,user.metrics,user.activity` is correct; a space-separated value (the convention Oura and Google use) is a different string with a different meaning to Withings and will be rejected by the authorize endpoint.
     </Warning>
