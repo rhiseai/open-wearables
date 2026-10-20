@@ -187,6 +187,21 @@ Keep later outcomes distinct: a `*_sdk_batch_received` event means parsing, auth
 
 Use controlled partial-body tests and bounded client outcome categories to validate cancellation, suspension, network, and timeout hypotheses. Preserve authentication and retry behavior while the cause is unresolved. Enabling or forwarding raw SDK log text is not a substitute for safe diagnostics: it can include identifiers and response text.
 
+## Asynchronous SDK import failures
+
+The `/sync` HTTP 202 response and a later worker result are different boundaries. A
+`process_sdk_upload` result with `status_code=400` reports a failed background import;
+it is not an HTTP response sent to the client. It does not undo the earlier acceptance
+or establish whether the SDK received that response or advanced its cursor.
+
+The importer can commit timeseries before processing sleep. A later sleep transaction
+failure rolls back that transaction while earlier samples remain stored. The SDK sleep
+writer and missing-score filler share a transaction-scoped user lock, held through
+score writes and commit; the filler re-reads candidates after acquiring it. There is
+no automatic database retry in this worker path. A replay requires the original payload
+and a resolved cause: synthetic regressions verify duplicate-free explicit replay, not
+the availability of every production payload or automatic client recovery.
+
 ## Related settings
 
 - FastAPI's built-in OpenTelemetry support (traces, metrics, exception logs) stays off; `OTEL_*` variables do not turn it on.
