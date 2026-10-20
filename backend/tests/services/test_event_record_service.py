@@ -630,7 +630,7 @@ class TestCreateOrMergeSleep:
         assert kw["duration_seconds"] == int((self._dt(7, 0, day=22) - self._dt(22, 0)).total_seconds())
 
     def test_replayed_apple_sleep_batch_keeps_whole_night(self, db: Session) -> None:
-        """A late HealthKit batch can inherit its sample ID as the merged night's ID."""
+        """An absorbed late sample ID still resolves to the stable accumulated night."""
         data_source = DataSourceFactory(source="Apple Watch")
         early = self._record(data_source, self._dt(22), self._dt(2, day=22)).model_copy(
             update={"external_id": "early-sample", "provider": ProviderName.APPLE}
@@ -647,14 +647,18 @@ class TestCreateOrMergeSleep:
             update={"sleep_stages": [late_stage]}
         )
 
-        event_record_service.create_or_merge_sleep(db, data_source.user_id, early, early_detail, self.THRESHOLD)
+        original = event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, early, early_detail, self.THRESHOLD
+        )
         merged = event_record_service.create_or_merge_sleep(db, data_source.user_id, late, late_detail, self.THRESHOLD)
-        assert merged.external_id == "late-sample"
+        assert merged.id == original.id
+        assert merged.external_id == "early-sample"
 
         replayed = event_record_service.create_or_merge_sleep(
             db, data_source.user_id, late, late_detail, self.THRESHOLD
         )
         db.refresh(replayed)
+        assert replayed.id == original.id
         assert replayed.start_datetime == early.start_datetime
         assert replayed.end_datetime == late.end_datetime
         assert replayed.sleep_detail.sleep_total_duration_minutes == 480
@@ -769,8 +773,8 @@ class TestCreateOrMergeSleep:
         expected = round((27 * 30 + 80 * 430) / 460, 2)
         assert result.sleep_detail.sleep_efficiency_score == Decimal(str(expected))
 
-    def test_old_record_deleted_after_merge(self, db: Session) -> None:
-        """The adjacent record is deleted after merging."""
+    def test_existing_record_identity_survives_merge(self, db: Session) -> None:
+        """Extending a stored night preserves the row other records already reference."""
         user = UserFactory()
         data_source = DataSourceFactory(user=user)
 
@@ -787,9 +791,13 @@ class TestCreateOrMergeSleep:
         record = self._record(data_source, self._dt(22, 25), self._dt(7, 40, day=22))
         detail = self._detail(record.id)
 
-        event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
+        merged = event_record_service.create_or_merge_sleep(db, user.id, record, detail, self.THRESHOLD)
 
-        assert event_record_service.get(db, old_id) is None
+        assert merged.id == old_id
+        assert event_record_service.get(db, old_id) is merged
+        assert merged.start_datetime == self._dt(20, 56)
+        assert merged.end_datetime == self._dt(7, 40, day=22)
+        assert db.query(EventRecord).filter_by(data_source_id=data_source.id, category="sleep").count() == 1
 
     def test_adjacent_outside_threshold_not_merged(self, db: Session) -> None:
         """Sessions further apart than threshold create two separate records."""

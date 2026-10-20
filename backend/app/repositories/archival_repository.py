@@ -465,16 +465,16 @@ class DataPointSeriesArchiveRepository:
                 DataSource.source.label("source"),
                 DataSource.device_model.label("device_model"),
                 DataSource.device_type.label("device_type"),
+                # No ELSE: a source without the series sums to NULL, as in the live query,
+                # so "nothing stored" stays apart from "zero".
                 func.sum(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == steps_id, DataPointSeriesArchive.value),
-                        else_=0,
                     )
                 ).label("steps_sum"),
                 func.sum(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == energy_id, DataPointSeriesArchive.value),
-                        else_=0,
                     )
                 ).label("active_energy_sum"),
                 func.sum(
@@ -483,7 +483,6 @@ class DataPointSeriesArchiveRepository:
                             DataPointSeriesArchive.series_type_definition_id == basal_energy_id,
                             DataPointSeriesArchive.value,
                         ),
-                        else_=0,
                     )
                 ).label("basal_energy_sum"),
                 func.avg(
@@ -543,9 +542,9 @@ class DataPointSeriesArchiveRepository:
                     "source": row.source,
                     "device_model": row.device_model,
                     "device_type": row.device_type,
-                    "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
-                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
-                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
+                    "steps_sum": int(row.steps_sum) if row.steps_sum is not None else None,
+                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": None,  # Not available in simplified archive
                     "hr_min": None,  # Not available in simplified archive

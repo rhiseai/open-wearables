@@ -64,6 +64,8 @@ POLAR_CLIENT_ID                   providers/polar-client-id                  req
 POLAR_CLIENT_SECRET               providers/polar-client-secret              required
 STRAVA_CLIENT_ID                  providers/strava-client-id                 optional
 STRAVA_CLIENT_SECRET              providers/strava-client-secret             optional
+WITHINGS_CLIENT_ID                providers/withings-client-id               required
+WITHINGS_CLIENT_SECRET            providers/withings-client-secret           required
 TABLE
 
 [[ -r "$BASE_ENV" ]] || die "missing non-secret base file: $BASE_ENV"

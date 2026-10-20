@@ -938,6 +938,29 @@ class Polar247Data(Base247DataTemplate):
             health_score_service.bulk_create(db, scores)
         return len(scores)
 
+    @staticmethod
+    def _save_sleep_record(
+        db: DbSession,
+        user_id: UUID,
+        record: EventRecordCreate,
+        detail: EventRecordDetailCreate,
+        score: HealthScoreCreate | None,
+    ) -> None:
+        """Link the provider score to the canonical session under the same writer lock."""
+        try:
+            saved = event_record_service.create_or_merge_sleep(
+                db, user_id, record, detail, settings.sleep_end_gap_minutes, commit=False
+            )
+            if score is not None:
+                health_score_service.bulk_create(
+                    db,
+                    [score.model_copy(update={"event_record_id": saved.id, "data_source_id": saved.data_source_id})],
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
     def fetch_and_save_from_webhook(
         self,
         db: DbSession,
@@ -955,12 +978,8 @@ class Polar247Data(Base247DataTemplate):
             case PolarWebhookEventType.SLEEP:
                 count = 0
                 for record, detail, score, hr_samples in self.normalize_sleep([raw], user_id):
-                    event_record_service.create_or_merge_sleep(
-                        db, user_id, record, detail, settings.sleep_end_gap_minutes
-                    )
+                    self._save_sleep_record(db, user_id, record, detail, score)
                     count += 1
-                    if score:
-                        health_score_service.bulk_create(db, [score])
                     if hr_samples:
                         timeseries_service.bulk_create_samples(db, hr_samples)
                 return {"sleep": count}
@@ -1014,15 +1033,12 @@ class Polar247Data(Base247DataTemplate):
         raw_items = self.get_sleep_data(db, user_id, start_time, end_time)
         normalized = self.normalize_sleep(raw_items, user_id)
         count = 0
-        scores: list[HealthScoreCreate] = []
         hr_samples: list[TimeSeriesSampleCreate] = []
 
         for record, detail, score, hr in normalized:
             try:
-                event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
+                self._save_sleep_record(db, user_id, record, detail, score)
                 count += 1
-                if score:
-                    scores.append(score)
                 hr_samples.extend(hr)
             except Exception as e:
                 log_and_capture_error(
@@ -1032,7 +1048,6 @@ class Polar247Data(Base247DataTemplate):
                     extra={"provider": "polar", "task": "_save_sleep", "user_id": str(user_id)},
                 )
 
-        self._save_scores(db, scores)
         self._save_timeseries(db, hr_samples)
         return count
 

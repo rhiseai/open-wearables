@@ -446,7 +446,7 @@ The following architectural decisions have been made:
 | **Priority scope** | Per-provider (not per-metric) | Simplifies configuration; one priority ranking for all metrics |
 | **Revoked connection data** | Keep and use in /summary | Historical data remains valuable even after disconnect |
 | **Multiple accounts per provider** | Not allowed | Constraint `(user_id, provider)` - simplifies model and UI |
-| **Partial data** | Use priority provider regardless of coverage | First iteration always uses highest-priority provider with any data; coverage-based fallback planned for future |
+| **Partial data** | Daily activity summaries: each metric from the highest-priority provider that stored it that day. Other reads: priority provider regardless of coverage | A provider with heart rate but no daily activity must not report zero steps; coverage-based fallback for the other reads planned for future |
 
 ## Cross-Source Deduplication
 
@@ -499,7 +499,7 @@ def bulk_create_event_records(records: list[EventRecordCreate]) -> list[EventRec
 <Note>
 **Not implemented in first iteration.**
 
-The current implementation always uses the highest-priority provider that has any data for the requested period. Coverage-based fallback strategies will be added in a future release.
+Apart from the daily activity summary, which picks each metric from the highest-priority provider holding it that day, the current implementation always uses the highest-priority provider that has any data for the requested period. Coverage-based fallback strategies will be added in a future release.
 </Note>
 
 ### Problem

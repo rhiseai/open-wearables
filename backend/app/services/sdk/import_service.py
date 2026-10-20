@@ -648,6 +648,7 @@ class ImportService:
             )
 
         except ValidationError as e:
+            db_session.rollback()
             # Reached ONLY when the envelope itself is invalid (provider/sdkVersion/
             # syncTimestamp/data shape) — _parse_sync_request re-raised because nothing was
             # salvageable. Per-record failures never reach here: they are collected inside
@@ -688,6 +689,7 @@ class ImportService:
             )
 
         except Exception as e:
+            db_session.rollback()
             log_and_capture_error(
                 e,
                 self.log,

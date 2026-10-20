@@ -28,9 +28,11 @@ class ActivityAggregateResult(TypedDict):
     source: str | None
     device_model: str | None
     device_type: str | None
-    steps_sum: int
-    active_energy_sum: float
-    basal_energy_sum: float
+    # None when the source stored no sample of that series on that day, so a ring that
+    # synced heart rate but no daily activity cannot read as a day of zero steps.
+    steps_sum: int | None
+    active_energy_sum: float | None
+    basal_energy_sum: float | None
     hr_avg: int | None
     hr_max: int | None
     hr_min: int | None

@@ -911,6 +911,35 @@ class TestDataPointSeriesRepository:
         assert len(result) == 1
         assert result[0]["steps_sum"] == 10000  # daily total, NOT 10000 + 9500
 
+    def test_aggregate_leaves_steps_and_energy_none_for_a_heart_rate_only_source(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        """A source that stored only heart rate has no step or energy sum, not a sum of zero."""
+        user = UserFactory()
+        day = datetime(2026, 6, 20, tzinfo=timezone.utc)
+        heart_rate = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            source="oura",
+            device_model=None,
+            recorded_at=day + timedelta(hours=9),
+            zone_offset="+00:00",
+            value=62,
+            series_type=SeriesType.heart_rate,
+        )
+        series_repo.bulk_create(db, [heart_rate])
+        db.commit()
+
+        result = series_repo.get_daily_activity_aggregates(db, user.id, day, day + timedelta(days=1))
+
+        assert len(result) == 1
+        assert result[0]["hr_avg"] == 62
+        assert (result[0]["steps_sum"], result[0]["active_energy_sum"], result[0]["basal_energy_sum"]) == (
+            None,
+            None,
+            None,
+        )
+
     def test_aggregate_sums_samples_when_no_daily_total(
         self, db: Session, series_repo: DataPointSeriesRepository
     ) -> None:

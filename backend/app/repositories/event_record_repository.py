@@ -19,6 +19,7 @@ from sqlalchemy import (
     lateral,
     literal,
     literal_column,
+    or_,
     select,
     text,
     true,
@@ -29,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Query, selectinload
 
 from app.database import DbSession
-from app.models import DataPointSeries, DataSource, EventRecord, SleepDetails, WorkoutDetails
+from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository, source_filter_conditions, utc_bucket_start
 from app.schemas.enums import DeviceType, ProviderName, SeriesType, TimelineBucket, get_series_type_id
@@ -58,7 +59,9 @@ class EventRecordRepository(
         super().__init__(model)
         self.data_source_repo = DataSourceRepository()
 
-    def _build_creation(self, db_session: DbSession, creator: EventRecordCreate) -> tuple[UUID, EventRecord]:
+    def _build_creation(
+        self, db_session: DbSession, creator: EventRecordCreate, *, commit_data_source: bool = True
+    ) -> tuple[UUID, EventRecord]:
         """Resolve the data source and build the ORM object without touching the session."""
         if creator.data_source_id:
             data_source_id = creator.data_source_id
@@ -77,6 +80,7 @@ class EventRecordRepository(
                 software_version=creator.software_version,
                 original_source_name=creator.source,
                 reported_type=creator.device_type,
+                commit=commit_data_source,
             )
             data_source_id = data_source.id
 
@@ -232,7 +236,7 @@ class EventRecordRepository(
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
         the INSERT and leaves the outer transaction intact.
         """
-        data_source_id, creation = self._build_creation(db_session, creator)
+        data_source_id, creation = self._build_creation(db_session, creator, commit_data_source=False)
         nested = db_session.begin_nested()
         try:
             db_session.add(creation)
@@ -244,6 +248,108 @@ class EventRecordRepository(
             if existing := self._fetch_existing(db_session, data_source_id, creation):
                 return existing
             raise
+
+    def resolve_sleep_data_source(self, db_session: DbSession, creator: EventRecordCreate) -> UUID:
+        """Resolve a sleep writer without committing the caller's transaction."""
+        data_source_id, _ = self._build_creation(db_session, creator, commit_data_source=False)
+        source = db_session.get(DataSource, data_source_id)
+        if source is None or source.user_id != creator.user_id:
+            raise ValueError("Sleep data source does not belong to the user")
+        return data_source_id
+
+    @staticmethod
+    def delete_sleep_candidates(db_session: DbSession, records: list[EventRecord]) -> None:
+        """Free absorbed records' time slots before updating the canonical row."""
+        for record in records:
+            db_session.delete(record)
+        db_session.flush()
+
+    @staticmethod
+    def preserve_sleep_provider_scores(
+        db_session: DbSession, survivor: EventRecord, duplicates: list[EventRecord]
+    ) -> None:
+        """Keep one existing provider score per kind when folding duplicate rows.
+
+        The survivor's score wins; otherwise retain the latest stored snapshot.
+        Internal scores are recalculated after reconciliation instead.
+        """
+        if not duplicates:
+            return
+        rows = (
+            db_session.query(HealthScore)
+            .filter(
+                HealthScore.event_record_id.in_([survivor.id, *(record.id for record in duplicates)]),
+                HealthScore.provider != "internal",
+            )
+            .order_by(HealthScore.recorded_at.desc(), HealthScore.id)
+            .with_for_update()
+            .all()
+        )
+        retained = {(score.provider, score.category) for score in rows if score.event_record_id == survivor.id}
+        for score in rows:
+            identity = (score.provider, score.category)
+            if identity not in retained:
+                score.event_record_id = survivor.id
+                retained.add(identity)
+        db_session.flush()
+
+    @staticmethod
+    def lock_sleep_user(db_session: DbSession, user_id: UUID) -> None:
+        """Serialize sleep records and their user-wide scores until commit or rollback."""
+        db_session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"sleep_merge:{user_id}"},
+        )
+
+    def find_sleep_merge_candidates(
+        self,
+        db_session: DbSession,
+        data_source_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+        threshold_minutes: int,
+        external_id: str | None = None,
+        *,
+        replace_own_window: bool = False,
+    ) -> list[EventRecord]:
+        """Lock the complete adjacent component of one exact data source.
+
+        Own-ID rows are included even after an authoritative provider moves its
+        session. Their stale window must not enlarge a shortened replacement.
+        The caller holds the user advisory lock before this first read.
+        """
+        threshold = timedelta(minutes=threshold_minutes)
+        candidates: dict[UUID, EventRecord] = {}
+        while True:
+            adjacent = and_(
+                self.model.start_datetime <= end_time + threshold,
+                self.model.end_datetime >= start_time - threshold,
+            )
+            if external_id is not None:
+                adjacent = or_(adjacent, self.model.external_id == external_id)
+            records = (
+                db_session.query(self.model)
+                .options(selectinload(self.model.sleep_detail))
+                .filter(
+                    self.model.data_source_id == data_source_id,
+                    self.model.category == "sleep",
+                    self.model.type == "sleep_session",
+                    adjacent,
+                )
+                .order_by(self.model.start_datetime, self.model.id)
+                .with_for_update()
+                .populate_existing()
+                .all()
+            )
+            previous = len(candidates)
+            for record in records:
+                candidates[record.id] = record
+                if replace_own_window and record.external_id == external_id:
+                    continue
+                start_time = min(start_time, record.start_datetime)
+                end_time = max(end_time, record.end_datetime)
+            if len(candidates) == previous:
+                return sorted(candidates.values(), key=lambda record: (record.start_datetime, record.id))
 
     def _resolve_values(self, db_session: DbSession, creators: list[EventRecordCreate]) -> list[dict]:
         """Resolve data sources in batch and build event_record row values."""
@@ -803,6 +909,10 @@ class EventRecordRepository(
     ) -> list[dict]:
         """Get daily sleep summaries aggregated by date, source, and device_model.
 
+        A page is whole nights: every source's row for up to ``limit + 1`` sleep dates
+        past the cursor, so a caller that keeps one source per night can tell from the
+        extra night that there is a next page, and no night is split across pages.
+
         Returns list of dicts with keys:
         - sleep_date, min_start_time, max_end_time, total_duration_minutes
         - provider, source, device_model, device_type, record_id
@@ -821,6 +931,34 @@ class EventRecordRepository(
             EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
             Date,
         )
+        in_range = (
+            DataSource.user_id == user_id,
+            EventRecord.category == "sleep",
+            EventRecord.end_datetime >= start_date - timedelta(days=1),
+            local_sleep_date >= cast(start_date, Date),
+            local_sleep_date < cast(end_date, Date),
+        )
+
+        # The page's nights. The cursor names the night the last page ended on; its
+        # record id is not needed, since that night came back whole.
+        dates_query = (
+            db_session.query(local_sleep_date)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(*in_range)
+            .group_by(local_sleep_date)
+        )
+        order = asc
+        if cursor:
+            cursor_ts, _, direction = decode_cursor(cursor)
+            cursor_date = cursor_ts.date()
+            if direction == "prev":
+                order = desc
+                dates_query = dates_query.filter(local_sleep_date < cursor_date)
+            else:
+                dates_query = dates_query.filter(local_sleep_date > cursor_date)
+        page_dates = [row[0] for row in dates_query.order_by(order(local_sleep_date)).limit(limit + 1)]
+        if not page_dates:
+            return []
 
         # Build base aggregated query as subquery
         # Join with SleepDetails to get sleep stage data
@@ -889,13 +1027,7 @@ class EventRecordRepository(
             )
             .join(DataSource, EventRecord.data_source_id == DataSource.id)
             .outerjoin(SleepDetails, SleepDetails.record_id == EventRecord.id)
-            .filter(
-                DataSource.user_id == user_id,
-                EventRecord.category == "sleep",
-                EventRecord.end_datetime >= start_date - timedelta(days=1),
-                local_sleep_date >= cast(start_date, Date),
-                local_sleep_date < cast(end_date, Date),
-            )
+            .filter(*in_range, local_sleep_date.in_(page_dates))
             .group_by(
                 local_sleep_date,
                 DataSource.provider,
@@ -968,25 +1100,8 @@ class EventRecordRepository(
             physio_lateral.c.avg_spo2,
         ).outerjoin(physio_lateral, true())
 
-        # Handle cursor pagination
-        if cursor:
-            cursor_ts, cursor_id, direction = decode_cursor(cursor)
-            cursor_date = cursor_ts.date()
-
-            if direction == "prev":
-                # Backward pagination: get items BEFORE cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) < (cursor_date, cursor_id))
-                query = query.order_by(desc(subquery.c.sleep_date), desc(record_id_col))
-            else:
-                # Forward pagination: get items AFTER cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) > (cursor_date, cursor_id))
-                query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
-        else:
-            # No cursor: default ordering
-            query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
-
-        # Limit + 1 to check for has_more
-        results = query.limit(limit + 1).all()
+        # Page order: oldest night first, newest first when paging backward.
+        results = query.order_by(order(subquery.c.sleep_date), order(record_id_col)).all()
 
         # Transform results to dict format
         summaries = []

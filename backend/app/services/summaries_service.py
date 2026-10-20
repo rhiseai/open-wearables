@@ -2,8 +2,10 @@
 
 import contextlib
 from collections import defaultdict
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta, timezone
 from logging import Logger, getLogger
+from typing import Any
 from uuid import UUID
 
 from app.database import DbSession
@@ -95,6 +97,20 @@ MERGED_ACTIVITY_SAMPLE_FIELDS: dict[SeriesType, str] = {
 }
 INTEGER_ACTIVITY_SAMPLE_FIELDS = {SeriesType.steps, SeriesType.flights_climbed}
 
+# A day's activity metrics, in the groups a single source must supply together. Each
+# group comes from the first-ranked source holding its first field, so a day never adds
+# one provider's active energy to another's basal energy, or pairs one device's average
+# heart rate with another's maximum.
+ACTIVITY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("steps_sum",),
+    ("distance_sum",),
+    ("flights_climbed_sum",),
+    ("active_time_minutes",),
+    ("active_energy_sum", "basal_energy_sum"),
+    ("hr_avg", "hr_max", "hr_min"),
+)
+ACTIVITY_SOURCE_FIELDS = ("activity_date", "provider", "source", "device_model", "device_type")
+
 
 def _midnight(day: date) -> datetime:
     """A calendar date as the UTC midnight that starts it."""
@@ -104,6 +120,34 @@ def _midnight(day: date) -> datetime:
 def _activity_key(row: dict) -> tuple:
     """The compound key an activity cursor points at: date, then source, then device."""
     return (row["activity_date"], row["source"] or "", row.get("device_model") or "")
+
+
+def _extras_key(row: Mapping[str, Any], date_key: str = "activity_date") -> tuple:
+    """The key the per-day extras (workouts, active and intensity minutes) are looked up by."""
+    return (row[date_key], row["source"], row.get("device_model"))
+
+
+def _priority_sort_key(
+    provider_order: dict[ProviderName, int], device_type_order: dict[DeviceType, int]
+) -> Callable[[dict], tuple[int, int, str]]:
+    """Rank a per-day row by provider, then device type, then device model; unranked last."""
+
+    def sort_key(entry: dict) -> tuple[int, int, str]:
+        raw_provider = entry.get("provider") or entry.get("source")
+        try:
+            provider = ProviderName(raw_provider)
+        except ValueError:
+            provider = ProviderName.UNKNOWN
+
+        provider_priority = provider_order.get(provider, 99)
+
+        device_type_priority = 99
+        with contextlib.suppress(ValueError):
+            device_type_priority = device_type_order.get(DeviceType(entry.get("device_type")), 99)
+
+        return (provider_priority, device_type_priority, entry.get("device_model") or "")
+
+    return sort_key
 
 
 class SummariesService:
@@ -139,6 +183,7 @@ class SummariesService:
 
         provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
         device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
+        sort_key = _priority_sort_key(provider_order, device_type_order)
 
         # Group results by date
         by_date: dict[date, list[dict]] = defaultdict(list)
@@ -153,27 +198,60 @@ class SummariesService:
                 filtered.append(entries[0])
                 continue
 
-            # Sort by priority
-            def sort_key(entry: dict) -> tuple[int, int, str]:
-                raw_provider = entry.get("provider") or entry.get("source")
-                try:
-                    provider = ProviderName(raw_provider)
-                except ValueError:
-                    provider = ProviderName.UNKNOWN
-
-                provider_priority = provider_order.get(provider, 99)
-
-                device_model = entry.get("device_model")
-                device_type_priority = 99
-                with contextlib.suppress(ValueError):
-                    device_type_priority = device_type_order.get(DeviceType(entry.get("device_type")), 99)
-
-                return (provider_priority, device_type_priority, device_model or "")
-
             entries_sorted = sorted(entries, key=sort_key)
             filtered.append(entries_sorted[0])
 
         return filtered
+
+    def _pick_activity_by_priority(self, db_session: DbSession, results: list[dict]) -> list[dict]:
+        """One row per day, each metric group from the first-ranked source that holds it.
+
+        Sources rank as in ``_filter_by_priority`` (provider, then device type), but a
+        group is taken only from a source that stored it that day, so a ring that synced
+        heart rate without a daily activity record, or a band that reports energy and no
+        steps, no longer hides another provider's steps. The row's source is the one that
+        supplied the steps (else the first-ranked source with any metric), and
+        ``steps_source_key`` / ``heart_rate_source_key`` name where the steps and the
+        heart rate came from, for the per-day extras derived from them.
+        """
+        if not results:
+            return results
+
+        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
+        device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
+        sort_key = _priority_sort_key(provider_order, device_type_order)
+
+        by_date: dict[date, list[dict]] = defaultdict(list)
+        for result in results:
+            by_date[result["activity_date"]].append(result)
+
+        picked: list[dict] = []
+        for entries in by_date.values():
+            ranked = sorted(entries, key=sort_key)
+            holders: dict[str, dict] = {}
+            for fields in ACTIVITY_METRIC_GROUPS:
+                lead = fields[0]
+                holder = next((e for e in ranked if e.get(lead) is not None), None)
+                if holder is None:
+                    holder = next((e for e in ranked if any(e.get(f) is not None for f in fields)), None)
+                if holder is not None:
+                    holders[lead] = holder
+
+            identity = holders.get("steps_sum")
+            if identity is None:
+                identity = next((e for e in ranked if any(e is h for h in holders.values())), ranked[0])
+
+            row: dict = {field: identity.get(field) for field in ACTIVITY_SOURCE_FIELDS}
+            for fields in ACTIVITY_METRIC_GROUPS:
+                holder = holders.get(fields[0])
+                for field in fields:
+                    row[field] = holder.get(field) if holder is not None else None
+            row["steps_source_key"] = _extras_key(holders["steps_sum"]) if "steps_sum" in holders else None
+            row["heart_rate_source_key"] = _extras_key(holders["hr_avg"]) if "hr_avg" in holders else None
+            picked.append(row)
+
+        picked.sort(key=lambda r: r["activity_date"])
+        return picked
 
     def _fill_from_same_provider(
         self,
@@ -559,8 +637,7 @@ class SummariesService:
         # Build lookup dict for workout data by (date, provider, device)
         workout_lookup: dict[tuple, dict] = {}
         for wa in workout_aggregates:
-            key = (wa["workout_date"], wa["source"], wa.get("device_model"))
-            workout_lookup[key] = wa
+            workout_lookup[_extras_key(wa, date_key="workout_date")] = wa
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
@@ -570,8 +647,7 @@ class SummariesService:
         # Build lookup for activity minutes
         activity_lookup: dict[tuple, ActiveMinutesResult] = {}
         for am in activity_minutes:
-            key = (am["activity_date"], am["source"], am.get("device_model"))
-            activity_lookup[key] = am
+            activity_lookup[_extras_key(am)] = am
 
         # Get intensity minutes from HR data
         # Calculate HR zone thresholds based on user's max HR (220 - age)
@@ -591,17 +667,17 @@ class SummariesService:
         # Build lookup for intensity minutes
         intensity_lookup: dict[tuple, IntensityMinutesResult] = {}
         for im in intensity_minutes_data:
-            key = (im["activity_date"], im["source"], im.get("device_model"))
-            intensity_lookup[key] = im
+            intensity_lookup[_extras_key(im)] = im
 
         # Transform to schema
         data = []
         for result in results:
-            # Look up workout data for this day/provider/device
-            result_key = (result["activity_date"], result["source"], result.get("device_model"))
-            workout_data = workout_lookup.get(result_key, {})
-            activity_data = activity_lookup.get(result_key, {})
-            intensity_data = intensity_lookup.get(result_key, {})
+            # Workouts follow the row's own source; the step-threshold minutes follow the
+            # source that supplied the steps, and the HR-zone minutes the one that supplied
+            # the heart rate, since each is derived from those samples.
+            workout_data = workout_lookup.get(_extras_key(result), {})
+            activity_data = activity_lookup.get(result.get("steps_source_key"), {})
+            intensity_data = intensity_lookup.get(result.get("heart_rate_source_key"), {})
 
             # Get elevation from workouts
             elevation_meters = workout_data.get("elevation_meters")
@@ -715,14 +791,18 @@ class SummariesService:
         )
 
     def _activity_days(self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime) -> list[dict]:
-        """One row per day in [start, end): live and archived, best source per date."""
+        """One row per day in [start, end): live and archived, each metric from the best source holding it.
+
+        Every source's row is first raised with its own provider's sibling-device samples,
+        so the per-metric pick compares whole providers rather than single devices.
+        """
         results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start, end)
         results = self._merge_archive_activity(db_session, user_id, start, end, results)
         merged_sample_sums = self.data_point_repo.get_daily_merged_sample_sums(
             db_session, user_id, start, end, tuple(MERGED_ACTIVITY_SAMPLE_FIELDS)
         )
-        results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
-        return self._fill_from_same_provider(results, merged_sample_sums)
+        results = self._fill_from_same_provider(results, merged_sample_sums)
+        return self._pick_activity_by_priority(db_session, results)
 
     def _activity_page_days(
         self,
