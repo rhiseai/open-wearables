@@ -13,6 +13,7 @@ from app.services.raw_payload_storage import put_payload_to_s3, store_raw_payloa
 from app.services.sdk_sync_state import is_historical_sync_active, sdk_payload_exceeds_realtime_limit
 from app.utils.api_utils import inline_schema_defs
 from app.utils.auth import SDKAuthDep
+from app.utils.auth_diagnostics import AuthBoundary, AuthOutcome, AuthReason, log_auth_decision
 from app.utils.sdk_request_metadata import sdk_request_metadata
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -67,6 +68,7 @@ def sync_sdk_data(
         Payload validation runs async in the worker, not here.
     """
     if auth.auth_type == "sdk_token" and (not auth.user_id or str(auth.user_id) != user_id):
+        log_auth_decision(AuthReason.SUBJECT_MISMATCH, AuthOutcome.REJECTED, boundary=AuthBoundary.SDK_SUBJECT)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Token does not match user_id",
