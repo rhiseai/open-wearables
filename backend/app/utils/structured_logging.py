@@ -39,6 +39,8 @@ def log_structured(
     level: str,
     message: str,
     provider: str | None = None,
+    *,
+    inherit_trace_id: bool = True,
     **attributes: Any,
 ) -> None:
     """
@@ -63,6 +65,7 @@ def log_structured(
         level: Log level (debug, info, warning, error)
         message: Log message (required)
         provider: Provider name (optional)
+        inherit_trace_id: Include the contextual trace ID unless explicitly disabled for privacy-restricted logs
         **attributes: Custom attributes to include (queryable via @name:value in log explorers)
 
     Example:
@@ -83,7 +86,7 @@ def log_structured(
         Vercel: Filter by JSON attributes in dashboard
         GCP: Use Cloud Logging filters with jsonPayload.batch_id="abc-123"
     """
-    if attributes.get("trace_id") is None:
+    if inherit_trace_id and attributes.get("trace_id") is None:
         tid = trace_id_var.get()
         if tid:
             attributes["trace_id"] = tid

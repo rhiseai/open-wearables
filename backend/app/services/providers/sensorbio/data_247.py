@@ -854,6 +854,10 @@ class SensorBio247Data(Base247DataTemplate):
             provider="sensorbio",
             task="load_and_save_all",
             user_id=str(user_id),
-            **results,
+            sleep_sessions_synced=results["sleep_sessions_synced"],
+            recovery_metrics_synced=results["recovery_metrics_synced"],
+            recovery_scores_synced=results["recovery_scores_synced"],
+            activity_samples_synced=results["activity_samples_synced"],
+            daily_activity_synced=results["daily_activity_synced"],
         )
         return results

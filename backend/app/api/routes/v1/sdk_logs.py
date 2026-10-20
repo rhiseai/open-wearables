@@ -19,6 +19,7 @@ from app.services.raw_payload_storage import store_raw_payload
 from app.services.sdk_sync_state import mark_historical_data_types_completed, mark_historical_sync_started
 from app.services.sync_status_service import emit_sync_started, try_record_data_types
 from app.utils.auth import SDKAuthDep
+from app.utils.auth_diagnostics import AuthBoundary, AuthOutcome, AuthReason, log_auth_decision
 from app.utils.sdk_request_metadata import sdk_request_metadata
 from app.utils.structured_logging import log_structured
 
@@ -125,6 +126,7 @@ def submit_sdk_logs(
     lifecycle, device state, sync success/failure).
     """
     if auth.auth_type == "sdk_token" and (not auth.user_id or str(auth.user_id) != str(user_id)):
+        log_auth_decision(AuthReason.SUBJECT_MISMATCH, AuthOutcome.REJECTED, boundary=AuthBoundary.SDK_SUBJECT)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Token does not match user_id",
