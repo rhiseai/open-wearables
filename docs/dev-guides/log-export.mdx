@@ -137,6 +137,33 @@ Replace the `debug` exporter with the one for your log backend.
 
 If your platform can read container logs (Grafana Alloy, the OpenTelemetry Collector `filelog` receiver, Azure Monitor Agent, Datadog Agent), `LOG_FORMAT=json` is often enough: every log record is then one JSON line that these agents parse without app-side export. Some output does not go through logging and stays plain text, such as startup banners and start script output (see [Logs](/deployment/docker#logs)). Configure the agent to keep lines that are not JSON as plain messages instead of rejecting them.
 
+## SDK authentication decisions
+
+With `LOG_FORMAT=json`, SDK credential failures, SDK subject mismatches, and refresh-token exchanges emit `action="auth_decision"`. The event contains only the standard timestamp, level, message and provider fields plus these fixed fields:
+
+| Field | Values |
+|-------|--------|
+| `auth_boundary` | `sdk_credentials`, `sdk_subject`, `refresh` |
+| `auth_reason` | `credentials_missing`, `sdk_token_expired`, `sdk_token_invalid`, `sdk_token_wrong_scope`, `api_key_invalid`, `subject_mismatch`, `refresh_invalid_or_revoked`, `refresh_rotated` |
+| `auth_outcome` | `rejected`, `recovered`, `accepted` |
+
+`rejected` is a warning at the boundary that refuses the request. When a rejected Bearer token is followed by a valid API key in the same request, one `recovered` info event records the Bearer reason. A valid SDK token takes precedence over the API-key header. Ordinary successful SDK-token and API-key authentication emits no decision event. The optional developer-token probe emits no decision either.
+
+Refresh exchanges emit `accepted` with `refresh_rotated` after generating the replacement tokens and response, or `rejected` with `refresh_invalid_or_revoked`. The repository does not distinguish invalid tokens from revoked tokens. Refresh-token rotation and HTTP response contracts are unchanged.
+
+These events do not include tokens, identifiers, request headers, payloads, exception text, or contextual trace IDs. The same restricted attributes are passed to OTLP export. Expected rejections use warning level so they do not add another error-level record alongside the existing HTTP request log. With `LOG_LEVEL=error`, these decision events are filtered out.
+
+To inspect aggregate outcomes in CloudWatch Logs Insights, select the backend log group and a bounded time range, then run:
+
+```sql
+fields auth_boundary, auth_reason, auth_outcome
+| filter action = "auth_decision"
+| stats count(*) as decisions by auth_boundary, auth_reason, auth_outcome
+| sort decisions desc
+```
+
+For example, a row with `sdk_credentials`, `sdk_token_expired`, `recovered` counts requests that succeeded through API-key fallback after an expired SDK token. A row with `sdk_credentials`, `sdk_token_expired`, `rejected` counts requests refused at that boundary. These aggregate events do not link separate requests or identify individual users, so they cannot prove that a particular client later recovered. In OTLP queries, use the corresponding `app.auth_boundary`, `app.auth_reason`, `app.auth_outcome`, and `app.action` attributes.
+
 ## Related settings
 
 - FastAPI's built-in OpenTelemetry support (traces, metrics, exception logs) stays off; `OTEL_*` variables do not turn it on.

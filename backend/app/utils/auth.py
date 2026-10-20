@@ -4,12 +4,14 @@ from uuid import UUID
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
+from jose.exceptions import ExpiredSignatureError
 
 from app.config import settings
 from app.database import DbSession
 from app.models import Developer
 from app.repositories.developer_repository import DeveloperRepository
 from app.schemas.auth import SDKAuthContext
+from app.utils.auth_diagnostics import AuthOutcome, AuthReason, log_auth_decision
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 developer_repository = DeveloperRepository(Developer)
@@ -110,6 +112,7 @@ async def get_sdk_auth(
     # Import here to avoid circular imports
     from app.services.api_key_service import api_key_service
 
+    reason = AuthReason.CREDENTIALS_MISSING
     # Try SDK user token first
     if token:
         try:
@@ -125,14 +128,25 @@ async def get_sdk_auth(
                     user_id=UUID(sub) if sub else None,
                     app_id=payload.get("app_id"),
                 )
+            reason = AuthReason.SDK_TOKEN_WRONG_SCOPE
+        except ExpiredSignatureError:
+            reason = AuthReason.SDK_TOKEN_EXPIRED
         except JWTError:
-            pass  # Fall through to API key check
+            reason = AuthReason.SDK_TOKEN_INVALID
 
     # Fall back to API key (backwards compatibility)
     if x_open_wearables_api_key:
-        api_key = api_key_service.validate_api_key(db, x_open_wearables_api_key)
+        try:
+            api_key = api_key_service.validate_api_key(db, x_open_wearables_api_key)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+                log_auth_decision(AuthReason.API_KEY_INVALID, AuthOutcome.REJECTED)
+            raise
+        if token:
+            log_auth_decision(reason, AuthOutcome.RECOVERED)
         return SDKAuthContext(auth_type="api_key", api_key_id=str(api_key.id))
 
+    log_auth_decision(reason, AuthOutcome.REJECTED)
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Authentication required: provide SDK token or API key",
