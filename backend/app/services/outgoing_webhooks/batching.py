@@ -51,6 +51,7 @@ class TimeseriesAggregate:
     start_time: str | None = None
     end_time: str | None = None
     samples: list[dict[str, Any]] = field(default_factory=list)
+    sync: dict[str, str] | None = None
 
 
 class SDKWebhookBatch:
@@ -60,7 +61,7 @@ class SDKWebhookBatch:
         self.batch_id = batch_id
         self.historical = historical
         self._events: OrderedDict[str, PendingWebhook] = OrderedDict()
-        self._timeseries: dict[tuple[UUID, str, str], TimeseriesAggregate] = {}
+        self._timeseries: dict[tuple[UUID, str, str, str | None], TimeseriesAggregate] = {}
         self.coalesced = 0
         self.suppressed = 0
 
@@ -97,17 +98,20 @@ class SDKWebhookBatch:
         start_time: str | None,
         end_time: str | None,
         samples: list[dict[str, Any]],
+        sync: dict[str, str] | None = None,
     ) -> None:
         if self.historical:
             self.suppressed += 1
             return
-        key = (user_id, provider, series_type)
+        # Writes of different runs stay apart: each event names the run that produced it.
+        run_id = sync.get("run_id") if sync else None
+        key = (user_id, provider, series_type, run_id)
         aggregate = self._timeseries.get(key)
         if aggregate is None:
             if len(self._events) + len(self._timeseries) >= MAX_REALTIME_EVENTS_PER_SDK_BATCH:
                 self.suppressed += 1
                 return
-            aggregate = TimeseriesAggregate(user_id=user_id, provider=provider, series_type=series_type)
+            aggregate = TimeseriesAggregate(user_id=user_id, provider=provider, series_type=series_type, sync=sync)
             self._timeseries[key] = aggregate
         else:
             self.coalesced += 1
@@ -142,6 +146,7 @@ class SDKWebhookBatch:
                     start_time=aggregate.start_time,
                     end_time=aggregate.end_time,
                     samples=aggregate.samples,
+                    sync=aggregate.sync,
                 )
         summary: dict[str, int | bool] = {
             "historical": self.historical,

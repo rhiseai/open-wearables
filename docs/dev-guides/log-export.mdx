@@ -164,6 +164,44 @@ fields auth_boundary, auth_reason, auth_outcome
 
 For example, a row with `sdk_credentials`, `sdk_token_expired`, `recovered` counts requests that succeeded through API-key fallback after an expired SDK token. A row with `sdk_credentials`, `sdk_token_expired`, `rejected` counts requests refused at that boundary. These aggregate events do not link separate requests or identify individual users, so they cannot prove that a particular client later recovered. In OTLP queries, use the corresponding `app.auth_boundary`, `app.auth_reason`, `app.auth_outcome`, and `app.action` attributes.
 
+## Interrupted SDK request bodies
+
+For SDK sync and diagnostic-log uploads, `error_cause_type="ClientDisconnect"` on an `http_request` record means the ASGI request-body reader observed a disconnect. The server attempts a 400 response before entering the endpoint. A disconnected peer may never receive that response. This marker identifies an interrupted transfer; it does not identify cancellation, app suspension, network loss, or timeout as the client-side cause.
+
+Status 400 alone does not distinguish this case from validation failures. Check the underlying cause. `request_bytes` comes from the declared `Content-Length`, so it is not a measurement of bytes received. `duration_ms` measures server request handling, not the client's upload timer.
+
+Before measuring retries, check whether correlation fields are available. Select a bounded time range in the backend CloudWatch log group and run:
+
+```sql
+filter message = "http_request" and status = 400 and error_cause_type = "ClientDisconnect"
+| filter path like /\/sdk\/users\/.*\/(sync|logs)/
+| stats count(*) as aborted_requests,
+    count(outbox_item_id) as with_outbox_item_id,
+    count(sdk_version) as with_sdk_version,
+    count(request_id) as with_request_id
+```
+
+This query returns counts only. For missing outbox coverage, confirm it with the same filters plus `filter ispresent(outbox_item_id)` and `stats count(*)`, rather than assuming a recovery outcome from an omitted field-count column. `request_id` is client-supplied and is not guaranteed unique per HTTP attempt or stable across later retries; an immediate retry after a 401 can reuse it. Confirm the installed client's retry boundaries and whether any outbox identifier is retained across retries and what unit it identifies. The headers are optional. Their presence does not establish coverage for older clients, uniqueness across clients, or a one-to-one mapping to uploaded chunks. A cohort without a stable correlation field has no measurable same-item recovery rate from these records alone.
+
+Keep later outcomes distinct: a `*_sdk_batch_received` event means parsing, authentication, and endpoint entry succeeded. It is emitted before payload persistence and task enqueueing, so it does not prove an HTTP 202 or completed ingestion. For `/sync`, HTTP 202 means the import task was queued; processing completes asynchronously. For `/logs`, HTTP 202 means the endpoint accepted the diagnostic events and attempted optional raw-payload storage; it does not prove durable storage or queue a health-data import. Neither response proves completed health-data ingestion. With production's default errors-only access logging, successful responses are absent from `http_request` records. Report these missing denominators and the observation window instead of treating absence of another error as recovery.
+
+Use controlled partial-body tests and bounded client outcome categories to validate cancellation, suspension, network, and timeout hypotheses. Preserve authentication and retry behavior while the cause is unresolved. Enabling or forwarding raw SDK log text is not a substitute for safe diagnostics: it can include identifiers and response text.
+
+## Asynchronous SDK import failures
+
+The `/sync` HTTP 202 response and a later worker result are different boundaries. A
+`process_sdk_upload` result with `status_code=400` reports a failed background import;
+it is not an HTTP response sent to the client. It does not undo the earlier acceptance
+or establish whether the SDK received that response or advanced its cursor.
+
+The importer can commit timeseries before processing sleep. A later sleep transaction
+failure rolls back that transaction while earlier samples remain stored. The SDK sleep
+writer and missing-score filler share a transaction-scoped user lock, held through
+score writes and commit; the filler re-reads candidates after acquiring it. There is
+no automatic database retry in this worker path. A replay requires the original payload
+and a resolved cause: synthetic regressions verify duplicate-free explicit replay, not
+the availability of every production payload or automatic client recovery.
+
 ## Related settings
 
 - FastAPI's built-in OpenTelemetry support (traces, metrics, exception logs) stays off; `OTEL_*` variables do not turn it on.

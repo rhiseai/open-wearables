@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from app.config import Settings, settings
@@ -22,6 +24,7 @@ FEATURE_KEYS = {
     "store_fit_files",
     "historical_sync_on_connect",
     "raw_payload_storage",
+    "sdk_payload_s3_offload",
     "outgoing_webhooks_enabled",
     "default_data_granularity",
 }
@@ -83,13 +86,14 @@ class TestBuildPayload:
 
         payload = telemetry_service.build_payload(db, event="daily")
 
-        assert payload["schema_version"] == 1
+        assert payload["schema_version"] == 2
         assert payload["event"] == "daily"
         assert len(payload["instance_id"]) == 32
         assert payload["app_version"]
         assert payload["environment"]
         assert payload["sent_at"]
         assert payload["total_users"] == "1-10"
+        assert payload["seed_users"] == "0"
         assert payload["active_connections"] == "1-10"
         assert payload["inactive_connections"] == "1-10"
         assert payload["users_with_active_connection"] == "1-10"
@@ -183,6 +187,34 @@ class TestOptOutSettings:
 
 
 class TestSendPing:
+    def test_aggregation_failure_releases_claim_after_database_rollback(self, db: Session) -> None:
+        previous = datetime.now(timezone.utc) - timedelta(days=2)
+        state = telemetry_service.get_or_create_state(db)
+        state.last_sent_at = previous
+        db.commit()
+
+        def fail_aggregation(session: Session) -> dict[str, int]:
+            session.execute(text("SELECT 1 / 0"))
+            raise AssertionError("PostgreSQL must reject division by zero")
+
+        with (
+            patch.object(settings, "telemetry_enabled", True),
+            patch.object(telemetry_service.repo, "count_data_points_by_provider", side_effect=fail_aggregation),
+            patch("app.services.telemetry_service.httpx.post") as post,
+            pytest.raises(DBAPIError),
+        ):
+            telemetry_service.send_ping(db, event="daily")
+
+        post.assert_not_called()
+        db.expire_all()
+        assert telemetry_service.get_or_create_state(db).last_sent_at == previous
+        with (
+            patch.object(settings, "telemetry_enabled", True),
+            patch("app.services.telemetry_service.httpx.post", return_value=MagicMock()) as retry,
+        ):
+            assert telemetry_service.send_ping(db, event="daily") == "sent"
+        retry.assert_called_once()
+
     def test_disabled_via_settings_sends_nothing(self, db: Session) -> None:
         with (
             patch.object(settings, "telemetry_enabled", False),

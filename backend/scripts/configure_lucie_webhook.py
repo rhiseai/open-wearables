@@ -39,30 +39,25 @@ def configure_lucie_webhook_filters() -> int:
                 sort_by="id",
             )
             for developer in developers:
-                endpoint_iterator: str | None = None
-                while True:
-                    try:
-                        page = svix_service.list_endpoints(str(developer.id), iterator=endpoint_iterator)
-                    except HttpError as exc:
-                        if exc.status_code == 404:
-                            break
-                        raise
+                try:
+                    # Read every page before patching, so a 404 (no Svix application) skips the developer
+                    endpoints = list(svix_service.iter_endpoints(str(developer.id)))
+                except HttpError as exc:
+                    if exc.status_code == 404:
+                        continue
+                    raise
 
-                    for endpoint in page.data:
-                        if _LUCIE_ENDPOINT_PATTERN.fullmatch(endpoint.url) is None:
-                            continue
-                        updated = svix_service.patch_endpoint(
-                            str(developer.id),
-                            endpoint.id,
-                            filter_types=_LUCIE_FILTER_TYPES,
-                        )
-                        if sorted(updated.event_types or []) != sorted(_LUCIE_FILTER_TYPES):
-                            raise RuntimeError("Svix did not persist the required Lucie event filters")
-                        configured += 1
-
-                    if page.done:
-                        break
-                    endpoint_iterator = page.iterator
+                for endpoint in endpoints:
+                    if _LUCIE_ENDPOINT_PATTERN.fullmatch(endpoint.url) is None:
+                        continue
+                    updated = svix_service.patch_endpoint(
+                        str(developer.id),
+                        endpoint.id,
+                        filter_types=_LUCIE_FILTER_TYPES,
+                    )
+                    if sorted(updated.event_types or []) != sorted(_LUCIE_FILTER_TYPES):
+                        raise RuntimeError("Svix did not persist the required Lucie event filters")
+                    configured += 1
 
             if len(developers) < _DEVELOPER_PAGE_SIZE:
                 break

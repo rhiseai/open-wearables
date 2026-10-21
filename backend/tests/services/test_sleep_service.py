@@ -749,7 +749,7 @@ class TestPersistSleep:
 class TestHandleSleepDataIntegration:
     """Integration tests for handle_sleep_data with real payload structures."""
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_handle_real_payload_sleeping_stages(
@@ -784,7 +784,7 @@ class TestHandleSleepDataIntegration:
         assert mock_event_service.create_or_merge_sleep.call_count == 2
 
         # The finalize task should be dispatched for housekeeping
-        mock_finalize.delay.assert_called_once()
+        mock_finalize.send_task.assert_called_once()
 
         # Verify saved state: grab the last set() call's value
         last_set_call = mock_redis.set.call_args_list[-1]
@@ -804,7 +804,7 @@ class TestHandleSleepDataIntegration:
         assert len(in_bed_stages) == 0
         assert state.device_model == "Watch3,3"
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_handle_detailed_stages_payload(
@@ -845,7 +845,7 @@ class TestHandleSleepDataIntegration:
         assert SleepStageType.REM in stage_types
         assert SleepStageType.AWAKE in stage_types
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.persist_sleep")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_fresh_night_batch_flushes_without_closing_redis(
@@ -890,7 +890,7 @@ class TestHandleSleepDataIntegration:
         assert mock_persist.call_args.kwargs["close"] is False
         # Redis state must remain (set was called; delete not part of persist mock)
         assert mock_redis.set.called
-        mock_finalize.delay.assert_called_once()
+        mock_finalize.send_task.assert_called_once()
 
 
 class TestSDKSyncEndpointSleep:
@@ -956,7 +956,7 @@ class TestNoIntermediateRedisSaves:
     prevents this race condition.
     """
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_redis_set_called_once_per_batch(
@@ -1000,7 +1000,7 @@ class TestHistoricalBulkUploadMerging:
     DB record per night regardless of how many payloads Apple sends.
     """
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_second_payload_merges_via_create_or_merge_sleep(
@@ -1066,7 +1066,7 @@ class TestHistoricalBulkUploadMerging:
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.REM in stage_types
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_follow_up_batch_reuses_same_external_id(
@@ -1212,7 +1212,7 @@ class TestProviderSleepScore:
             ],
         )
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_sleep_score_value_is_kept_in_state(
@@ -1235,7 +1235,7 @@ class TestProviderSleepScore:
         finished_state: SleepState = mock_persist.call_args[0][2]
         assert finished_state.sleep_score == 82
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     @patch("app.services.sdk.sleep_service.event_record_service")
     @patch("app.services.sdk.sleep_service.get_redis_client")
     def test_sleep_score_is_not_attached_to_other_provider_state(
@@ -1303,7 +1303,7 @@ class TestProviderSleepScore:
 
         mock_score_service.bulk_create.assert_not_called()
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.sdk.sleep_service.celery_app")
     def test_samsung_sleep_score_is_persisted(self, mock_finalize: MagicMock, db: Session) -> None:
         """End to end against the DB: a historical Samsung night lands as a session with its sleep score."""
         user = UserFactory()

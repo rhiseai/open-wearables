@@ -11,7 +11,7 @@ from app.constants.series_types.sdk import SleepPhase, get_series_type_from_metr
 from app.constants.series_types.sdk.category_types import AppleCategoryType
 from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.constants.workout_types import get_unified_apple_workout_type_xml
-from app.schemas.enums import SeriesType, daily_total_flag
+from app.schemas.enums import EventCategory, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -125,7 +125,6 @@ class XMLService:
 
         return SourceInfo(
             name=raw_fields.get("name"),
-            device_id=raw_fields.get("device"),
             device_model=raw_fields.get("model"),
             device_manufacturer=raw_fields.get("manufacturer"),
             device_hardware_version=raw_fields.get("hardware"),
@@ -274,7 +273,7 @@ class XMLService:
         duration_seconds = int((document["endDate"] - document["startDate"]).total_seconds())
 
         record = EventRecordCreate(
-            category="workout",
+            category=EventCategory.WORKOUT,
             type=workout_type.value,
             source_name=document["sourceName"],
             device_model=device_info.device_model,
@@ -298,7 +297,7 @@ class XMLService:
 
     def _init_metrics(self) -> EventRecordMetrics:
         return {
-            "energy_burned": Decimal("0"),
+            "energy_burned": None,
             "heart_rate_min": None,
             "heart_rate_max": None,
             "heart_rate_avg": None,
@@ -331,8 +330,11 @@ class XMLService:
             if avg_value is not None:
                 metrics["heart_rate_avg"] = avg_value
 
-        if "energyburned" in lowered and metrics["energy_burned"] is not None:
-            metrics["energy_burned"] += self._decimal_from_stat(statistic.get("sum")) or Decimal("0")
+        # Summed across the energy statistics, and left unset when the export reports none
+        energy = self._decimal_from_stat(statistic.get("sum")) if "energyburned" in lowered else None
+        if energy is not None:
+            current = metrics["energy_burned"]
+            metrics["energy_burned"] = energy if current is None else current + energy
 
     def _wrap_sleep_data(self, sleep_records: list[SleepRecord]) -> SyncRequest:
         """Wrap sleep data in a SyncRequest
