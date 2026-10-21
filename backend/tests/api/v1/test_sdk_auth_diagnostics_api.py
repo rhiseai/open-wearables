@@ -3,9 +3,11 @@
 import json
 import logging
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
+from fastapi import HTTPException
 from jose import jwt
 from sqlalchemy.orm import Session
 from starlette.testclient import TestClient
@@ -78,6 +80,135 @@ def _decisions(output: str) -> list[dict]:
 def _assert_decision(entry: dict, boundary: str, reason: str, outcome: str = "rejected") -> None:
     assert (entry["auth_boundary"], entry["auth_reason"], entry["auth_outcome"]) == (boundary, reason, outcome)
     assert entry["level"] == ("warning" if outcome == "rejected" else "info")
+
+
+def _access_logs(output: str) -> list[dict]:
+    entries = []
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("message") == "http_request":
+            entries.append(event)
+    return entries
+
+
+@pytest.mark.parametrize(("endpoint", "payload"), ENDPOINTS)
+@pytest.mark.parametrize(
+    ("kind", "reason", "severity"),
+    [
+        ("expired", "sdk_token_expired", "warning"),
+        ("invalid", "sdk_token_invalid", "error"),
+        ("wrong_scope", "sdk_token_wrong_scope", "error"),
+        ("missing", "credentials_missing", "error"),
+    ],
+)
+def test_sdk_auth_reason_controls_real_access_log_without_changing_401(
+    client: TestClient,
+    endpoint: str,
+    payload: dict,
+    kind: str,
+    reason: str,
+    severity: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = (
+        jwt.encode(
+            {
+                "sub": USER_ID,
+                "scope": "developer" if kind == "wrong_scope" else "sdk",
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=-5 if kind == "expired" else 5),
+            },
+            settings.secret_key,
+            algorithm=settings.algorithm,
+        )
+        if kind in {"expired", "wrong_scope"}
+        else "private-invalid-bearer-fixture"
+    )
+    headers = {} if kind == "missing" else {"Authorization": f"Bearer {token}"}
+    capsys.readouterr()
+    response = client.post(f"/api/v1/sdk/users/{USER_ID}/{endpoint}", headers=headers, json=payload)
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Authentication required: provide SDK token or API key"}
+    assert "www-authenticate" not in response.headers
+    output = capsys.readouterr().out
+    [access] = _access_logs(output)
+    assert (access["status"], access["level"], access["auth_reason"]) == (401, severity, reason)
+    assert token not in output
+
+
+def test_expired_bearer_with_rejected_api_key_stays_error(
+    client: TestClient,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = jwt.encode(
+        {"sub": USER_ID, "scope": "sdk", "exp": datetime.now(timezone.utc) - timedelta(minutes=5)},
+        settings.secret_key,
+        algorithm=settings.algorithm,
+    )
+    capsys.readouterr()
+    response = client.post(
+        f"/api/v1/sdk/users/{USER_ID}/sync",
+        headers={"Authorization": f"Bearer {token}", "X-Open-Wearables-API-Key": "private-invalid-key"},
+        json=ENDPOINTS[0][1],
+    )
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Invalid or missing API key"}
+    [access] = _access_logs(capsys.readouterr().out)
+    assert access["level"] == "error"
+    assert "auth_reason" not in access
+
+
+def test_expired_request_does_not_downgrade_a_subsequent_real_sync_500(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    expired = jwt.encode(
+        {"sub": USER_ID, "scope": "sdk", "exp": datetime.now(timezone.utc) - timedelta(minutes=5)},
+        settings.secret_key,
+        algorithm=settings.algorithm,
+    )
+    endpoint = f"/api/v1/sdk/users/{USER_ID}/sync"
+    capsys.readouterr()
+    response = client.post(endpoint, headers={"Authorization": f"Bearer {expired}"}, json=ENDPOINTS[0][1])
+    assert response.status_code == 401
+    monkeypatch.setattr(settings, "sdk_payload_s3_offload", False)
+    with (
+        patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as task,
+        patch("app.api.routes.v1.sdk_sync.store_raw_payload"),
+    ):
+        task.delay.side_effect = RuntimeError("test queue failure")
+        failing_client = TestClient(client.app, raise_server_exceptions=False)
+        response = failing_client.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {create_sdk_user_token('test-app', USER_ID)}"},
+            json=ENDPOINTS[0][1],
+        )
+    assert response.status_code == 500
+    first, failed = _access_logs(capsys.readouterr().out)
+    assert (first["status"], first["level"]) == (401, "warning")
+    assert (failed["status"], failed["level"]) == (500, "error")
+    assert "auth_reason" not in failed
+
+
+@pytest.mark.parametrize("status_code", [500, 503])
+def test_refresh_server_failures_stay_error(
+    client: TestClient,
+    status_code: int,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    error = RuntimeError("test refresh failure") if status_code == 500 else HTTPException(status_code=503)
+    capsys.readouterr()
+    with patch("app.api.routes.v1.token.refresh_token_service.refresh_token", side_effect=error):
+        failing_client = TestClient(client.app, raise_server_exceptions=False)
+        response = failing_client.post("/api/v1/token/refresh", json={"refresh_token": "test-refresh-token"})
+    assert response.status_code == status_code
+    [access] = _access_logs(capsys.readouterr().out)
+    assert (access["status"], access["level"]) == (status_code, "error")
+    assert "auth_reason" not in access
 
 
 @pytest.mark.parametrize(("endpoint", "payload"), ENDPOINTS)
@@ -183,6 +314,9 @@ def test_rejected_refresh_credentials_preserve_401_and_bearer_challenge(
     assert response.json() == {"detail": "Invalid or revoked refresh token"}
     assert response.headers["www-authenticate"] == "Bearer"
     output = capsys.readouterr().out
+    [access] = _access_logs(output)
+    assert (access["status"], access["level"]) == (401, "error")
+    assert "auth_reason" not in access
     [event] = _decisions(output)
     _assert_decision(event, "refresh", "refresh_invalid_or_revoked")
     assert token not in output
