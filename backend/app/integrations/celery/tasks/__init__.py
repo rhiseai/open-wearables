@@ -29,6 +29,7 @@ from .garmin.backfill_trigger import (
 )
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
+from .process_sdk_sleep_task import process_sdk_sleep
 from .process_sdk_upload_task import process_sdk_upload
 from .process_xml_upload_task import process_xml_upload
 from .provider_webhooks_task import reconcile_provider_webhooks
@@ -63,6 +64,7 @@ __all__ = [
     "dispatch_extension_events",
     "close_stale_sync_runs",
     "finalize_stale_sleeps",
+    "process_sdk_sleep",
     "process_sdk_upload",
     "process_aws_upload",
     "process_xml_upload",
