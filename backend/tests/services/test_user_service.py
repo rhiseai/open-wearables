@@ -16,7 +16,10 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from app.integrations.redis_client import get_redis_client
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
+from app.schemas.providers.mobile_sdk import SleepState
+from app.services.sdk.sleep_service import active_users_key, key, save_sleep_state, source_states_key
 from app.services.user_service import user_service
 from tests.factories import UserFactory
 
@@ -215,6 +218,33 @@ class TestUserServiceDelete:
         # Assert - user should no longer exist
         result = user_service.get(db, user_id)
         assert result is None
+
+    def test_delete_user_drops_in_progress_sleep(self, db: Session) -> None:
+        """A deleted user's Redis sleep state must not outlive them (RHISE-6107)."""
+        # Arrange
+        user = UserFactory(email="sleeping@example.com")
+        user_id = str(user.id)
+        night = datetime(2026, 10, 21, 2, 0, tzinfo=timezone.utc)
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=night,
+            end_time=night + timedelta(hours=4),
+            last_start_timestamp=night,
+            last_end_timestamp=night + timedelta(hours=4),
+        )
+        save_sleep_state(user_id, state)
+        redis_client = get_redis_client()
+        assert redis_client.sismember(active_users_key(), user_id)
+
+        # Act
+        user_service.delete(db, user.id)
+
+        # Assert
+        assert not redis_client.sismember(active_users_key(), user_id)
+        assert not redis_client.exists(key(user_id, state), source_states_key(user_id))
 
     def test_delete_nonexistent_user(self, db: Session) -> None:
         """Should handle deleting non-existent user gracefully."""
