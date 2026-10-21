@@ -44,6 +44,7 @@ from app.schemas.providers.mobile_sdk.sync_request import (
 )
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
+from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
 from app.services.providers.apple.sample_normalization import normalize_apple_sample_value
 from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
@@ -51,7 +52,7 @@ from app.utils.structured_logging import log_structured
 
 from .device_resolution import extract_device_info, extract_device_type
 from .menstrual_service import handle_menstrual_data
-from .sleep_service import handle_sleep_data
+from .sleep_service import SleepLockBusyError, handle_sleep_data
 
 # Health Connect's own mg/dL converter uses exactly 18.0, so values written to HC
 # in mg/dL round-trip with a ~0.1% offset under this factor.
@@ -87,6 +88,7 @@ class LoadDataResult(TypedDict):
     records_updated: int  # rows refreshed in place
     types: list[str]  # series types written
     sleep_saved: int
+    sleep_deferred: int  # sleep segments left to process_sdk_sleep (lock busy)
     dropped: list[InvalidRecord]
     validation_ms: float
 
@@ -420,6 +422,30 @@ class ImportService:
 
         return EventRecordMetrics(**stats_dict), time_series_samples, duration
 
+    def _defer_sleep(self, request: SDKSyncRequest, user_id: str, batch_id: str | None) -> None:
+        """Hand the batch's sleep to process_sdk_sleep, which retries until the lock frees up."""
+        # import not at module level in order to avoid circular import
+        from app.integrations.celery.tasks.process_sdk_sleep_task import process_sdk_sleep
+
+        sleep_only = request.model_copy(update={"data": SyncRequestData(sleep=request.data.sleep)})
+        webhook_batch = current_sdk_webhook_batch()
+        process_sdk_sleep.delay(
+            sleep_only.model_dump_json(),
+            user_id,
+            batch_id or str(uuid4()),
+            webhook_batch.historical if webhook_batch is not None else False,
+        )
+        log_structured(
+            self.log,
+            "warning",
+            f"{request.provider.capitalize()} SDK sleep deferred: sleep lock busy",
+            provider=request.provider,
+            action=f"{request.provider}_sdk_sleep_deferred",
+            batch_id=batch_id,
+            user_id=user_id,
+            sleep_deferred=len(request.data.sleep),
+        )
+
     def load_data(
         self,
         db_session: DbSession,
@@ -443,6 +469,7 @@ class ImportService:
         records_inserted = 0
         records_updated = 0
         sleep_saved = 0
+        sleep_deferred = 0
         types: set[str] = set()
 
         # A nutrient record whose correlation isn't in this batch stays a loose sample.
@@ -509,8 +536,14 @@ class ImportService:
 
         # Process sleep (count sleep segments from input)
         if request.data.sleep:
-            handle_sleep_data(db_session, request, user_id)
-            sleep_saved = len(request.data.sleep)
+            try:
+                handle_sleep_data(db_session, request, user_id)
+                sleep_saved = len(request.data.sleep)
+            except SleepLockBusyError:
+                # The lock is busy with this user's other batches, and nothing of the sleep
+                # was written. The rest of the batch is committed, so only its sleep waits.
+                self._defer_sleep(request, user_id, batch_id)
+                sleep_deferred = len(request.data.sleep)
 
         # Assemble menstrual_cycle events from menstrual_flow samples + payload cycle-start flags.
         # Samples are already committed above; cycle-start metadata is not persisted on timeseries rows.
@@ -524,6 +557,7 @@ class ImportService:
             "records_updated": records_updated,
             "types": sorted(types),
             "sleep_saved": sleep_saved,
+            "sleep_deferred": sleep_deferred,
             "dropped": dropped,
             "validation_ms": validation_ms,
         }
@@ -592,6 +626,7 @@ class ImportService:
                 records_updated=saved_counts["records_updated"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
+                sleep_deferred=saved_counts["sleep_deferred"],
                 validation_ms=saved_counts["validation_ms"],
             )
 

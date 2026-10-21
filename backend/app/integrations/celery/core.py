@@ -204,6 +204,7 @@ def create_celery() -> Celery:
             route_webhook_task,
             {
                 "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
+                "app.integrations.celery.tasks.process_sdk_sleep_task.process_sdk_sleep": {"queue": "sdk_sync"},
                 "app.integrations.celery.tasks.process_aws_upload_task.process_aws_upload": {"queue": "xml_sync"},
                 "app.integrations.celery.tasks.process_aws_upload_task.complete_and_process_aws_upload": {
                     "queue": "xml_sync"
