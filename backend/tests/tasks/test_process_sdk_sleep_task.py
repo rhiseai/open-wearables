@@ -43,7 +43,7 @@ def _sleep_records(db: Session, user_id: object) -> list[EventRecord]:
     return db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user_id).all()
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 @patch(f"{_MODULE}.SessionLocal")
 def test_deferred_sleep_is_stored_when_the_lock_is_free(
     mock_session_local: MagicMock, mock_finalize: MagicMock, db: Session

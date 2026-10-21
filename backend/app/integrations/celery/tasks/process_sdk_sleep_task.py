@@ -4,6 +4,7 @@ from typing import Any
 
 from celery import Task, shared_task
 
+from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
@@ -17,7 +18,7 @@ _LOCK_RETRY_MAX_SECONDS = 300
 _LOCK_RETRY_JITTER_SECONDS = 15
 
 
-@shared_task(bind=True, queue="sdk_sync", max_retries=8)
+@shared_task(bind=True, name=CeleryTask.PROCESS_SDK_SLEEP, max_retries=8)
 def process_sdk_sleep(
     task: Task,
     request_json: str,

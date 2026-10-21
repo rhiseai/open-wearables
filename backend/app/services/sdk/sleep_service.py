@@ -7,9 +7,11 @@ from logging import getLogger
 from typing import Any
 from uuid import UUID, uuid4
 
+from celery import current_app as celery_app
 from redis.exceptions import LockNotOwnedError
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.constants.series_types.sdk import (
     SleepPhase,
     get_apple_sleep_phase,
@@ -18,7 +20,7 @@ from app.constants.sleep import SleepStageType
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
 from app.models import EventRecord
-from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
+from app.schemas.enums import DeviceType, EventCategory, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -35,7 +37,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
-from app.services.sdk.device_resolution import extract_device_info, extract_device_type
+from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
 from app.services.sleep_reconciliation import merge_sleep_stages
 from app.utils.structured_logging import log_structured
 
@@ -163,12 +165,18 @@ def _create_new_sleep_state(
     device_model: str | None = None,
     zone_offset: str | None = None,
     device_type: DeviceType | None = None,
+    device_id: str | None = None,
+    source_app_id: str | None = None,
+    device_manufacturer: str | None = None,
 ) -> SleepState:
     return SleepState(
         uuid=id or str(uuid4()),
         source_name=source_name or "unknown",
         device_model=device_model,
         device_type=device_type,
+        device_id=device_id,
+        source_app_id=source_app_id,
+        device_manufacturer=device_manufacturer,
         provider=provider,
         zone_offset=zone_offset,
         start_time=start_time,
@@ -198,6 +206,9 @@ def _apply_transition(
     device_model: str | None = None,
     zone_offset: str | None = None,
     device_type: DeviceType | None = None,
+    device_id: str | None = None,
+    source_app_id: str | None = None,
+    device_manufacturer: str | None = None,
     *,
     commit: bool = True,
 ) -> SleepState:
@@ -221,7 +232,17 @@ def _apply_transition(
     if delta_seconds > settings.sleep_end_gap_minutes * 60:
         persist_sleep(db_session, user_id, state, close=True, commit=commit)
         state = _create_new_sleep_state(
-            start_time, end_time, uuid, provider, source_name, device_model, zone_offset, device_type
+            start_time,
+            end_time,
+            uuid,
+            provider,
+            source_name,
+            device_model,
+            zone_offset,
+            device_type,
+            device_id,
+            source_app_id,
+            device_manufacturer,
         )
 
     if zone_offset and not state.zone_offset:
@@ -340,6 +361,7 @@ def handle_sleep_data(
         for sample in sorted(request.data.sleep, key=lambda item: item.startDate):
             device_model, _, source_name = extract_device_info(sample.source)
             device_type = extract_device_type(sample.source)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(sample.source)
             identity = _state_identity(request.provider, source_name, device_model)
             sample_key = (identity, sample.startDate, sample.endDate, sample.stage)
             if sample_key in seen:
@@ -362,6 +384,9 @@ def handle_sleep_data(
                     device_model,
                     sample.zoneOffset,
                     device_type,
+                    device_id,
+                    source_app_id,
+                    device_manufacturer,
                 )
             state = _apply_transition(
                 db_session,
@@ -376,6 +401,9 @@ def handle_sleep_data(
                 device_model,
                 sample.zoneOffset,
                 device_type,
+                device_id,
+                source_app_id,
+                device_manufacturer,
                 commit=False,
             )
             sleep_score = _extract_sleep_score(sample.values)
@@ -410,12 +438,9 @@ def handle_sleep_data(
     finally:
         release_sleep_lock(lock, user_id)
 
-    # import not at module level in order to avoid circular import
-    from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_stale_sleeps
-
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
     # other users' sessions) are finalised promptly without waiting for the next beat.
-    finalize_stale_sleeps.delay()
+    celery_app.send_task(CeleryTask.FINALIZE_STALE_SLEEPS)
 
 
 def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
@@ -572,13 +597,16 @@ def persist_sleep(
         end_datetime=end_time,
         zone_offset=state.zone_offset,
         duration_seconds=int(total_duration),
-        category="sleep",
+        category=EventCategory.SLEEP,
         type="sleep_session",
         source_name=state.source_name or "unknown",
         source=source_for_lookup,
         provider=state.provider,
         device_model=state.device_model,
         device_type=state.device_type,
+        device_id=state.device_id,
+        source_app_id=state.source_app_id,
+        device_manufacturer=state.device_manufacturer,
     )
 
     detail = EventRecordDetailCreate(

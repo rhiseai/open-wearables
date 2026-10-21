@@ -3,7 +3,7 @@ from app.constants.series_types.sdk.workout_statistics import WORKOUT_STATISTIC_
 from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
 
-# Apple HealthKit emits only HKQuantityTypeIdentifier... metrics (SDNN, not RMSSD),
+# Apple HealthKit emits only HKQuantityTypeIdentifier... metrics (HRV as SDNN, plus RMSSD on iOS 27+),
 # plus selected HKCategoryTypeIdentifier... samples mapped into timeseries
 # (menstrual_flow, mindful_minutes, etc.).
 TIMESERIES: frozenset[SeriesType] = frozenset(

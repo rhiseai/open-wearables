@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Open Wearables API",
-    "version": "0.9.0"
+    "version": "0.10.0"
   },
   "paths": {
     "/": {
@@ -665,6 +665,144 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/UserRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/personal-record": {
+      "get": {
+        "tags": [
+          "External: Users"
+        ],
+        "summary": "Get Personal Record",
+        "description": "Returns the user's birth date, gender and sex. A field that was never set is null.",
+        "operationId": "get_personal_record_api_v1_users__user_id__personal_record_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalRecordResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "External: Users"
+        ],
+        "summary": "Put Personal Record",
+        "description": "Sets the user's birth date, gender and sex.\n\nReplaces the whole record: a field left out of the body is set to null. Open Wearables uses\nthe birth date for the user's age, for example in the body summary and for the maximum heart\nrate behind the intensity minutes of the activity summary.",
+        "operationId": "put_personal_record_api_v1_users__user_id__personal_record_put",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersonalRecordUpdate"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalRecordResponse"
                 }
               }
             }
@@ -4465,21 +4603,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "anyOf": [
-                      {
-                        "type": "boolean"
-                      },
-                      {
-                        "type": "object",
-                        "additionalProperties": true
-                      },
-                      {
-                        "type": "string"
-                      }
-                    ]
-                  },
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SyncResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SyncQueuedResponse"
+                    }
+                  ],
                   "title": "Response Sync User Data Api V1 Providers  Provider  Users  User Id  Sync Post"
                 }
               }
@@ -6461,6 +6592,7 @@
                                     "HKQuantityTypeIdentifierRestingHeartRate",
                                     "RESTING_HEART_RATE",
                                     "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+                                    "HKQuantityTypeIdentifierHeartRateVariabilityRMSSD",
                                     "HEART_RATE_VARIABILITY",
                                     "HKQuantityTypeIdentifierHeartRateRecoveryOneMinute",
                                     "HKQuantityTypeIdentifierWalkingHeartRateAverage",
@@ -11258,7 +11390,7 @@
               }
             ],
             "title": "Total Calories Kcal",
-            "description": "Active + basal energy",
+            "description": "Total energy burned: the provider's reported total when available, otherwise active + basal energy when both are reported; null otherwise",
             "example": 2150.0
           },
           "active_minutes": {
@@ -12430,6 +12562,17 @@
               }
             ],
             "title": "Original Source Name"
+          },
+          "device_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Name"
           },
           "display_name": {
             "anyOf": [
@@ -13645,6 +13788,16 @@
               }
             ],
             "title": "Expires In"
+          },
+          "password_change": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PasswordChangePrompt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "user_id": {
             "type": "string",
@@ -14905,6 +15058,130 @@
         ],
         "title": "PasswordChange"
       },
+      "PasswordChangePrompt": {
+        "type": "string",
+        "enum": [
+          "required",
+          "recommended"
+        ],
+        "title": "PasswordChangePrompt",
+        "description": "How the portal should ask a developer who signed in with the default password to change it."
+      },
+      "PersonalRecordResponse": {
+        "properties": {
+          "birth_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Birth Date",
+            "description": "Birth date of the user"
+          },
+          "gender": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "female",
+                  "male",
+                  "nonbinary",
+                  "other"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gender",
+            "description": "Optional self-reported gender"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "User Id"
+          },
+          "sex": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "female",
+                  "male"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sex",
+            "description": "Biological sex, for norms that differ between women and men"
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_id"
+        ],
+        "title": "PersonalRecordResponse"
+      },
+      "PersonalRecordUpdate": {
+        "properties": {
+          "birth_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Birth Date",
+            "description": "Birth date of the user"
+          },
+          "gender": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "female",
+                  "male",
+                  "nonbinary",
+                  "other"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Gender",
+            "description": "Optional self-reported gender"
+          },
+          "sex": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "female",
+                  "male"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sex",
+            "description": "Biological sex, for norms that differ between women and men"
+          }
+        },
+        "type": "object",
+        "title": "PersonalRecordUpdate",
+        "description": "The whole record: a field left out is stored as null."
+      },
       "PowerZone": {
         "properties": {
           "zone": {
@@ -15946,6 +16223,7 @@
           "flights_climbed",
           "average_met",
           "active_time",
+          "total_energy",
           "distance_walking_running",
           "distance_cycling",
           "distance_swimming",
@@ -16831,6 +17109,18 @@
             ],
             "example": "phone"
           },
+          "device_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Id",
+            "example": "R9ZW30ABC12"
+          },
           "device_name": {
             "anyOf": [
               {
@@ -16981,6 +17271,152 @@
         "title": "StorageEstimate",
         "description": "Storage sizes across all database tables."
       },
+      "Sync247Summary": {
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/SyncStatus"
+          },
+          "items_inserted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Inserted"
+          },
+          "items_updated": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Updated"
+          },
+          "items_reported": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Reported"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code",
+            "description": "Set when the whole sync failed before any task ran"
+          },
+          "tasks": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Sync247TaskSummary"
+            },
+            "type": "object",
+            "title": "Tasks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "items_inserted",
+          "items_updated",
+          "items_reported",
+          "tasks"
+        ],
+        "title": "Sync247Summary",
+        "description": "A 24/7 sync: totals over its provider fetch tasks, and each task."
+      },
+      "Sync247TaskSummary": {
+        "properties": {
+          "status": {
+            "$ref": "#/components/schemas/SyncStatus"
+          },
+          "items_inserted": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Inserted",
+            "description": "New rows, when the write path reports the split"
+          },
+          "items_updated": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Updated",
+            "description": "Rows refreshed in place, when the write path reports the split"
+          },
+          "items_reported": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Items Reported",
+            "description": "Rows written, when only a total is known"
+          },
+          "items_skipped": {
+            "type": "integer",
+            "title": "Items Skipped",
+            "description": "Records deliberately not stored, such as duplicates"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "description": "The fetch stopped early, so the window is incomplete"
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Code",
+            "description": "HTTP status (http_401) or error type of the first failure"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "items_inserted",
+          "items_updated",
+          "items_reported",
+          "items_skipped",
+          "truncated",
+          "error_code"
+        ],
+        "title": "Sync247TaskSummary",
+        "description": "One provider fetch task of a 24/7 sync. Counters mean what they do in sync.data_type events."
+      },
       "SyncDataType": {
         "type": "string",
         "enum": [
@@ -16990,6 +17426,81 @@
         ],
         "title": "SyncDataType",
         "description": "Types of data to sync from provider."
+      },
+      "SyncDetails": {
+        "properties": {
+          "workouts": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Workouts",
+            "description": "Workouts saved, when workouts were synced"
+          },
+          "data_247": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Sync247Summary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "title": "SyncDetails"
+      },
+      "SyncQueuedResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "async": {
+            "type": "boolean",
+            "title": "Async"
+          },
+          "task_id": {
+            "type": "string",
+            "title": "Task Id"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "async",
+          "task_id",
+          "message"
+        ],
+        "title": "SyncQueuedResponse",
+        "description": "A sync queued to run in the background."
+      },
+      "SyncResponse": {
+        "properties": {
+          "success": {
+            "type": "boolean",
+            "title": "Success"
+          },
+          "details": {
+            "$ref": "#/components/schemas/SyncDetails"
+          }
+        },
+        "type": "object",
+        "required": [
+          "success",
+          "details"
+        ],
+        "title": "SyncResponse",
+        "description": "A synchronous sync's outcome."
       },
       "SyncRunDataTypeRecord": {
         "properties": {
@@ -18090,6 +18601,16 @@
               }
             ],
             "title": "Expires In"
+          },
+          "password_change": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PasswordChangePrompt"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",

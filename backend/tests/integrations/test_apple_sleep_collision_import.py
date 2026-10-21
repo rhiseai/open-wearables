@@ -98,7 +98,7 @@ def test_collision_import_saves_sleep_menstrual_events_and_sync_marker(db: Sessi
     user, connection, own = _seed_collision()
     own_id = own.id
     importer = ImportService(log=logging.getLogger("test.sleep-collision"))
-    with patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay"):
+    with patch("app.services.sdk.sleep_service.celery_app"):
         for _ in range(2):
             result = importer.import_data_from_request(db, _payload(), "application/json", str(user.id))
             assert result.status_code == 200, result.response

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from base64 import b64encode, urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -133,8 +134,14 @@ class BaseOAuthTemplate(ABC):
 
         return oauth_state
 
-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
-        """Refreshes the access token using the refresh token."""
+    def refresh_access_token(
+        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_failure: bool = True
+    ) -> OAuthTokenResponse:
+        """Refreshes the access token using the refresh token.
+
+        Pass ``revoke_on_failure=False`` when the caller revokes the connection itself with a
+        more specific reason than ``refresh_failed``.
+        """
         data, headers = self._prepare_refresh_request(refresh_token)
 
         try:
@@ -182,7 +189,7 @@ class BaseOAuthTemplate(ABC):
             # refresh already rotated it (single-use refresh tokens, e.g. Whoop)
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
                 rotated_token = self._get_rotated_token(db, user_id, refresh_token)
-                if rotated_token is None:
+                if rotated_token is None and revoke_on_failure:
                     # The revoke is guarded on the same rotation condition, so a rotation
                     # that commits after the check above still cannot revoke the connection
                     revoked = self._revoke_connection(db, user_id, refresh_token=refresh_token, reason="refresh_failed")
@@ -199,7 +206,6 @@ class BaseOAuthTemplate(ABC):
                         user_id=str(user_id),
                     )
                     return rotated_token
-
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",
@@ -300,8 +306,6 @@ class BaseOAuthTemplate(ABC):
         )
 
         if self.credentials.default_scope:
-            from urllib.parse import quote
-
             encoded_scope = quote(self.credentials.default_scope)
             auth_url += f"&scope={encoded_scope}"
 

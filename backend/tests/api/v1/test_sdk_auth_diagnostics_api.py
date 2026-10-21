@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 
 from app.config import settings
 from app.models import RefreshToken
+from app.schemas.auth import SDKTokenOrigin
 from app.services.refresh_token_service import refresh_token_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.config_utils import LogFormat, LogLevel
@@ -174,7 +175,7 @@ def test_rejected_refresh_credentials_preserve_401_and_bearer_challenge(
     token = "rt-private-invalid-refresh-fixture"
     if revoked:
         user = UserFactory()
-        token = refresh_token_service.create_sdk_refresh_token(db, user.id, "private-app-fixture")
+        token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
         refresh_token_service.revoke_token(db, token)
     capsys.readouterr()
     response = client.post("/api/v1/token/refresh", json={"refresh_token": token})
@@ -197,9 +198,8 @@ def test_rotation_logs_accepted_not_cross_request_recovery_and_replay_is_rejecte
 ) -> None:
     identity = UserFactory() if token_kind == "sdk" else DeveloperFactory()
     identity_id = str(identity.id)
-    app_id = "private-rotation-app-fixture"
     old = (
-        refresh_token_service.create_sdk_refresh_token(db, identity.id, app_id)
+        refresh_token_service.create_sdk_refresh_token(db, identity.id, SDKTokenOrigin.ADMIN)
         if token_kind == "sdk"
         else refresh_token_service.create_developer_refresh_token(db, identity.id)
     )
@@ -229,7 +229,7 @@ def test_rotation_logs_accepted_not_cross_request_recovery_and_replay_is_rejecte
     _assert_decision(first, "refresh", "refresh_rotated", "accepted")
     _assert_decision(failed_replay, "refresh", "refresh_invalid_or_revoked")
     _assert_decision(second, "refresh", "refresh_rotated", "accepted")
-    for private in (identity_id, app_id, old, old[:10], data["access_token"], data["refresh_token"]):
+    for private in (identity_id, old, old[:10], data["access_token"], data["refresh_token"]):
         assert private not in output
         assert private not in caplog.text
 

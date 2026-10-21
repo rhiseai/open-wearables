@@ -12,18 +12,19 @@ from typing import Any
 from celery import shared_task
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.services import developer_service
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.payloads import validate_webhook_payload
-from app.services.outgoing_webhooks.routing import EMIT_WEBHOOK_TASK_NAME, webhook_queue_for
+from app.services.outgoing_webhooks.routing import webhook_queue_for
 
 logger = getLogger(__name__)
 
 
 # No ``queue=`` here: a task-level queue would override the per-event router in celery/core.py.
 @shared_task(
-    name=EMIT_WEBHOOK_TASK_NAME,
+    name=CeleryTask.EMIT_WEBHOOK_EVENT,
     bind=True,
     max_retries=2,
     default_retry_delay=5,

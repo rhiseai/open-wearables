@@ -106,9 +106,12 @@ ACTIVITY_METRIC_GROUPS: tuple[tuple[str, ...], ...] = (
     ("distance_sum",),
     ("flights_climbed_sum",),
     ("active_time_minutes",),
-    ("active_energy_sum", "basal_energy_sum"),
+    ("active_energy_sum", "basal_energy_sum", "total_energy_sum"),
     ("hr_avg", "hr_max", "hr_min"),
 )
+# Fields that pick a group's source, when not just its first: a band that stores only its
+# total energy (Whoop, BMR included) still supplies the day's energy.
+ACTIVITY_GROUP_LEADS: dict[str, tuple[str, ...]] = {"active_energy_sum": ("active_energy_sum", "total_energy_sum")}
 ACTIVITY_SOURCE_FIELDS = ("activity_date", "provider", "source", "device_model", "device_type")
 
 
@@ -162,6 +165,13 @@ class SummariesService:
         self.archive_repo = DataPointSeriesArchiveRepository()
         self.health_score_repo = HealthScoreRepository(HealthScore)
 
+    @staticmethod
+    def _priority_orders(db_session: DbSession) -> tuple[dict[ProviderName, int], dict[DeviceType, int]]:
+        return (
+            ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session),
+            DeviceTypePriorityRepository().get_priority_order(db_session),
+        )
+
     def _filter_by_priority(
         self,
         db_session: DbSession,
@@ -181,8 +191,7 @@ class SummariesService:
         if not results:
             return results
 
-        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
-        device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
+        provider_order, device_type_order = self._priority_orders(db_session)
         sort_key = _priority_sort_key(provider_order, device_type_order)
 
         # Group results by date
@@ -217,8 +226,7 @@ class SummariesService:
         if not results:
             return results
 
-        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
-        device_type_order = DeviceTypePriorityRepository().get_priority_order(db_session)
+        provider_order, device_type_order = self._priority_orders(db_session)
         sort_key = _priority_sort_key(provider_order, device_type_order)
 
         by_date: dict[date, list[dict]] = defaultdict(list)
@@ -231,7 +239,8 @@ class SummariesService:
             holders: dict[str, dict] = {}
             for fields in ACTIVITY_METRIC_GROUPS:
                 lead = fields[0]
-                holder = next((e for e in ranked if e.get(lead) is not None), None)
+                leads = ACTIVITY_GROUP_LEADS.get(lead, (lead,))
+                holder = next((e for e in ranked if any(e.get(f) is not None for f in leads)), None)
                 if holder is None:
                     holder = next((e for e in ranked if any(e.get(f) is not None for f in fields)), None)
                 if holder is not None:
@@ -336,6 +345,7 @@ class SummariesService:
                 SeriesType.steps,
                 SeriesType.active_energy,
                 SeriesType.basal_energy,
+                SeriesType.total_energy,
                 SeriesType.heart_rate,
                 SeriesType.distance_walking_running,
                 SeriesType.flights_climbed,
@@ -379,11 +389,9 @@ class SummariesService:
         """Get daily sleep summaries aggregated by date, provider, and device."""
         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
 
-        # Get aggregated data from repository (now returns list of dicts)
-        results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
-
-        # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
+        results = self.event_record_repo.get_sleep_summaries(
+            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
+        )
 
         # Check if there's more data
         has_more = len(results) > limit
@@ -515,10 +523,8 @@ class SummariesService:
         resting_heart_rate, hrv_rmssd_milli, spo2_percentage.
         """
         results = self.health_score_repo.get_recovery_summaries(
-            db_session, user_id, start_date, end_date, cursor, limit
+            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
         )
-
-        results = self._filter_by_priority(db_session, user_id, results, date_key="recovery_date")
 
         has_more = len(results) > limit
         if has_more:
@@ -634,10 +640,11 @@ class SummariesService:
             db_session, user_id, page_start, page_end
         )
 
-        # Build lookup dict for workout data by (date, provider, device)
+        # Build lookup dict for workout data by (date, provider, source, device)
         workout_lookup: dict[tuple, dict] = {}
         for wa in workout_aggregates:
-            workout_lookup[_extras_key(wa, date_key="workout_date")] = wa
+            key = (wa["workout_date"], wa["provider"], wa["source"], wa.get("device_model"))
+            workout_lookup[key] = wa
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
@@ -675,7 +682,9 @@ class SummariesService:
             # Workouts follow the row's own source; the step-threshold minutes follow the
             # source that supplied the steps, and the HR-zone minutes the one that supplied
             # the heart rate, since each is derived from those samples.
-            workout_data = workout_lookup.get(_extras_key(result), {})
+            workout_data = workout_lookup.get(
+                (result["activity_date"], result.get("provider"), result["source"], result.get("device_model")), {}
+            )
             activity_data = activity_lookup.get(result.get("steps_source_key"), {})
             intensity_data = intensity_lookup.get(result.get("heart_rate_source_key"), {})
 
@@ -711,9 +720,9 @@ class SummariesService:
             # not additive - providers report daily totals that include workout calories
             active_cal = result.get("active_energy_sum")
             basal_cal = result.get("basal_energy_sum")
-            total_cal = None
-            if active_cal is not None or basal_cal is not None:
-                total_cal = (active_cal or 0.0) + (basal_cal or 0.0)
+            total_cal = result.get("total_energy_sum")
+            if total_cal is None and active_cal is not None and basal_cal is not None:
+                total_cal = active_cal + basal_cal
 
             # Active minutes: prefer the provider-reported daily active time (Garmin
             # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration).
@@ -736,7 +745,6 @@ class SummariesService:
                     vigorous=vigorous,
                 )
 
-            steps = result.get("steps_sum")
             summary = ActivitySummary(
                 date=result["activity_date"],
                 source=SourceMetadata(
@@ -745,7 +753,7 @@ class SummariesService:
                     device=result.get("device_model"),
                     device_type=result.get("device_type"),
                 ),
-                steps=steps if steps is not None else None,
+                steps=result.get("steps_sum"),
                 distance_meters=total_distance,
                 floors_climbed=floors_climbed,
                 elevation_meters=elevation_meters,
@@ -798,11 +806,42 @@ class SummariesService:
         """
         results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start, end)
         results = self._merge_archive_activity(db_session, user_id, start, end, results)
+        results = self._add_workout_only_days(db_session, user_id, start, end, results)
         merged_sample_sums = self.data_point_repo.get_daily_merged_sample_sums(
             db_session, user_id, start, end, tuple(MERGED_ACTIVITY_SAMPLE_FIELDS)
         )
         results = self._fill_from_same_provider(results, merged_sample_sums)
         return self._pick_activity_by_priority(db_session, results)
+
+    def _add_workout_only_days(
+        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, results: list
+    ) -> list:
+        """Add an empty row per source for dates that have workouts but no time-series data."""
+        covered = {r["activity_date"] for r in results}
+        extra = [
+            {
+                "activity_date": wa["workout_date"],
+                "provider": wa["provider"],
+                "source": wa["source"],
+                "device_model": wa["device_model"],
+                "device_type": wa["device_type"],
+                "steps_sum": None,
+                "active_energy_sum": None,
+                "basal_energy_sum": None,
+                "total_energy_sum": None,
+                "hr_avg": None,
+                "hr_max": None,
+                "hr_min": None,
+                "distance_sum": None,
+                "flights_climbed_sum": None,
+                "active_time_minutes": None,
+            }
+            for wa in self.event_record_repo.get_daily_workout_aggregates(db_session, user_id, start, end)
+            if wa["workout_date"] not in covered
+        ]
+        if not extra:
+            return results
+        return sorted([*results, *extra], key=lambda r: r["activity_date"])
 
     def _activity_page_days(
         self,

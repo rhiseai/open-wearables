@@ -1,5 +1,6 @@
 import json
 import time
+from collections import Counter
 from collections.abc import Generator
 from datetime import datetime
 from decimal import Decimal
@@ -8,8 +9,10 @@ from typing import Iterable, TypedDict
 from uuid import UUID, uuid4
 
 import sentry_sdk
+from celery import current_app as celery_app
 from pydantic import ValidationError
 
+from app.constants.celery_tasks import CeleryTask
 from app.constants.entry_source import get_unified_sdk_entry_source
 from app.constants.series_types.sdk import (
     WorkoutStatisticType,
@@ -20,7 +23,7 @@ from app.constants.series_types.sdk import (
 from app.constants.workout_types import get_unified_sdk_workout_type
 from app.database import DbSession
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import DeviceType, SeriesType, daily_total_flag
+from app.schemas.enums import DeviceType, EventCategory, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -50,7 +53,7 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
-from .device_resolution import extract_device_info, extract_device_type
+from .device_resolution import extract_device_ids, extract_device_info, extract_device_type
 from .menstrual_service import handle_menstrual_data
 from .sleep_service import SleepLockBusyError, handle_sleep_data
 
@@ -90,6 +93,7 @@ class LoadDataResult(TypedDict):
     sleep_saved: int
     sleep_deferred: int  # sleep segments left to process_sdk_sleep (lock busy)
     dropped: list[InvalidRecord]
+    unsupported_types: dict[str, int]  # record types with no series mapping, skipped
     validation_ms: float
 
 
@@ -170,6 +174,7 @@ class ImportService:
 
             device_model, software_version, original_source_name = extract_device_info(wjson.source)
             device_type = extract_device_type(wjson.source)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(wjson.source)
 
             metrics, time_series_samples, duration = self._extract_metrics_from_workout_stats(
                 wjson.values,
@@ -181,6 +186,9 @@ class ImportService:
                 provider,
                 original_source_name,
                 device_type,
+                device_id,
+                source_app_id,
+                device_manufacturer,
             )
 
             if duration is None:
@@ -190,7 +198,7 @@ class ImportService:
             type = get_unified_sdk_workout_type(workout_type).value if workout_type else None
 
             record = EventRecordCreate(
-                category="workout",
+                category=EventCategory.WORKOUT,
                 type=type,
                 source_name=original_source_name or "unknown",
                 device_model=device_model,
@@ -203,6 +211,9 @@ class ImportService:
                 source=original_source_name,
                 software_version=software_version,
                 device_type=device_type,
+                device_id=device_id,
+                source_app_id=source_app_id,
+                device_manufacturer=device_manufacturer,
                 provider=provider,
                 user_id=user_uuid,
             )
@@ -237,7 +248,7 @@ class ImportService:
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
 
             record = EventRecordCreate(
-                category="meal",
+                category=EventCategory.MEAL,
                 type=rjson.type,
                 source_name=original_source_name or "unknown",
                 device_model=device_model,
@@ -317,6 +328,7 @@ class ImportService:
 
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(rjson.source)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
 
             sample = TimeSeriesSampleCreate(
                 id=uuid4(),
@@ -326,6 +338,9 @@ class ImportService:
                 device_model=device_model,
                 software_version=software_version,
                 device_type=extract_device_type(rjson.source),
+                device_id=device_id,
+                source_app_id=source_app_id,
+                device_manufacturer=device_manufacturer,
                 provider=provider,
                 recorded_at=rjson.startDate,
                 zone_offset=rjson.zoneOffset,
@@ -363,6 +378,9 @@ class ImportService:
         provider: str,
         source_name: str | None,
         device_type: DeviceType | None = None,
+        device_id: str | None = None,
+        source_app_id: str | None = None,
+        device_manufacturer: str | None = None,
     ) -> tuple[EventRecordMetrics, list[TimeSeriesSampleCreate], int | float | None]:
         """
         Returns a tuple with the metrics, time series samples, and duration.
@@ -371,7 +389,6 @@ class ImportService:
             return EventRecordMetrics(), [], None
 
         stats_dict: dict[str, Decimal | int] = {}
-        stats_dict["energy_burned"] = Decimal("0")
         time_series_samples: list[TimeSeriesSampleCreate] = []
         duration: float | None = None
 
@@ -391,6 +408,9 @@ class ImportService:
                         device_model=device_model,
                         software_version=software_version,
                         device_type=device_type,
+                        device_id=device_id,
+                        source_app_id=source_app_id,
+                        device_manufacturer=device_manufacturer,
                         provider=provider,
                         recorded_at=end_date,
                         zone_offset=zone_offset,
@@ -411,7 +431,9 @@ class ImportService:
                     | WorkoutStatisticType.CALORIES
                     | WorkoutStatisticType.TOTAL_CALORIES
                 ):
-                    stats_dict["energy_burned"] += value
+                    # Summed across the energy statistics, and left unset when the payload reports none
+                    energy = stats_dict.get("energy_burned")
+                    stats_dict["energy_burned"] = value if energy is None else energy + value
                 case _:
                     detail_field = get_detail_field_from_workout_statistic_type(stat.type)
                     if detail_field:
@@ -424,16 +446,16 @@ class ImportService:
 
     def _defer_sleep(self, request: SDKSyncRequest, user_id: str, batch_id: str | None) -> None:
         """Hand the batch's sleep to process_sdk_sleep, which retries until the lock frees up."""
-        # import not at module level in order to avoid circular import
-        from app.integrations.celery.tasks.process_sdk_sleep_task import process_sdk_sleep
-
         sleep_only = request.model_copy(update={"data": SyncRequestData(sleep=request.data.sleep)})
         webhook_batch = current_sdk_webhook_batch()
-        process_sdk_sleep.delay(
-            sleep_only.model_dump_json(),
-            user_id,
-            batch_id or str(uuid4()),
-            webhook_batch.historical if webhook_batch is not None else False,
+        celery_app.send_task(
+            CeleryTask.PROCESS_SDK_SLEEP,
+            args=[
+                sleep_only.model_dump_json(),
+                user_id,
+                batch_id or str(uuid4()),
+                webhook_batch.historical if webhook_batch is not None else False,
+            ],
         )
         log_structured(
             self.log,
@@ -489,6 +511,12 @@ class ImportService:
             else:
                 records.append(rjson)
 
+        # Types this backend can't map (e.g. sent by a newer SDK) are skipped while
+        # building samples; count them so the summary log shows what was dropped.
+        unsupported_types = Counter(
+            rjson.type or "" for rjson in records if get_series_type_from_metric_type(rjson.type or "") is None
+        )
+
         # Process meals in batch
         meal_bundles = list(self._build_meal_bundles(correlation_records, nutrient_records, request.provider, user_id))
         if meal_bundles:
@@ -511,7 +539,9 @@ class ImportService:
 
             # Bulk create details (requires event_record to exist due to FK)
             if details_to_insert:
-                self.event_record_service.bulk_create_details(db_session, details_to_insert, detail_type="workout")
+                self.event_record_service.bulk_create_details(
+                    db_session, details_to_insert, detail_type=EventCategory.WORKOUT
+                )
             workouts_saved = len(inserted_ids)
 
             # Bulk create time series samples
@@ -559,6 +589,7 @@ class ImportService:
             "sleep_saved": sleep_saved,
             "sleep_deferred": sleep_deferred,
             "dropped": dropped,
+            "unsupported_types": dict(unsupported_types),
             "validation_ms": validation_ms,
         }
 
@@ -626,6 +657,7 @@ class ImportService:
                 records_updated=saved_counts["records_updated"],
                 workouts_saved=saved_counts["workouts_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
+                unsupported_types=saved_counts["unsupported_types"],
                 sleep_deferred=saved_counts["sleep_deferred"],
                 validation_ms=saved_counts["validation_ms"],
             )

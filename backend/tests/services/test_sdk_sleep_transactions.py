@@ -49,7 +49,7 @@ def _sample(
     }
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_sources_and_devices_have_separate_states_and_records(mock_finalize: MagicMock, db: Session) -> None:
     user = UserFactory()
     now = datetime.now(timezone.utc)
@@ -76,7 +76,7 @@ def test_sources_and_devices_have_separate_states_and_records(mock_finalize: Mag
     }
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_expired_lease_and_stale_redis_cannot_shrink_committed_sleep(mock_finalize: MagicMock, db: Session) -> None:
     user = UserFactory()
     user_id = str(user.id)
@@ -109,7 +109,7 @@ def test_expired_lease_and_stale_redis_cannot_shrink_committed_sleep(mock_finali
     assert watch.sleep_deep_minutes == 60
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_provider_score_failure_rolls_back_sleep_and_keeps_cache(mock_finalize: MagicMock, db: Session) -> None:
     user_id = str(UserFactory().id)
     now = datetime.now(timezone.utc)
@@ -153,7 +153,7 @@ def test_database_failure_never_publishes_state(failure_stage: str) -> None:
     redis_client.delete.assert_not_called()
 
 
-@patch("app.integrations.celery.tasks.process_sdk_sleep_task.process_sdk_sleep.delay")
+@patch("app.services.sdk.import_service.celery_app")
 def test_busy_lock_defers_the_batch_sleep_and_keeps_the_rest_of_the_batch(mock_defer: MagicMock, db: Session) -> None:
     user = UserFactory()
     now = datetime.now(timezone.utc)
@@ -187,14 +187,14 @@ def test_busy_lock_defers_the_batch_sleep_and_keeps_the_rest_of_the_batch(mock_d
     assert result.records_saved == 1
     assert result.sleep_saved == 0
     assert db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user.id).count() == 0
-    request_json, user_id, batch_id, historical = mock_defer.call_args.args
+    request_json, user_id, batch_id, historical = mock_defer.send_task.call_args.kwargs["args"]
     deferred = SyncRequest.model_validate_json(request_json)
     assert deferred.data.records == []
     assert deferred.data.sleep == _request(*payload["data"]["sleep"]).data.sleep
     assert (user_id, batch_id, historical) == (str(user.id), "busy-lock-batch", True)
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_legacy_state_keeps_original_identity_while_new_provider_is_separate(
     mock_finalize: MagicMock, db: Session
 ) -> None:
@@ -246,7 +246,7 @@ def test_importer_rolls_back_and_reports_original_database_error() -> None:
     db.rollback.assert_called_once()
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_enclosing_sample_expands_both_cached_boundaries(mock_finalize: MagicMock, db: Session) -> None:
     user_id = str(UserFactory().id)
     now = datetime.now(timezone.utc)
@@ -259,7 +259,7 @@ def test_enclosing_sample_expands_both_cached_boundaries(mock_finalize: MagicMoc
     assert state.end_time == now
 
 
-@patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay")
+@patch("app.services.sdk.sleep_service.celery_app")
 def test_owner_lock_precedes_reads_and_commit_precedes_cache_publication(mock_finalize: MagicMock) -> None:
     events = []
     db = MagicMock()

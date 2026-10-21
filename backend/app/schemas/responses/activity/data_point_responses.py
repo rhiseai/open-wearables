@@ -33,6 +33,7 @@ class ActivityAggregateResult(TypedDict):
     steps_sum: int | None
     active_energy_sum: float | None
     basal_energy_sum: float | None
+    total_energy_sum: float | None
     hr_avg: int | None
     hr_max: int | None
     hr_min: int | None

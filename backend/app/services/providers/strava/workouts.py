@@ -7,7 +7,7 @@ from app.config import settings
 from app.constants.entry_source import get_unified_strava_entry_source
 from app.constants.workout_types import get_unified_strava_workout_type
 from app.database import DbSession
-from app.schemas.enums import SeriesType, WorkoutType
+from app.schemas.enums import EventCategory, SeriesType, WorkoutType
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -223,10 +223,10 @@ class StravaWorkouts(BaseWorkoutsTemplate):
         metrics = self._build_metrics(raw_workout)
 
         source_name = raw_workout.device_name or "Strava"
-        device_model = raw_workout.device_name or ""
+        device_model = raw_workout.device_name or None
 
         record = EventRecordCreate(
-            category="workout",
+            category=EventCategory.WORKOUT,
             type=workout_type.value,
             source_name=source_name,
             device_model=device_model,
@@ -325,7 +325,7 @@ class StravaWorkouts(BaseWorkoutsTemplate):
                 activity.id,
                 record.start_datetime,
                 record.zone_offset,
-                activity.device_name or "",
+                activity.device_name or None,
             )
         except Exception as exc:
             log_and_capture_error(
