@@ -271,6 +271,7 @@ class TestGetValidTokenLocking:
             db,
             expiring_connection.user_id,
             "stored_refresh_token",
+            revoke_on_failure=True,
         )
         lock.release.assert_called_once()
 

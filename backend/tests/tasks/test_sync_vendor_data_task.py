@@ -15,6 +15,7 @@ from app.integrations.celery.tasks.sync_vendor_data_task import sync_vendor_data
 from app.models import UserConnection
 from app.schemas.auth import ConnectionStatus
 from app.schemas.sync_status import SyncStatus
+from app.services.providers.sync_247_result import Sync247Result, Sync247TaskOutcome
 from app.services.sync_coordination import try_become_primary
 from app.utils.sync_params import build_sync_params
 from tests.factories import UserConnectionFactory, UserFactory
@@ -248,7 +249,66 @@ class TestSyncVendorDataTask:
         assert str(result["user_id"]) == str(user.id)
         assert "garmin" in result["providers_synced"]
         assert result["providers_synced"]["garmin"]["params"]["workouts"]["success"] is False
-        assert "Provider API unavailable" in result["providers_synced"]["garmin"]["params"]["workouts"]["error"]
+        # The error's type only: its text could carry the rows a write failed on.
+        assert result["providers_synced"]["garmin"]["params"]["workouts"]["error_code"] == "Exception"
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.try_record_data_types")
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_a_run_where_everything_failed_still_records_its_data_types(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        mock_record: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy.workouts.load_data.side_effect = Exception("Provider API unavailable")
+        mock_strategy.data_247 = None
+        mock_get_provider.return_value = mock_strategy
+
+        sync_vendor_data(str(user.id))
+
+        outcomes = mock_record.call_args.args[1]
+        assert [(o.data_type, o.status) for o in outcomes] == [("workouts", SyncStatus.FAILED)]
+
+    @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
+    @patch("app.services.providers.factory.ProviderFactory.get_provider")
+    def test_records_data_types_before_the_runs_terminal_event(
+        self,
+        mock_get_provider: MagicMock,
+        mock_session_local: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        """A consumer acting on sync.completed reads the per-type outcomes from the history."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", status=ConnectionStatus.ACTIVE)
+        mock_session_local.return_value.__enter__.return_value = db
+        mock_session_local.return_value.__exit__.return_value = None
+        mock_strategy = MagicMock()
+        mock_strategy.capabilities.rest_pull = True
+        mock_strategy.capabilities.webhook_stream = False
+        mock_strategy.workouts.load_data.return_value = 3
+        mock_strategy.data_247 = None
+        mock_get_provider.return_value = mock_strategy
+        calls = MagicMock()
+        task = "app.integrations.celery.tasks.sync_vendor_data_task"
+
+        with (
+            patch(f"{task}.try_record_data_types", calls.record),
+            patch(f"{task}.emit_sync_completed", calls.completed),
+        ):
+            sync_vendor_data(str(user.id))
+
+        assert [name for name, *_ in calls.mock_calls] == ["record", "completed"]
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
@@ -469,11 +529,12 @@ class TestSyncVendorDataConnectionDeletedMidSync:
         return strategy
 
     @staticmethod
-    def _deleting_load_and_save_all(db: Session, connection: UserConnection) -> Callable[..., dict[str, int]]:
-        def load_and_save_all(*args: object, **kwargs: object) -> dict[str, int]:
+    def _deleting_load_and_save_all(db: Session, connection: UserConnection) -> Callable[..., Sync247Result]:
+        def load_and_save_all(*args: object, **kwargs: object) -> Sync247Result:
             _delete_mid_sync(db, connection)
-            # What Oura returns when every data type failed and was rolled back.
-            return {"activity": 0, "sleep": 0}
+            # What Oura returns when every data type failed (401 for a deleted user) and was rolled back.
+            failed = Sync247TaskOutcome(error_codes=("http_401",))
+            return Sync247Result(provider="oura", outcomes={"activity": failed, "sleep": failed})
 
         return load_and_save_all
 
@@ -509,14 +570,15 @@ class TestSyncVendorDataConnectionDeletedMidSync:
         with patch(f"{_TASK}.emit_sync_failed") as emit_failed:
             result = sync_vendor_data(user_id)
 
-        assert result["errors"] == {"oura": "Provider API unavailable"}
+        # Errors are reported by type: their text can carry provider or database values.
+        assert result["errors"] == {"oura": "RuntimeError"}
         emit_failed.assert_called_once()
-        assert emit_failed.call_args.kwargs["error"] == "Provider API unavailable"
+        assert emit_failed.call_args.kwargs["error"] == "RuntimeError"
         assert self._pull_lock_is_free()
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
     @patch("app.services.providers.factory.ProviderFactory.get_provider")
-    def test_historical_run_completes_and_releases_the_lock(
+    def test_historical_run_reports_its_outcome_and_releases_the_lock(
         self,
         mock_get_provider: MagicMock,
         mock_session_local: MagicMock,
@@ -535,14 +597,15 @@ class TestSyncVendorDataConnectionDeletedMidSync:
         # Historical runs are also stored through run tracking's own session, which is not under test.
         with (
             patch(f"{_TASK}.emit_sync_started"),
-            patch(f"{_TASK}.emit_sync_completed") as emit_completed,
+            patch(f"{_TASK}.emit_sync_failed") as emit_failed,
             patch(f"{_TASK}.try_record_data_types"),
         ):
             result = sync_vendor_data(user_id, is_historical=True)
 
+        # Every data type failed, so the run is a failure rather than an empty success.
         assert result["errors"] == {}
-        emit_completed.assert_called_once()
-        assert emit_completed.call_args.kwargs["status"] == SyncStatus.SKIPPED
+        emit_failed.assert_called_once()
+        assert emit_failed.call_args.kwargs["error"] == "All sync sub-tasks failed"
         assert self._pull_lock_is_free()
 
     @patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal")
@@ -567,7 +630,7 @@ class TestSyncVendorDataConnectionDeletedMidSync:
 
         # Saving the live cursor on the missing row fails, and the run reports that error.
         assert list(result["errors"]) == ["oura"]
-        assert "has been deleted" in result["errors"]["oura"]
+        assert result["errors"]["oura"] == "ObjectDeletedError"
         emit_failed.assert_called_once()
         assert emit_failed.call_args.kwargs["error"] == result["errors"]["oura"]
         assert self._pull_lock_is_free()

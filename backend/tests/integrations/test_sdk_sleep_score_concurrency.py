@@ -209,7 +209,7 @@ def actual_tasks(
             # Real Redis records sync outcomes; only the external delivery leaf is
             # replaced, so daemon webhook dispatch cannot outlive the test patches.
             patch("app.services.sync_status_service._maybe_dispatch_outgoing_webhook"),
-            patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps.delay"),
+            patch("app.services.sdk.sleep_service.celery_app"),
         ):
             yield
     finally:
@@ -490,8 +490,8 @@ def test_sleep_sql_failure_preserves_earlier_commit_and_truthful_replay(
                 assert connection.last_synced_at is None
             assert load_source_sleep_states(str(scenario.user_id)) == {}
             assert not any(
-                call.args[0] in {"sleep.created", "sleep.updated", "heart_rate.created"}
-                for call in mock_webhook_dispatch.delay.call_args_list
+                call.kwargs["args"][0] in {"sleep.created", "sleep.updated", "heart_rate.created"}
+                for call in mock_webhook_dispatch.send_task.call_args_list
             )
     finally:
         event.remove(engine, "after_cursor_execute", fail_score_write)
@@ -500,4 +500,4 @@ def test_sleep_sql_failure_preserves_earlier_commit_and_truthful_replay(
     assert len(faults) == len(expected)
     _assert_complete(session_factory, scenario)
     _assert_outcomes(scenario, batch_id, [*expected, SyncStatus.SUCCESS])
-    assert any(call.args[0] == "sleep.updated" for call in mock_webhook_dispatch.delay.call_args_list)
+    assert any(call.kwargs["args"][0] == "sleep.updated" for call in mock_webhook_dispatch.send_task.call_args_list)

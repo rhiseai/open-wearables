@@ -14,8 +14,11 @@ from app.repositories.data_point_series_repository import WriteCounts
 from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums.series_types import SeriesType
+from app.schemas.sync_status import SyncScope, SyncSource
 from app.services.providers.garmin.data_247 import Garmin247Data
+from app.services.providers.garmin.handlers.wellness import process_wellness_items
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.utils.context import sync_run_var
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -445,9 +448,8 @@ class TestGarmin247Data:
 
         results = garmin_247.load_and_save_all(db, user.id)
 
-        assert results["sync_complete"] is True
-        assert results["total_saved"] == 0
-        assert "webhooks" in results["message"].lower()
+        assert results.rows_written == 0
+        assert not results.outcomes  # nothing attempted — data arrives by push
 
     def test_load_and_save_all_with_dates_is_noop(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test load_and_save_all with custom dates is still a no-op."""
@@ -458,8 +460,8 @@ class TestGarmin247Data:
 
         results = garmin_247.load_and_save_all(db, user.id, start_time=start, end_time=end)
 
-        assert results["sync_complete"] is True
-        assert results["total_saved"] == 0
+        assert results.rows_written == 0
+        assert not results.outcomes
 
     def test_load_and_save_all_string_dates_is_noop(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test load_and_save_all with ISO string dates is still a no-op."""
@@ -472,7 +474,8 @@ class TestGarmin247Data:
             end_time="2024-01-07T00:00:00Z",
         )
 
-        assert results["sync_complete"] is True
+        assert results.rows_written == 0
+        assert not results.all_failed
 
     # -------------------------------------------------------------------------
     # HRV Data Tests
@@ -548,8 +551,8 @@ class TestGarmin247Data:
         normalized, _ = garmin_247.normalize_dailies(sample_daily, user_id)
         samples = garmin_247._build_dailies_samples(user_id, normalized)
 
-        # 5 metrics (steps, calories, resting_hr, floors, distance) + 3 HR samples
-        assert len(samples) == 8
+        # 6 metrics (steps, active/basal calories, resting_hr, floors, distance) + 3 HR samples
+        assert len(samples) == 9
         assert len({s.series_type for s in samples}) > 1
 
     def test_build_dailies_samples_exercise_time(self, garmin_247: Garmin247Data) -> None:
@@ -936,3 +939,22 @@ class TestGarmin247Data:
 
         mock_bulk_create.assert_called_once()
         assert count == 1
+
+
+class TestWellnessPushRun:
+    def test_push_is_written_under_the_run_it_reports(self) -> None:
+        connection = MagicMock(user_id=uuid4())
+        connection_repo = MagicMock()
+        connection_repo.get_all_by_provider_user_id.return_value = [connection]
+        written_under = []
+        garmin_247 = MagicMock()
+        garmin_247.process_items_batch.side_effect = lambda *_args: written_under.append(sync_run_var.get()) or 1
+
+        with patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed") as completed:
+            process_wellness_items(
+                MagicMock(), connection_repo, garmin_247, "dailies", [{"userId": "g1"}], [], set(), "trace"
+            )
+
+        assert written_under[0].run_id == completed.call_args.kwargs["run_id"]
+        assert (written_under[0].source, written_under[0].scope) == (SyncSource.WEBHOOK, SyncScope.LIVE)
+        assert sync_run_var.get() is None

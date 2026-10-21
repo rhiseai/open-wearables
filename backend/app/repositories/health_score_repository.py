@@ -1,14 +1,16 @@
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any
+from typing import cast as typing_cast
 from uuid import UUID
 
-from sqlalchemy import Date, and_, asc, desc
+from sqlalchemy import Date, and_, asc, cast, desc, func, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
 from app.models import DataSource, HealthScore
-from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.repositories.data_point_series_repository import WriteCounts
+from app.repositories.repositories import CrudRepository, source_priority_order
+from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
@@ -47,16 +49,22 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         results = query.order_by(desc(HealthScore.recorded_at)).offset(params.offset).limit(params.limit).all()
         return results, total_count
 
-    def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
-        """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
+    def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> WriteCounts:
+        """Bulk insert health scores, doing nothing on conflict with the unique constraint.
+
+        Returns the rows actually written. DO NOTHING never refreshes an existing
+        row, so the count is all inserts — RETURNING yields a row only for the
+        ones that were not conflicts.
+        """
         if not creators:
-            return
+            return WriteCounts(0, 0)
 
         values = [c.model_dump() for c in creators]
 
-        stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
-        db_session.execute(stmt)
+        stmt = insert(HealthScore).values(values).on_conflict_do_nothing().returning(HealthScore.id)
+        inserted = len(db_session.execute(stmt).scalars().all())
         # Caller is responsible for commit — allows batching with other operations
+        return WriteCounts(inserted, 0)
 
     def get_latest_by_category(
         self,
@@ -107,48 +115,65 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider_order: dict[ProviderName, int],
+        device_type_order: dict[DeviceType, int],
     ) -> list[dict[str, Any]]:
         """Get recovery health scores for a date range with cursor-based pagination.
+
+        Per date only the highest-priority source's earliest score is kept, picked before pagination
+        so a page holds `limit` dates however many sources scored each day.
 
         Returns list of dicts with keys: recovery_date, provider, source, device_model,
         device_type, record_id, recorded_at, recovery_score, resting_heart_rate,
         hrv_rmssd_milli, spo2_percentage.
-        Pages whole days, as get_sleep_summaries does: every score of up to limit + 1
-        days past the cursor, so a caller that keeps one source per day can detect
-        has_more without a separate COUNT query and no day is split across pages.
+        Fetches limit+1 rows so callers can detect has_more without a separate COUNT query.
         Ordering matches get_sleep_summaries: ASC by default, DESC when paginating backward.
         """
-        recovery_date = HealthScore.recorded_at.cast(Date)
-        in_range = (
-            HealthScore.user_id == user_id,
-            HealthScore.category == HealthScoreCategory.RECOVERY,
-            HealthScore.recorded_at >= start_date,
-            HealthScore.recorded_at < end_date,
+        # Provider scores have no data_source, so the provider rank comes from the score itself
+        ranked = (
+            select(
+                HealthScore.id,
+                func.row_number()
+                .over(
+                    partition_by=cast(HealthScore.recorded_at, Date),
+                    order_by=(
+                        *source_priority_order(provider_order, device_type_order, HealthScore.provider),
+                        HealthScore.recorded_at,
+                        HealthScore.id,
+                    ),
+                )
+                .label("source_rank"),
+            )
+            .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
+            .where(
+                HealthScore.user_id == user_id,
+                HealthScore.category == HealthScoreCategory.RECOVERY,
+                HealthScore.recorded_at >= start_date,
+                HealthScore.recorded_at < end_date,
+            )
+            .subquery()
         )
-
-        # The page's days. The cursor names the day the last page ended on.
-        dates_query = db_session.query(recovery_date).filter(*in_range).group_by(recovery_date)
-        order = asc
-        if cursor:
-            cursor_ts, _, direction = decode_cursor(cursor)
-            cursor_date = cursor_ts.date()
-            if direction == "prev":
-                order = desc
-                dates_query = dates_query.filter(recovery_date < cursor_date)
-            else:
-                dates_query = dates_query.filter(recovery_date > cursor_date)
-        page_dates = [row[0] for row in dates_query.order_by(order(recovery_date)).limit(limit + 1)]
-        if not page_dates:
-            return []
-
         # Outer join so scores without a data_source (older rows) still come back.
-        rows = (
+        query = (
             db_session.query(HealthScore, DataSource)
             .outerjoin(DataSource, HealthScore.data_source_id == DataSource.id)
-            .filter(*in_range, recovery_date.in_(page_dates))
-            .order_by(order(HealthScore.recorded_at), order(HealthScore.id))
-            .all()
+            .filter(HealthScore.id.in_(select(ranked.c.id).where(ranked.c.source_rank == 1)))
         )
+
+        if cursor:
+            cursor_ts, cursor_id, direction = decode_cursor(cursor)
+            if direction == "prev":
+                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) < (cursor_ts, cursor_id)).order_by(
+                    desc(HealthScore.recorded_at), desc(HealthScore.id)
+                )
+            else:
+                query = query.filter(tuple_(HealthScore.recorded_at, HealthScore.id) > (cursor_ts, cursor_id)).order_by(
+                    asc(HealthScore.recorded_at), asc(HealthScore.id)
+                )
+        else:
+            query = query.order_by(asc(HealthScore.recorded_at), asc(HealthScore.id))
+
+        rows = query.limit(limit + 1).all()
 
         return [
             {
@@ -160,9 +185,11 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
                 "record_id": row.id,
                 "recorded_at": row.recorded_at,
                 "recovery_score": int(row.value) if row.value is not None else None,
-                "resting_heart_rate": cast(dict, row.components or {}).get("resting_heart_rate", {}).get("value"),
-                "hrv_rmssd_milli": cast(dict, row.components or {}).get("hrv_rmssd_milli", {}).get("value"),
-                "spo2_percentage": cast(dict, row.components or {}).get("spo2_percentage", {}).get("value"),
+                "resting_heart_rate": typing_cast(dict, row.components or {})
+                .get("resting_heart_rate", {})
+                .get("value"),
+                "hrv_rmssd_milli": typing_cast(dict, row.components or {}).get("hrv_rmssd_milli", {}).get("value"),
+                "spo2_percentage": typing_cast(dict, row.components or {}).get("spo2_percentage", {}).get("value"),
             }
             for row, data_source in rows
         ]

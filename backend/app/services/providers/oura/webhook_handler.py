@@ -47,6 +47,7 @@ from fastapi import HTTPException, Request
 from pydantic import ValidationError
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.database import DbSession
 from app.models.user_connection import UserConnection
 from app.repositories import UserConnectionRepository
@@ -59,12 +60,9 @@ from app.utils.structured_logging import LogContext, log_structured
 
 logger = logging.getLogger(__name__)
 
-_PROCESS_PUSH_TASK = "app.integrations.celery.tasks.webhook_push_task.process_webhook_push"
-
 # Upstream statuses that condemn one profile's token rather than the object
 # itself, so the fetch is worth retrying with another linked profile's token.
 _TOKEN_FAILURE_STATUSES = frozenset({401, 403})
-
 SUPPORTED_DATA_TYPES = [
     "workout",
     "sleep",
@@ -160,7 +158,9 @@ class OuraWebhookHandler(BaseWebhookHandler):
 
         store_raw_payload(source="webhook", provider="oura", payload=payload, trace_id=request_trace_id)
 
-        task = celery_app.send_task(_PROCESS_PUSH_TASK, args=["oura", payload, request_trace_id], queue="webhook_sync")
+        task = celery_app.send_task(
+            CeleryTask.PROCESS_WEBHOOK_PUSH, args=["oura", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
+        )
         log_structured(
             logger,
             "info",

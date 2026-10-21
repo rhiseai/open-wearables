@@ -43,7 +43,7 @@ PRIORITY_EVENTS = {
     "body_composition.created",
 }
 
-_EMIT_TASK = "app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event"
+_EMIT_TASK = "app.services.outgoing_webhooks.events.celery_app"
 _SUBSCRIBED = "app.services.outgoing_webhooks.svix.subscribed_event_types"
 
 
@@ -132,7 +132,7 @@ class TestRouting:
                 zone_offset=None,
                 duration_seconds=28800,
             )
-        kwargs = task.delay.call_args.kwargs
+        kwargs = task.send_task.call_args.kwargs["kwargs"]
         assert kwargs["idempotency_key"].startswith(f"sleep.created.{record_id}.")
         assert kwargs["channels"] == [f"user.{user_id}"]
 
@@ -215,7 +215,7 @@ class TestTimeseriesGating:
             on_timeseries_batch_saved(
                 user_id=uuid4(), provider="apple", series_type="heart_rate", sample_count=1, samples=[]
             )
-        task.delay.assert_not_called()
+        task.send_task.assert_not_called()
 
     def test_body_composition_is_enqueued_even_when_timeseries_are_off(self) -> None:
         with (
@@ -224,7 +224,7 @@ class TestTimeseriesGating:
             patch(_EMIT_TASK) as task,
         ):
             on_timeseries_batch_saved(user_id=uuid4(), provider="apple", series_type="weight", sample_count=1)
-        assert task.delay.call_args.args[0] == "body_composition.created"
+        assert task.send_task.call_args.kwargs["args"][0] == "body_composition.created"
 
     def test_unsubscribed_timeseries_takes_no_sdk_batch_slot(self) -> None:
         with (
@@ -248,7 +248,7 @@ class TestTimeseriesGating:
                     duration_seconds=28800,
                 )
             summary = batch.flush()
-        assert [c.args[0] for c in task.delay.call_args_list] == ["sleep.created"]
+        assert [c.kwargs["args"][0] for c in task.send_task.call_args_list] == ["sleep.created"]
         assert summary["suppressed"] == 0
 
 
