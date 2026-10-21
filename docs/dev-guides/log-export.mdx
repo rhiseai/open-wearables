@@ -153,6 +153,10 @@ Refresh exchanges emit `accepted` with `refresh_rotated` after generating the re
 
 These events do not include tokens, identifiers, request headers, payloads, exception text, or contextual trace IDs. The same restricted attributes are passed to OTLP export. Expected rejections use warning level so they do not add another error-level record alongside the existing HTTP request log. With `LOG_LEVEL=error`, these decision events are filtered out.
 
+The HTTP access log carries the bounded `auth_reason` for a rejected SDK Bearer token or missing credentials. A 401 with `sdk_token_expired` is logged as `warning`: it asks the SDK to refresh its access token. Invalid credentials, rejected API-key fallback, refresh endpoint failures and all 5xx responses remain `error`. The HTTP status, response body and authentication behavior are unchanged. Errors-only access logging still records the expiry challenge; the configured `LOG_LEVEL` can filter warnings out.
+
+Severity is chosen from the authentication failure type in the backend, so error alarms can count `error` and `critical` records directly. Deploy this backend classification before removing a temporary downstream SDK-401 exclusion. An expiry warning does not prove that the client subsequently refreshed or retried successfully.
+
 To inspect aggregate outcomes in CloudWatch Logs Insights, select the backend log group and a bounded time range, then run:
 
 ```sql
