@@ -54,6 +54,13 @@ _STAGE_TO_METRIC: dict[str, str] = {
 
 SLEEP_SCORE_VALUE_TYPE = "sleepScore"
 
+# How long an upload waits for another worker to finish this user's sleep.
+SLEEP_LOCK_WAIT_SECONDS = 15
+
+
+class SleepLockBusyError(RuntimeError):
+    """Another worker held this user's sleep lock for the whole wait; nothing was written."""
+
 
 def _extract_sleep_score(values: list[dict[str, Any]] | None) -> float | None:
     """Return the provider sleep score carried in an SDK sleep entry's `values`, if any."""
@@ -327,10 +334,10 @@ def handle_sleep_data(
         - Dispatch the stale-sleep housekeeping task
     """
     redis_client = get_redis_client()
-    lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=15)
+    lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=SLEEP_LOCK_WAIT_SECONDS)
     acquired = lock.acquire()
     if not acquired:
-        raise RuntimeError(f"Could not acquire sleep processing lock for user {user_id}")
+        raise SleepLockBusyError(f"Could not acquire sleep processing lock for user {user_id}")
 
     try:
         event_record_service.lock_sleep_user(db_session, UUID(user_id))

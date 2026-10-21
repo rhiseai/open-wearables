@@ -13,6 +13,7 @@ from app.integrations.celery.tasks.finalize_stale_sleep_task import finalize_sta
 from app.integrations.redis_client import get_redis_client
 from app.models import DataSource, EventRecord
 from app.schemas.providers.mobile_sdk import SyncRequest
+from app.services.outgoing_webhooks.batching import collect_sdk_webhooks
 from app.services.sdk.import_service import import_service
 from app.services.sdk.sleep_service import (
     active_users_key,
@@ -152,27 +153,45 @@ def test_database_failure_never_publishes_state(failure_stage: str) -> None:
     redis_client.delete.assert_not_called()
 
 
-def test_lock_miss_is_an_import_failure_and_captures_original_error() -> None:
-    db = MagicMock()
-    redis_client = MagicMock()
-    redis_client.lock.return_value.acquire.return_value = False
+@patch("app.services.sdk.import_service.celery_app")
+def test_busy_lock_defers_the_batch_sleep_and_keeps_the_rest_of_the_batch(mock_defer: MagicMock, db: Session) -> None:
+    user = UserFactory()
     now = datetime.now(timezone.utc)
-    request = _request(_sample(now - timedelta(hours=1), now))
-    with (
-        patch("app.services.sdk.sleep_service.get_redis_client", return_value=redis_client),
-        patch("app.services.sdk.import_service.log_and_capture_error") as capture,
-    ):
-        result = import_service.import_data_from_request(
-            db, request.model_dump_json(), "application/json", str(uuid4()), batch_id="failed-lock-batch"
-        )
-    assert result.status_code == 400
+    payload = _request(_sample(now - timedelta(hours=1), now)).model_dump(mode="json")
+    payload["data"]["records"] = [
+        {
+            "id": "busy-lock-heart-rate",
+            "type": "HKQuantityTypeIdentifierHeartRate",
+            "value": 60,
+            "unit": "count/min",
+            "startDate": now.isoformat(),
+            "endDate": now.isoformat(),
+            "source": {"name": "Watch", "device_model": "Watch7,1"},
+        }
+    ]
+    # Another worker is processing this user's sleep for the whole wait.
+    holder = get_redis_client().lock(f"sleep:lock:{user.id}", timeout=30)
+    assert holder.acquire(blocking=False)
+    try:
+        with (
+            patch("app.services.sdk.sleep_service.SLEEP_LOCK_WAIT_SECONDS", 0.1),
+            collect_sdk_webhooks("busy-lock-batch", historical=True),
+        ):
+            result = import_service.import_data_from_request(
+                db, json.dumps(payload), "application/json", str(user.id), batch_id="busy-lock-batch"
+            )
+    finally:
+        holder.release()
+
+    assert result.status_code == 200
+    assert result.records_saved == 1
     assert result.sleep_saved == 0
-    assert "Could not acquire sleep processing lock" in result.response
-    failure = capture.call_args[0][0]
-    assert isinstance(failure, RuntimeError)
-    db.rollback.assert_called()
-    redis_client.set.assert_not_called()
-    redis_client.lock.return_value.release.assert_not_called()
+    assert db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user.id).count() == 0
+    request_json, user_id, batch_id, historical = mock_defer.send_task.call_args.kwargs["args"]
+    deferred = SyncRequest.model_validate_json(request_json)
+    assert deferred.data.records == []
+    assert deferred.data.sleep == _request(*payload["data"]["sleep"]).data.sleep
+    assert (user_id, batch_id, historical) == (str(user.id), "busy-lock-batch", True)
 
 
 @patch("app.services.sdk.sleep_service.celery_app")
