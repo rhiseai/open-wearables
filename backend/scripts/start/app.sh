@@ -92,12 +92,11 @@ echo 'Running device type backfill...'
 uv run python scripts/data_migrations/backfill_device_types.py \
     || echo "Warning: device type backfill failed — will retry on next startup."
 
-# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
-# Merges data sources split by placeholder models / platform names / Polar's missing source,
-# then drops events duplicated across a user's sources. Idempotent, no-op once merged.
-echo 'Running data source merge...'
-uv run python scripts/data_migrations/merge_duplicate_data_sources.py \
-    || echo "Warning: data source merge failed — will retry on next startup."
+# Not run at startup (RHISE-6077). Its phase 2 deletes events that share a window across one
+# user's sources, and in our data those are one workout or night written to HealthKit by
+# several apps (WHOOP, Oura, Strava, Garmin Connect, Apple Watch) with different values; the
+# copy it keeps is effectively arbitrary. Run it by hand once that decision is made:
+#   uv run python scripts/data_migrations/merge_duplicate_data_sources.py --dry-run
 
 # TODO: Remove this after ~2027-03-01 once all deployments have migrated.
 # Clears the 0 kcal the SDK and Apple XML importers stored for workouts that reported no
