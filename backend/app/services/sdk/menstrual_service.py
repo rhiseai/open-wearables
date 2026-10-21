@@ -24,7 +24,7 @@ from app.constants.series_types.sdk.category_types import (
 from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, EventRecord
-from app.schemas.enums import SeriesType, get_series_type_id
+from app.schemas.enums import EventCategory, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import EventRecordCreate, MenstrualCycleDetailCreate
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.event_record_service import event_record_service
@@ -164,7 +164,7 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
             has_specified_cycle_length=cycle_length is not None,
             last_updated_at=now,
         )
-        event_record_service.bulk_create_details(db_session, [detail], detail_type="menstrual_cycle")
+        event_record_service.bulk_create_details(db_session, [detail], detail_type=EventCategory.MENSTRUAL_CYCLE)
         upserted += 1
 
     orphans_deleted = _delete_orphan_periods(

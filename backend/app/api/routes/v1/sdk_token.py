@@ -5,8 +5,8 @@ from fastapi import APIRouter, Body, HTTPException, status
 
 from app.config import settings
 from app.database import DbSession
-from app.schemas.auth import SDKTokenRequest, TokenResponse
-from app.services import application_service, create_sdk_user_token, refresh_token_service, user_service
+from app.schemas.auth import SDKTokenOrigin, SDKTokenRequest, TokenResponse
+from app.services import application_service, refresh_token_service, user_service
 from app.utils.auth import DeveloperOptionalDep
 
 router = APIRouter()
@@ -45,17 +45,17 @@ def create_user_token(
         400: If neither app credentials nor admin auth is provided
         404: If the user does not exist
     """
-    app_id: str
-
+    application = None
+    issued_by_developer_id = None
     # Method 1: App credentials provided
     if payload and payload.app_id and payload.app_secret:
         application = application_service.validate_credentials(db, payload.app_id, payload.app_secret)
-        app_id = application.app_id
+        origin = SDKTokenOrigin.APPLICATION
     # Method 2: Admin authentication (developer token)
     elif developer:
-        # Use developer ID as app_id for admin-generated tokens (enables audit trail)
-        # Format: "admin:{developer_id}" to distinguish from app-generated tokens
-        app_id = f"admin:{developer.id}"
+        # The issuing developer is recorded for the audit trail
+        origin = SDKTokenOrigin.ADMIN
+        issued_by_developer_id = developer.id
     else:
         # Neither method provided
         raise HTTPException(
@@ -69,13 +69,9 @@ def create_user_token(
     # outage, instead of the 404 that tells them to (re-)register the user.
     user_service.get(db, user_id, raise_404=True)
 
-    # Generate user-scoped SDK token
-    access_token = create_sdk_user_token(
-        app_id=app_id,
-        user_id=str(user_id),
+    access_token, refresh_token = refresh_token_service.issue_sdk_tokens(
+        db, user_id, origin, application=application, issued_by_developer_id=issued_by_developer_id
     )
-
-    refresh_token = refresh_token_service.create_sdk_refresh_token(db, user_id, app_id)
 
     return TokenResponse(
         access_token=access_token,

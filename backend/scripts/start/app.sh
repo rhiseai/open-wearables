@@ -77,6 +77,13 @@ echo 'Running Whoop cycle day re-key...'
 uv run python scripts/data_migrations/rekey_whoop_cycle_days.py \
     || echo "Warning: Whoop cycle re-key failed — will retry on next startup."
 
+# TODO: Remove this after ~2027-01-01 once all deployments have migrated.
+# Relabels Whoop cycle energy stored as active_energy to total_energy: it includes BMR.
+# Drops 0 kJ no-wear rows. Runs once per instance (data_migration).
+echo 'Running Whoop active_energy->total_energy relabel...'
+uv run python scripts/data_migrations/relabel_whoop_active_energy_to_total_energy.py \
+    || echo "Warning: Whoop energy relabel failed — will retry on next startup."
+
 # TODO: Remove this after ~2026-12-01 once all deployments have migrated.
 # Re-resolves data_source.device_type with the new mappings: cloud-provider rows are
 # recomputed, SDK-provider rows only upgrade NULL/'other'. Idempotent; live sync applies
@@ -84,6 +91,19 @@ uv run python scripts/data_migrations/rekey_whoop_cycle_days.py \
 echo 'Running device type backfill...'
 uv run python scripts/data_migrations/backfill_device_types.py \
     || echo "Warning: device type backfill failed — will retry on next startup."
+
+# Not run at startup (RHISE-6077). Its phase 2 deletes events that share a window across one
+# user's sources, and in our data those are one workout or night written to HealthKit by
+# several apps (WHOOP, Oura, Strava, Garmin Connect, Apple Watch) with different values; the
+# copy it keeps is effectively arbitrary. Run it by hand once that decision is made:
+#   uv run python scripts/data_migrations/merge_duplicate_data_sources.py --dry-run
+
+# TODO: Remove this after ~2027-03-01 once all deployments have migrated.
+# Clears the 0 kcal the SDK and Apple XML importers stored for workouts that reported no
+# calories. Runs once per instance (data_migration).
+echo 'Running SDK workout calories cleanup...'
+uv run python scripts/data_migrations/clear_sdk_zero_workout_calories.py \
+    || echo "Warning: SDK workout calories cleanup failed — will retry on next startup."
 
 # Initialize archival settings
 echo 'Initializing archival settings...'
@@ -100,7 +120,7 @@ done || echo "Warning: Could not register webhook event types with Svix. Will re
 # Init app
 echo "Starting the FastAPI application..."
 if [ "$ENVIRONMENT" = "local" ]; then
-    uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    exec uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 else
-    uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    exec uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 fi

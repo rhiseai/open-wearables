@@ -9,12 +9,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.schemas.webhooks.event_types import WebhookEventType
 
-EMIT_WEBHOOK_TASK_NAME = "app.integrations.celery.tasks.emit_webhook_event_task.emit_webhook_event"
+EMIT_WEBHOOK_TASK_NAME = CeleryTask.EMIT_WEBHOOK_EVENT
 
-WEBHOOK_PRIORITY_QUEUE = "webhook_priority"
-WEBHOOK_BULK_QUEUE = "webhook_outgoing"
+WEBHOOK_PRIORITY_QUEUE = CeleryQueue.WEBHOOK_PRIORITY
+WEBHOOK_BULK_QUEUE = CeleryQueue.WEBHOOK_OUTGOING
 WEBHOOK_QUEUES = (WEBHOOK_PRIORITY_QUEUE, WEBHOOK_BULK_QUEUE)
 
 # Matched on the resource part, so future actions (workout.updated, connection.*) route the same way.

@@ -9,7 +9,9 @@ from app.services.providers.garmin.backfill_state import (
 )
 
 from .archival_task import run_daily_archival
+from .backfill_data_type_coverage_task import backfill_data_type_coverage
 from .close_stale_sync_runs_task import close_stale_sync_runs
+from .delete_user_webhook_payloads_task import delete_user_webhook_payloads
 from .emit_webhook_event_task import emit_webhook_event
 from .extension_events_task import dispatch_extension_events
 from .fill_missing_resilience_scores_task import fill_missing_resilience_scores
@@ -29,6 +31,7 @@ from .garmin.backfill_trigger import (
 )
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import complete_and_process_aws_upload, process_aws_upload
+from .process_sdk_sleep_task import process_sdk_sleep
 from .process_sdk_upload_task import process_sdk_upload
 from .process_xml_upload_task import process_xml_upload
 from .provider_webhooks_task import reconcile_provider_webhooks
@@ -53,6 +56,8 @@ __all__ = [
     "trigger_garmin_next_pending_type",
     # Archival
     "run_daily_archival",
+    # One-off data migrations
+    "backfill_data_type_coverage",
     # Apple XML multipart uploads
     "complete_and_process_aws_upload",
     # Sleep score calculation
@@ -63,6 +68,7 @@ __all__ = [
     "dispatch_extension_events",
     "close_stale_sync_runs",
     "finalize_stale_sleeps",
+    "process_sdk_sleep",
     "process_sdk_upload",
     "process_aws_upload",
     "process_xml_upload",
@@ -79,4 +85,5 @@ __all__ = [
     # Outgoing webhooks
     "emit_webhook_event",
     "report_webhook_queue_depth",
+    "delete_user_webhook_payloads",
 ]

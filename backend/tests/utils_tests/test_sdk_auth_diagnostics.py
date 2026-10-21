@@ -13,7 +13,6 @@ from jose import jwt
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.services.api_key_service import api_key_service
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_combined_auth, get_sdk_auth
 from app.utils.auth_diagnostics import AuthBoundary, AuthOutcome, AuthReason, log_auth_decision
@@ -252,7 +251,7 @@ async def test_api_key_exception_is_preserved_and_only_401_is_an_auth_rejection(
 ) -> None:
     error = HTTPException(status_code, "original private detail", headers={"X-Fixture": "preserved"})
     with (
-        patch.object(api_key_service, "validate_api_key", side_effect=error),
+        patch("app.utils.auth.validate_api_key", side_effect=error),
         pytest.raises(HTTPException) as raised,
     ):
         await get_sdk_auth(db, None, "private-api-key-fixture")
@@ -273,7 +272,7 @@ async def test_sdk_precedence_and_optional_developer_probe_emit_no_rejections(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     token = create_sdk_user_token("private-app-fixture", USER_ID)
-    with patch.object(api_key_service, "validate_api_key", side_effect=AssertionError("fallback must not run")):
+    with patch("app.utils.auth.validate_api_key", side_effect=AssertionError("fallback must not run")):
         result = await get_sdk_auth(db, token, "invalid-unused-api-key")
         combined = await get_combined_auth(db, token, "invalid-unused-api-key")
     assert result.auth_type == combined.auth_type == "sdk_token"
@@ -305,7 +304,7 @@ async def test_malformed_sdk_subject_does_not_start_a_new_fallback_path(
         algorithm=settings.algorithm,
     )
     with (
-        patch.object(api_key_service, "validate_api_key", side_effect=AssertionError("fallback must not run")),
+        patch("app.utils.auth.validate_api_key", side_effect=AssertionError("fallback must not run")),
         pytest.raises(ValueError, match="UUID"),
     ):
         await get_sdk_auth(db, token, "unused-api-key")

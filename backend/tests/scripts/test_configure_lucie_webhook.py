@@ -22,20 +22,19 @@ def test_configures_only_exact_lucie_endpoints(monkeypatch: pytest.MonkeyPatch) 
         SimpleNamespace(id="ep_lucie", url="https://api.getlucie.ai/api/v1/webhooks/ow"),
         SimpleNamespace(id="ep_other", url="https://example.com/webhooks/ow"),
     ]
-    page = SimpleNamespace(data=endpoints, done=True, iterator=None)
     updated = SimpleNamespace(event_types=["connection.created", "sleep.updated", "sleep.created", "sync.completed"])
 
     monkeypatch.setattr(configure_lucie_webhook.svix_service, "is_enabled", MagicMock(return_value=True))
     get_all = MagicMock(return_value=[developer])
     monkeypatch.setattr(configure_lucie_webhook.developer_service.crud, "get_all", get_all)
-    list_endpoints = MagicMock(return_value=page)
-    monkeypatch.setattr(configure_lucie_webhook.svix_service, "list_endpoints", list_endpoints)
+    iter_endpoints = MagicMock(return_value=iter(endpoints))
+    monkeypatch.setattr(configure_lucie_webhook.svix_service, "iter_endpoints", iter_endpoints)
     patch_endpoint = MagicMock(return_value=updated)
     monkeypatch.setattr(configure_lucie_webhook.svix_service, "patch_endpoint", patch_endpoint)
 
     assert configure_lucie_webhook.configure_lucie_webhook_filters() == 1
     get_all.assert_called_once_with(db, filters={}, offset=0, limit=250, sort_by="id")
-    list_endpoints.assert_called_once()
+    iter_endpoints.assert_called_once_with(str(developer.id))
     patch_endpoint.assert_called_once_with(
         str(developer.id),
         "ep_lucie",

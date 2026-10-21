@@ -7,6 +7,7 @@ from logging import getLogger
 from celery import shared_task
 
 from app.config import settings
+from app.constants.celery_tasks import CeleryTask
 from app.integrations.redis_client import get_redis_client
 from app.services.outgoing_webhooks.routing import WEBHOOK_QUEUES
 from app.utils.structured_logging import log_structured
@@ -14,7 +15,7 @@ from app.utils.structured_logging import log_structured
 logger = getLogger(__name__)
 
 
-@shared_task(ignore_result=True)
+@shared_task(name=CeleryTask.REPORT_WEBHOOK_QUEUE_DEPTH, ignore_result=True)
 def report_webhook_queue_depth() -> dict[str, int]:
     """Log ``LLEN`` of each outgoing webhook queue (one ``webhook_queue_depth`` line per queue).
 

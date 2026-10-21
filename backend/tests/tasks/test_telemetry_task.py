@@ -58,8 +58,14 @@ class TestSendTelemetryPingTask:
         """
         mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
         mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
-        mock_service.send_ping.side_effect = httpx.ConnectError("connection refused")
+        error = httpx.ConnectError("connection refused")
+        mock_service.send_ping.side_effect = error
 
-        result = send_telemetry_ping(event="daily")
+        with patch("app.integrations.celery.tasks.telemetry_task.log_and_capture_error") as report_failure:
+            result = send_telemetry_ping(event="daily")
 
         assert result == "failed"
+        report_failure.assert_called_once()
+        assert report_failure.call_args.args[0] is error
+        assert report_failure.call_args.args[2] == "Telemetry ping delivery failed"
+        assert report_failure.call_args.kwargs == {"level": "warning", "extra": {"event": "daily"}}
