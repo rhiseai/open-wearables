@@ -218,9 +218,9 @@ test('fits the sources of a user on a phone', async ({ page }) => {
  * arrow shows only after the strip measures itself, and a wheel event sent before that
  * finds no handler.
  */
-async function overflowingTabStrip(page: Page) {
+async function overflowingTabStrip(page: Page, path = `/users/${CONNECTED}`) {
 	await page.setViewportSize({ width: 1024, height: 800 });
-	await page.goto(`/users/${CONNECTED}`);
+	await page.goto(path);
 	await expect(page.getByRole('button', { name: 'Scroll right' })).toBeVisible();
 	return page.getByRole('navigation', { name: 'User sections' }).locator('..');
 }
@@ -273,7 +273,7 @@ test.describe('header actions reach the server from a built tab', () => {
 		'womens-health'
 	]) {
 		test(tab, async ({ page }) => {
-			await page.goto(`/users/${CONNECTED}/${tab}`);
+			await overflowingTabStrip(page, `/users/${CONNECTED}/${tab}`);
 			await page.getByRole('button', { name: 'Edit user' }).click();
 
 			await page.getByLabel('First name').fill(`Zofia-${tab}`);
