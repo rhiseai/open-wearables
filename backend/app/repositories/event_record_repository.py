@@ -40,7 +40,15 @@ from app.repositories.repositories import (
     utc_bucket_start,
 )
 from app.schemas.data_type_coverage import CoverageSpan
-from app.schemas.enums import DeviceType, EventCategory, ProviderName, SeriesType, TimelineBucket, get_series_type_id
+from app.schemas.enums import (
+    DeviceType,
+    EventCategory,
+    ProviderName,
+    SeriesType,
+    SummarySourceSelection,
+    TimelineBucket,
+    get_series_type_id,
+)
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordQueryParams,
@@ -901,6 +909,7 @@ class EventRecordRepository(
         limit: int,
         provider_order: dict[ProviderName, int],
         device_type_order: dict[DeviceType, int],
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> list[dict]:
         """Get daily sleep summaries: per date, the aggregate of its highest-priority source.
 
@@ -952,6 +961,7 @@ class EventRecordRepository(
                         else_=0,
                     )
                 ).label("total_duration"),
+                DataSource.id.label("data_source_id"),
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -961,7 +971,9 @@ class EventRecordRepository(
                 func.min(cast(EventRecord.id, String)).label("record_id_text"),
                 func.row_number()
                 .over(
-                    partition_by=local_sleep_date,
+                    partition_by=(local_sleep_date, DataSource.provider)
+                    if source_selection == SummarySourceSelection.PER_PROVIDER
+                    else local_sleep_date,
                     order_by=(
                         *source_priority_order(provider_order, device_type_order),
                         func.min(cast(EventRecord.id, String)),
@@ -1011,6 +1023,7 @@ class EventRecordRepository(
             )
             .group_by(
                 local_sleep_date,
+                DataSource.id,
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -1026,6 +1039,11 @@ class EventRecordRepository(
 
         # Lateral subquery: for each sleep row, average physio data within
         # [min_start_time, max_end_time) — exact window, no date-grouping mismatch.
+        physio_source_filters = (
+            [DataPointSeries.data_source_id == subquery.c.data_source_id]
+            if source_selection == SummarySourceSelection.PER_PROVIDER
+            else []
+        )
         physio_lateral = lateral(
             select(
                 func.avg(case((DataPointSeries.series_type_definition_id == hr_id, DataPointSeries.value))).label(
@@ -1047,6 +1065,7 @@ class EventRecordRepository(
             .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
             .where(
                 DataSource.user_id == user_id,
+                *physio_source_filters,
                 DataPointSeries.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
                 DataPointSeries.recorded_at >= subquery.c.min_start_time,
                 DataPointSeries.recorded_at < subquery.c.max_end_time,
@@ -1057,6 +1076,7 @@ class EventRecordRepository(
         record_id_col = cast(subquery.c.record_id_text, SQL_UUID).label("record_id")
         query = db_session.query(
             subquery.c.sleep_date,
+            subquery.c.data_source_id,
             subquery.c.min_start_time,
             subquery.c.max_end_time,
             subquery.c.total_duration,
@@ -1113,6 +1133,7 @@ class EventRecordRepository(
             summaries.append(
                 {
                     "sleep_date": row.sleep_date,
+                    "data_source_id": row.data_source_id,
                     "min_start_time": row.min_start_time,
                     "max_end_time": row.max_end_time,
                     "total_duration_minutes": int(row.total_duration or 0) // 60,

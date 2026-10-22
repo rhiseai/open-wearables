@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 
 from app.database import DbSession
-from app.schemas.enums import ProviderName, TimelineBucket, TimelineGroupBy
+from app.schemas.enums import ProviderName, SummarySourceSelection, TimelineBucket, TimelineGroupBy
 from app.schemas.responses.activity import (
     ActivitySummary,
     ActivityTotals,
@@ -32,6 +32,7 @@ def get_activity_summary(
     cursor: str | None = None,
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
+    source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
@@ -40,7 +41,7 @@ def get_activity_summary(
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order
+        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, source_selection=source_selection
     )
 
 
@@ -71,11 +72,14 @@ def get_sleep_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
 ) -> PaginatedResponse[SleepSummary]:
     """Returns daily sleep metrics."""
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
-    return summaries_service.get_sleep_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_sleep_summaries(
+        db, user_id, start_datetime, end_datetime, cursor, limit, source_selection=source_selection
+    )
 
 
 @router.get("/users/{user_id}/summaries/recovery")

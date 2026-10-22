@@ -27,6 +27,7 @@ from app.schemas.enums import (
     DeviceType,
     ProviderName,
     SeriesType,
+    SummarySourceSelection,
     get_series_type_id,
 )
 from app.schemas.responses.activity import (
@@ -120,14 +121,27 @@ def _midnight(day: date) -> datetime:
     return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
 
 
-def _activity_key(row: dict) -> tuple:
+def _activity_key(
+    row: dict, source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY
+) -> tuple[date, str, str]:
     """The compound key an activity cursor points at: date, then source, then device."""
+    if source_selection == SummarySourceSelection.PER_PROVIDER:
+        return (row["activity_date"], str(row["provider"]), "")
     return (row["activity_date"], row["source"] or "", row.get("device_model") or "")
+
+
+def _activity_cursor(row: dict, source_selection: SummarySourceSelection, direction: str) -> str:
+    """Keep the legacy source cursor while candidate cursors identify the provider."""
+    if source_selection == SummarySourceSelection.PRIORITY:
+        return encode_activity_cursor(
+            row["activity_date"], row["source"] or "unknown", row.get("device_model"), direction
+        )
+    return encode_activity_cursor(*_activity_key(row, source_selection), direction)
 
 
 def _extras_key(row: Mapping[str, Any], date_key: str = "activity_date") -> tuple:
     """The key the per-day extras (workouts, active and intensity minutes) are looked up by."""
-    return (row[date_key], row["source"], row.get("device_model"))
+    return (row[date_key], row.get("provider"), row["source"], row.get("device_model"))
 
 
 def _priority_sort_key(
@@ -212,7 +226,12 @@ class SummariesService:
 
         return filtered
 
-    def _pick_activity_by_priority(self, db_session: DbSession, results: list[dict]) -> list[dict]:
+    def _pick_activity_by_priority(
+        self,
+        db_session: DbSession,
+        results: list[dict],
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+    ) -> list[dict]:
         """One row per day, each metric group from the first-ranked source that holds it.
 
         Sources rank as in ``_filter_by_priority`` (provider, then device type), but a
@@ -229,9 +248,14 @@ class SummariesService:
         provider_order, device_type_order = self._priority_orders(db_session)
         sort_key = _priority_sort_key(provider_order, device_type_order)
 
-        by_date: dict[date, list[dict]] = defaultdict(list)
+        by_date: dict[date | tuple[date, str], list[dict]] = defaultdict(list)
         for result in results:
-            by_date[result["activity_date"]].append(result)
+            key = (
+                (result["activity_date"], result["provider"])
+                if source_selection == SummarySourceSelection.PER_PROVIDER
+                else result["activity_date"]
+            )
+            by_date[key].append(result)
 
         picked: list[dict] = []
         for entries in by_date.values():
@@ -255,11 +279,15 @@ class SummariesService:
                 holder = holders.get(fields[0])
                 for field in fields:
                     row[field] = holder.get(field) if holder is not None else None
+            row["workout_source_key"] = _extras_key(identity)
             row["steps_source_key"] = _extras_key(holders["steps_sum"]) if "steps_sum" in holders else None
             row["heart_rate_source_key"] = _extras_key(holders["hr_avg"]) if "hr_avg" in holders else None
+            if source_selection == SummarySourceSelection.PER_PROVIDER:
+                # A provider aggregate may draw different metric groups from sibling devices.
+                row.update(source=None, device_model=None, device_type=None)
             picked.append(row)
 
-        picked.sort(key=lambda r: r["activity_date"])
+        picked.sort(key=lambda r: _activity_key(r, source_selection))
         return picked
 
     def _fill_from_same_provider(
@@ -385,12 +413,20 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> PaginatedResponse[SleepSummary]:
         """Get daily sleep summaries aggregated by date, provider, and device."""
         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
 
         results = self.event_record_repo.get_sleep_summaries(
-            db_session, user_id, start_date, end_date, cursor, limit, *self._priority_orders(db_session)
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            cursor,
+            limit,
+            *self._priority_orders(db_session),
+            source_selection=source_selection,
         )
 
         # Check if there's more data
@@ -470,6 +506,7 @@ class SummariesService:
                 date=result["sleep_date"],
                 source=SourceMetadata(
                     provider=result.get("provider") or "unknown",
+                    data_source_id=result.get("data_source_id"),
                     source=result.get("source"),
                     device=result.get("device_model"),
                     device_type=result.get("device_type"),
@@ -587,6 +624,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         sort_order: str = "asc",
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -604,7 +642,9 @@ class SummariesService:
         self.logger.debug(f"Fetching activity summaries for user {user_id} from {start_date} to {end_date}")
 
         # Only this page's days are aggregated, so its cost follows the page, not the period.
-        results = self._activity_page_days(db_session, user_id, start_date, end_date, cursor, limit, sort_order)
+        results = self._activity_page_days(
+            db_session, user_id, start_date, end_date, cursor, limit, sort_order, source_selection
+        )
 
         # Check for more data
         has_more = len(results) > limit
@@ -619,16 +659,12 @@ class SummariesService:
             # Next cursor points to last item's compound key
             if has_more:
                 last = results[-1]
-                next_cursor = encode_activity_cursor(
-                    last["activity_date"], last["source"] or "unknown", last.get("device_model"), "next"
-                )
+                next_cursor = _activity_cursor(last, source_selection, "next")
 
             # Previous cursor if we had a cursor (not first page)
             if cursor:
                 first = results[0]
-                previous_cursor = encode_activity_cursor(
-                    first["activity_date"], first["source"] or "unknown", first.get("device_model"), "prev"
-                )
+                previous_cursor = _activity_cursor(first, source_selection, "prev")
 
         # The per-day extras, for this page's dates only.
         page_dates = [r["activity_date"] for r in results]
@@ -682,9 +718,7 @@ class SummariesService:
             # Workouts follow the row's own source; the step-threshold minutes follow the
             # source that supplied the steps, and the HR-zone minutes the one that supplied
             # the heart rate, since each is derived from those samples.
-            workout_data = workout_lookup.get(
-                (result["activity_date"], result.get("provider"), result["source"], result.get("device_model")), {}
-            )
+            workout_data = workout_lookup.get(result.get("workout_source_key") or _extras_key(result), {})
             activity_data = activity_lookup.get(result.get("steps_source_key"), {})
             intensity_data = intensity_lookup.get(result.get("heart_rate_source_key"), {})
 
@@ -798,7 +832,14 @@ class SummariesService:
             avg_steps=round(sum(steps) / len(steps)) if steps else None,
         )
 
-    def _activity_days(self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime) -> list[dict]:
+    def _activity_days(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start: datetime,
+        end: datetime,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+    ) -> list[dict]:
         """One row per day in [start, end): live and archived, each metric from the best source holding it.
 
         Every source's row is first raised with its own provider's sibling-device samples,
@@ -806,18 +847,30 @@ class SummariesService:
         """
         results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start, end)
         results = self._merge_archive_activity(db_session, user_id, start, end, results)
-        results = self._add_workout_only_days(db_session, user_id, start, end, results)
+        results = self._add_workout_only_days(db_session, user_id, start, end, results, source_selection)
         merged_sample_sums = self.data_point_repo.get_daily_merged_sample_sums(
             db_session, user_id, start, end, tuple(MERGED_ACTIVITY_SAMPLE_FIELDS)
         )
         results = self._fill_from_same_provider(results, merged_sample_sums)
-        return self._pick_activity_by_priority(db_session, results)
+        return self._pick_activity_by_priority(db_session, results, source_selection)
 
     def _add_workout_only_days(
-        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, results: list
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start: datetime,
+        end: datetime,
+        results: list,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> list:
         """Add an empty row per source for dates that have workouts but no time-series data."""
-        covered = {r["activity_date"] for r in results}
+
+        def key(row: dict, date_key: str) -> tuple | date:
+            if source_selection == SummarySourceSelection.PER_PROVIDER:
+                return (row[date_key], row["provider"])
+            return row[date_key]
+
+        covered = {key(r, "activity_date") for r in results}
         extra = [
             {
                 "activity_date": wa["workout_date"],
@@ -837,7 +890,7 @@ class SummariesService:
                 "active_time_minutes": None,
             }
             for wa in self.event_record_repo.get_daily_workout_aggregates(db_session, user_id, start, end)
-            if wa["workout_date"] not in covered
+            if key(wa, "workout_date") not in covered
         ]
         if not extra:
             return results
@@ -852,6 +905,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         sort_order: str,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> list[dict]:
         """The days for one page, in page order, plus one more if there is a next page.
 
@@ -883,7 +937,7 @@ class SummariesService:
                 window = (anchor, min(end_date, anchor + span))
                 complete = window[1] >= end_date
 
-            results = self._activity_days(db_session, user_id, *window)
+            results = self._activity_days(db_session, user_id, *window, source_selection=source_selection)
             if sort_order == "desc":
                 results = list(reversed(results))
 
@@ -893,7 +947,11 @@ class SummariesService:
                 results = [
                     r
                     for r in results
-                    if (_activity_key(r) < cursor_key if backwards else _activity_key(r) > cursor_key)
+                    if (
+                        _activity_key(r, source_selection) < cursor_key
+                        if backwards
+                        else _activity_key(r, source_selection) > cursor_key
+                    )
                 ]
                 if direction == "prev":
                     results = list(reversed(results))
