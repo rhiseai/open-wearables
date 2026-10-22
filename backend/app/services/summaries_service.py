@@ -360,7 +360,7 @@ class SummariesService:
 
         If archival is enabled, some days may only have data in the archive table.
         This method queries the archive and merges rows, preferring live data when
-        both exist for the same (date, source, device_model) key.
+        both exist for the same (date, provider, source, device_model) key.
         """
         try:
             self.archival_settings_repo.get(db_session)
@@ -388,15 +388,13 @@ class SummariesService:
         if not archive_results:
             return live_results
 
-        # Build lookup from live data keyed on (date, source, device_model)
-        live_keys: set[tuple] = set()
-        for r in live_results:
-            live_keys.add((r["activity_date"], r["source"], r.get("device_model")))
+        # Identically named writers/devices in different providers are independent sources.
+        live_keys = {_extras_key(row) for row in live_results}
 
         # Add archive rows that are NOT already covered by live data
         merged = list(live_results)
         for ar in archive_results:
-            key = (ar["activity_date"], ar["source"], ar.get("device_model"))
+            key = _extras_key(ar)
             if key not in live_keys:
                 merged.append(ar)
 

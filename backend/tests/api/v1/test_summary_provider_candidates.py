@@ -246,7 +246,7 @@ def test_candidates_preserve_sibling_device_merge_and_archived_provider(client: 
     user = UserFactory()
     watch = DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Watch", device_type="watch")
     phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Phone", device_type="phone")
-    oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+    oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="apple_health_sdk", device_model="Watch")
     steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
     # The shared hour contributes the larger device count, then the phone's later hour is added.
     for source, hour, steps in [(watch, 10, 100), (phone, 10, 150), (phone, 11, 200)]:
@@ -301,3 +301,44 @@ def test_default_null_source_cursor_keeps_legacy_identity(client: TestClient, db
     second = client.get(url, headers=headers, params=_params(limit=1, cursor=cursor))
     assert second.status_code == 200
     assert [s["date"] for s in second.json()["data"]] == [(START + timedelta(days=1)).date().isoformat()]
+
+
+def test_sleep_candidate_keeps_one_same_model_device_and_its_own_sessions(client: TestClient, db: Session) -> None:
+    user = UserFactory()
+    first = DataSourceFactory(
+        user=user,
+        provider=ProviderName.APPLE,
+        source="same-writer",
+        device_model="Watch",
+        device_type="watch",
+        device_id="watch-one",
+    )
+    second = DataSourceFactory(
+        user=user,
+        provider=ProviderName.APPLE,
+        source="same-writer",
+        device_model="Watch",
+        device_type="watch",
+        device_id="watch-two",
+    )
+    _sleep(first, START + timedelta(hours=1), 360)
+    _sleep(second, START + timedelta(hours=2), 400)
+    headers = api_key_headers(ApiKeyFactory().plain_key)
+    url = f"/api/v1/users/{user.id}/summaries/sleep"
+    legacy = client.get(url, headers=headers, params=_params())
+    assert legacy.status_code == 200
+    assert legacy.json()["data"][0]["duration_minutes"] == 760
+    assert legacy.json()["data"][0]["source"]["data_source_id"] is None
+    candidate_response = client.get(url, headers=headers, params=_params(source_selection="per_provider"))
+    assert candidate_response.status_code == 200, candidate_response.text
+    assert len(candidate_response.json()["data"]) == 1
+    candidate = candidate_response.json()["data"][0]
+    chosen = candidate["source"]["data_source_id"]
+    expected = {
+        str(first.id): (360, (START + timedelta(hours=1)).isoformat()),
+        str(second.id): (400, (START + timedelta(hours=2)).isoformat()),
+    }[chosen]
+    assert candidate["duration_minutes"] == expected[0]
+    assert len(candidate["sessions"]) == 1
+    assert datetime.fromisoformat(candidate["start_time"]) == datetime.fromisoformat(expected[1])
+    assert candidate["sessions"][0]["duration_minutes"] == expected[0]
