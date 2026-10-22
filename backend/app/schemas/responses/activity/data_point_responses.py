@@ -46,6 +46,7 @@ class ActiveMinutesResult(TypedDict):
     """Result from daily active/sedentary minutes query."""
 
     activity_date: date
+    provider: str | None
     source: str | None
     device_model: str | None
     active_minutes: int
@@ -57,6 +58,7 @@ class IntensityMinutesResult(TypedDict):
     """Result from daily intensity minutes query."""
 
     activity_date: date
+    provider: str | None
     source: str | None
     device_model: str | None
     light_minutes: int

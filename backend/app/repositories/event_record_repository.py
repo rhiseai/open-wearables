@@ -40,7 +40,15 @@ from app.repositories.repositories import (
     utc_bucket_start,
 )
 from app.schemas.data_type_coverage import CoverageSpan
-from app.schemas.enums import DeviceType, EventCategory, ProviderName, SeriesType, TimelineBucket, get_series_type_id
+from app.schemas.enums import (
+    DeviceType,
+    EventCategory,
+    ProviderName,
+    SeriesType,
+    SummarySourceSelection,
+    TimelineBucket,
+    get_series_type_id,
+)
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordQueryParams,
@@ -901,6 +909,7 @@ class EventRecordRepository(
         limit: int,
         provider_order: dict[ProviderName, int],
         device_type_order: dict[DeviceType, int],
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> list[dict]:
         """Get daily sleep summaries: per date, the aggregate of its highest-priority source.
 
@@ -924,6 +933,18 @@ class EventRecordRepository(
         local_sleep_date = cast(
             EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
             Date,
+        )
+
+        per_provider = source_selection == SummarySourceSelection.PER_PROVIDER
+        # Legacy groups can contain same-model devices with distinct stable IDs. Keep
+        # their original aggregate, but only claim a source UUID when it is unambiguous.
+        data_source_id = (
+            DataSource.id
+            if per_provider
+            else case(
+                (func.count(func.distinct(DataSource.id)) == 1, cast(func.min(cast(DataSource.id, String)), SQL_UUID)),
+                else_=None,
+            )
         )
 
         # Build base aggregated query as subquery
@@ -952,6 +973,7 @@ class EventRecordRepository(
                         else_=0,
                     )
                 ).label("total_duration"),
+                data_source_id.label("data_source_id"),
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -961,7 +983,9 @@ class EventRecordRepository(
                 func.min(cast(EventRecord.id, String)).label("record_id_text"),
                 func.row_number()
                 .over(
-                    partition_by=local_sleep_date,
+                    partition_by=(local_sleep_date, DataSource.provider)
+                    if source_selection == SummarySourceSelection.PER_PROVIDER
+                    else local_sleep_date,
                     order_by=(
                         *source_priority_order(provider_order, device_type_order),
                         func.min(cast(EventRecord.id, String)),
@@ -1011,6 +1035,7 @@ class EventRecordRepository(
             )
             .group_by(
                 local_sleep_date,
+                *([DataSource.id] if per_provider else []),
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -1026,6 +1051,11 @@ class EventRecordRepository(
 
         # Lateral subquery: for each sleep row, average physio data within
         # [min_start_time, max_end_time) — exact window, no date-grouping mismatch.
+        physio_source_filters = (
+            [DataPointSeries.data_source_id == subquery.c.data_source_id]
+            if source_selection == SummarySourceSelection.PER_PROVIDER
+            else []
+        )
         physio_lateral = lateral(
             select(
                 func.avg(case((DataPointSeries.series_type_definition_id == hr_id, DataPointSeries.value))).label(
@@ -1047,6 +1077,7 @@ class EventRecordRepository(
             .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
             .where(
                 DataSource.user_id == user_id,
+                *physio_source_filters,
                 DataPointSeries.series_type_definition_id.in_([hr_id, sdnn_id, rmssd_id, resp_id, spo2_id]),
                 DataPointSeries.recorded_at >= subquery.c.min_start_time,
                 DataPointSeries.recorded_at < subquery.c.max_end_time,
@@ -1057,6 +1088,7 @@ class EventRecordRepository(
         record_id_col = cast(subquery.c.record_id_text, SQL_UUID).label("record_id")
         query = db_session.query(
             subquery.c.sleep_date,
+            subquery.c.data_source_id,
             subquery.c.min_start_time,
             subquery.c.max_end_time,
             subquery.c.total_duration,
@@ -1113,6 +1145,7 @@ class EventRecordRepository(
             summaries.append(
                 {
                     "sleep_date": row.sleep_date,
+                    "data_source_id": row.data_source_id,
                     "min_start_time": row.min_start_time,
                     "max_end_time": row.max_end_time,
                     "total_duration_minutes": int(row.total_duration or 0) // 60,
@@ -1143,13 +1176,17 @@ class EventRecordRepository(
 
         # Attach per-session breakdown (individual sleep/nap records) for each summary,
         # keyed by the same (date, provider, source, device_model) grouping identity.
-        sessions_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date)
+        sessions_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date, source_selection)
         for summary in summaries:
             key = (
-                summary["sleep_date"],
-                summary["provider"],
-                summary["source"],
-                summary["device_model"],
+                (summary["sleep_date"], summary["data_source_id"])
+                if per_provider
+                else (
+                    summary["sleep_date"],
+                    summary["provider"],
+                    summary["source"],
+                    summary["device_model"],
+                )
             )
             summary["sessions"] = sessions_by_key.get(key, [])
 
@@ -1161,6 +1198,7 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> dict[tuple, list[dict]]:
         """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model).
 
@@ -1191,6 +1229,7 @@ class EventRecordRepository(
                 EventRecord.zone_offset.label("zone_offset"),
                 duration_seconds.label("duration_seconds"),
                 func.coalesce(SleepDetails.is_nap, False).label("is_nap"),
+                DataSource.id.label("data_source_id"),
                 DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
@@ -1210,7 +1249,16 @@ class EventRecordRepository(
 
         sessions_by_key: dict[tuple, list[dict]] = {}
         for row in rows:
-            key = (row.sleep_date, row.provider, row.source, row.device_model)
+            key = (
+                (row.sleep_date, row.data_source_id)
+                if source_selection == SummarySourceSelection.PER_PROVIDER
+                else (
+                    row.sleep_date,
+                    row.provider,
+                    row.source,
+                    row.device_model,
+                )
+            )
             sessions_by_key.setdefault(key, []).append(
                 {
                     "start_time": row.start_time,

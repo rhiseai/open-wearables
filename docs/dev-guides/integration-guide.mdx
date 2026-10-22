@@ -278,6 +278,50 @@ auth_url = await ow.get_auth_url("garmin", user_id, "https://myapp.com/callback"
 sleep = await ow.get_all(f"/api/v1/users/{user_id}/summaries/sleep", start_date="2025-01-01", end_date="2025-01-31")
 ```
 
+
+### Choosing a different provider for sleep and activity
+
+`GET /api/v1/users/{user_id}/summaries/sleep` and
+`GET /api/v1/users/{user_id}/summaries/activity` accept `source_selection`:
+
+| Value | Result |
+| --- | --- |
+| `priority` (default) | Existing global provider priority selects one daily summary. Activity can fill different metric groups from different providers. |
+| `per_provider` | One candidate per local date and provider. The caller applies its user's preferred provider separately for sleep and activity. |
+
+The candidate mode keeps OW's device selection and deduplication within each provider.
+Activity candidates combine only that provider's metric groups and sibling-device samples;
+`source.provider` identifies the provider, while device fields are empty because the candidate
+can span devices. A provider without steps remains a candidate if it has other daily data
+or a workout. The activity totals endpoint keeps the default global-priority behavior.
+
+Sleep candidates keep one source within each provider and expose its OW UUID as
+`source.data_source_id`. To display its actual stages, request
+`GET /api/v1/users/{user_id}/events/sleep` with `data_source_id=<that UUID>` and
+`include=stages`; keep the event endpoint's `filter_by_priority` at `false` (its default).
+The returned sessions carry the same `source.data_source_id`. In candidate mode, sleep
+physiology averages also come only from the selected source's samples in that night.
+
+```python
+sleep_candidates = await ow.get_all(
+    f"/api/v1/users/{user_id}/summaries/sleep",
+    start_date="2026-10-01",
+    end_date="2026-10-08",
+    source_selection="per_provider",
+)
+activity_candidates = await ow.get_all(
+    f"/api/v1/users/{user_id}/summaries/activity",
+    start_date="2026-10-01",
+    end_date="2026-10-08",
+    source_selection="per_provider",
+)
+```
+
+Page through every response before choosing: several providers for one date can cross a
+page boundary. Keep the same `source_selection` and other filters when following cursors.
+Requests use the same `X-Open-Wearables-API-Key` authentication as the other data endpoints;
+an unsupported `source_selection` returns HTTP 400 through the standard validation handler.
+
 ---
 
 ## Troubleshooting
