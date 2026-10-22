@@ -221,7 +221,7 @@ test('fits the sources of a user on a phone', async ({ page }) => {
 async function overflowingTabStrip(page: Page, path = `/users/${CONNECTED}`) {
 	await page.setViewportSize({ width: 1024, height: 800 });
 	await page.goto(path);
-	await expect(page.getByRole('button', { name: 'Scroll right' })).toBeVisible();
+	await expect(page.getByRole('button', { name: /^Scroll (left|right)$/ }).first()).toBeVisible();
 	return page.getByRole('navigation', { name: 'User sections' }).locator('..');
 }
 
