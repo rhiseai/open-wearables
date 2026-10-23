@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from logging import Logger, getLogger
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Query, Session, SessionTransaction
@@ -445,6 +445,8 @@ class EventRecordService(
         result: EventRecord,
         action: str,
         detail: EventRecordDetailCreate,
+        *,
+        revision_token: str | None = None,
     ) -> None:
         """Queue only plain values; savepoint commits and rollbacks never publish them."""
         device_type = None
@@ -494,6 +496,10 @@ class EventRecordService(
         }
         pending = db_session.info.setdefault("sleep_webhooks", {})
         previous = pending.get(result.id)
+        if revision_token is None and previous:
+            revision_token = previous[1].get("revision_token")
+        if revision_token is not None:
+            payload["revision_token"] = revision_token
         pending[result.id] = (previous[0] if previous and previous[0] == "created" else action, payload)
         if db_session.info.get("sleep_webhook_listeners"):
             return
@@ -511,6 +517,38 @@ class EventRecordService(
         def _discard_sleep_webhooks(session: Session, transaction: SessionTransaction) -> None:
             if not transaction.nested:
                 session.info.pop("sleep_webhooks", None)
+
+    def queue_sleep_score_updates(
+        self, db_session: DbSession, user_id: UUID, provider: ProviderName, wake_dates: set[date]
+    ) -> None:
+        """Notify consumers of changed daily scores once their transaction commits.
+
+        The caller holds the shared sleep writer lock while updating the scores.
+        A score can arrive before its session; that session's later create event
+        will make the already-stored score visible without a synthetic session.
+        """
+        for record, source in self.crud.get_main_sleep_by_wake_dates(db_session, user_id, provider, wake_dates):
+            incoming = EventRecordCreate(
+                id=record.id,
+                user_id=user_id,
+                data_source_id=source.id,
+                provider=provider,
+                source_name=source.source or provider,
+                source=source.source,
+                device_model=source.device_model,
+                category=EventCategory.SLEEP,
+                start_datetime=record.start_datetime,
+                end_datetime=record.end_datetime,
+            )
+            self._queue_sleep_webhook(
+                db_session,
+                user_id,
+                incoming,
+                record,
+                "updated",
+                self._sleep_detail_snapshot(record),
+                revision_token=uuid4().hex,
+            )
 
     def _create_or_merge_sleep_inner(
         self,

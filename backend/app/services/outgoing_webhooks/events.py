@@ -257,6 +257,7 @@ def _emit_sleep(
     sleep_duration_seconds: float | None = None,
     sleep_stage_intervals: list[dict[str, Any]] | None = None,
     sync: dict[str, str] | None = None,
+    revision_token: str | None = None,
 ) -> None:
     # Content-aware idempotency: a provider re-sends the same session as it is
     # finalized (Oura sends the stub early, then updates duration/stages/score).
@@ -267,6 +268,11 @@ def _emit_sleep(
     revision = hashlib.sha1(
         f"{start_time}|{end_time}|{duration_seconds}|{efficiency_percent}|{stages}".encode()
     ).hexdigest()[:12]
+    # Daily scores are stored separately and are not part of the public sleep
+    # payload. A token for each changed write lets 61 -> 75 -> 61 notify twice;
+    # the queued delivery keeps that token across transport retries.
+    if revision_token is not None:
+        revision = f"{revision}.{revision_token}"
     _dispatch(
         event_type,
         {

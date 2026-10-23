@@ -313,6 +313,40 @@ class EventRecordRepository(
             {"key": f"sleep_merge:{user_id}"},
         )
 
+    def get_main_sleep_by_wake_dates(
+        self, db_session: DbSession, user_id: UUID, provider: ProviderName, wake_dates: set[date]
+    ) -> list[tuple[EventRecord, DataSource]]:
+        """Return one main session per local wake date for a provider score refresh."""
+        if not wake_dates:
+            return []
+        wake_date = cast(
+            func.timezone("UTC", EventRecord.end_datetime)
+            + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            Date,
+        )
+        rows = (
+            db_session.query(EventRecord, DataSource, wake_date)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .join(SleepDetails, SleepDetails.record_id == EventRecord.id)
+            .options(selectinload(EventRecord.sleep_detail))
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == provider,
+                EventRecord.category == EventCategory.SLEEP,
+                _nap_condition(False),
+                wake_date.in_(wake_dates),
+            )
+            .order_by(
+                func.coalesce(SleepDetails.sleep_total_duration_minutes * 60, EventRecord.duration_seconds).desc(),
+                EventRecord.id,
+            )
+            .all()
+        )
+        sessions: dict[date, tuple[EventRecord, DataSource]] = {}
+        for record, source, day in rows:
+            sessions.setdefault(day, (record, source))
+        return list(sessions.values())
+
     def find_sleep_merge_candidates(
         self,
         db_session: DbSession,

@@ -174,6 +174,10 @@ OURA_WEBHOOK_VERIFICATION_TOKEN=your-oura-webhook-verification-token
 
     **Subscribed data types:** `sleep`, `daily_sleep`, `daily_readiness`, `daily_activity`, `daily_spo2`, `daily_cardiovascular_age`, `workout` - each for the `create` and `update` events.
 
+    Oura can revise a daily sleep, readiness, or activity score after its first sync. Open Wearables replaces the stored score and contributors when it fetches a revision, including during historical sync. An identical replay leaves the score unchanged.
+
+    A new or revised daily sleep score also emits `sleep.updated` after the score is committed when a matching Oura main sleep session already exists. Consumers can re-read the day's health scores even when the sleep duration and stages did not change. If the score arrives before the sleep session, the later `sleep.created` event exposes the already-stored score. The sleep webhook payload is unchanged.
+
     <Note>
     Oura subscriptions expire after 90 days and are renewed automatically by a scheduled task (monthly). You can also manage them manually via `POST /api/v1/providers/oura/webhooks/subscriptions` (register / re-register with a `callback_url`) and `POST /api/v1/providers/oura/webhooks/subscriptions/renew`.
     </Note>
