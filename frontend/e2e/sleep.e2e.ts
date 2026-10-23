@@ -46,6 +46,42 @@ test('lists sessions newest first, dated by the morning they ended', async ({ pa
 	await expect(cards.first().getByTitle(/^REM · /)).toBeVisible();
 });
 
+test('identifies the app that wrote a session alongside its provider and device', async ({
+	page
+}) => {
+	await page.goto(SLEEP);
+	const cards = page.getByRole('article');
+	const autosleep = cards.nth(2).getByTitle('Apple · AutoSleep · iPhone 15', { exact: true });
+	await expect(autosleep.getByText('AutoSleep', { exact: true })).toBeVisible();
+	await expect(autosleep).toContainText(/Apple\s*·\s*AutoSleep\s*·\s*iPhone 15/);
+
+	for (const index of [1, 3]) {
+		const withoutApp = cards.nth(index).getByTitle('Suunto · Suunto 9 Peak', { exact: true });
+		await expect(withoutApp).toContainText(/Suunto\s*·\s*Suunto 9 Peak/);
+		await expect(withoutApp).not.toContainText(/·\s*·/);
+	}
+
+	const longOrigin = cards
+		.nth(6)
+		.getByTitle("Apple · Zofia Kowalska's Apple Watch Series 10 · Apple Watch Series 10", {
+			exact: true
+		});
+	for (const width of [1280, 768, 390]) {
+		await page.setViewportSize({ width, height: 844 });
+		await expect(longOrigin).toBeVisible();
+		if (width >= 640) {
+			await expect(
+				longOrigin.getByText("Zofia Kowalska's Apple Watch Series 10", { exact: true })
+			).toBeVisible();
+		}
+		const { scrollWidth, clientWidth } = await page.evaluate(() => ({
+			scrollWidth: document.documentElement.scrollWidth,
+			clientWidth: document.documentElement.clientWidth
+		}));
+		expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
+	}
+});
+
 test('sums the whole period beside the list, not the page in front of you', async ({ page }) => {
 	await page.goto(SLEEP);
 
