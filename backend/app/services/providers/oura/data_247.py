@@ -348,7 +348,8 @@ class Oura247Data(Base247DataTemplate):
         if samples:
             counts = timeseries_service.bulk_create_samples(db, samples)
         if health_scores:
-            counts += health_score_service.bulk_create(db, health_scores)
+            score_counts, _ = health_score_service.bulk_upsert_provider_daily_scores(db, health_scores)
+            counts += score_counts
         if samples or health_scores:
             db.commit()
         return counts
@@ -581,7 +582,8 @@ class Oura247Data(Base247DataTemplate):
         if samples:
             counts = timeseries_service.bulk_create_samples(db, samples)
         if health_scores:
-            counts += health_score_service.bulk_create(db, health_scores)
+            score_counts, _ = health_score_service.bulk_upsert_provider_daily_scores(db, health_scores)
+            counts += score_counts
         if samples or health_scores:
             db.commit()
         return counts
@@ -1001,7 +1003,14 @@ class Oura247Data(Base247DataTemplate):
         """Save daily sleep scores via health_score_service."""
         counts = WriteCounts(0, 0)
         if normalized:
-            counts = health_score_service.bulk_create(db, normalized)
+            event_record_service.lock_sleep_user(db, user_id)
+            counts, changed = health_score_service.bulk_upsert_provider_daily_scores(db, normalized)
+            changed_times = {score.recorded_at for score in changed}
+            # Preserve Oura's calendar day before PostgreSQL normalizes an
+            # offset-bearing daily timestamp to the session's timezone.
+            days_by_time = {score.recorded_at: score.recorded_at.date() for score in normalized}
+            wake_dates = {days_by_time[recorded_at] for recorded_at in changed_times}
+            event_record_service.queue_sleep_score_updates(db, user_id, ProviderName.OURA, wake_dates)
             db.commit()
         return counts
 
