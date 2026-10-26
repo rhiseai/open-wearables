@@ -1055,7 +1055,7 @@ class EventRecordService(
                 start_time=record.start_datetime,
                 end_time=record.end_datetime,
                 zone_offset=record.zone_offset,
-                source=self._map_source(data_source),
+                source=self._map_source(data_source).model_copy(update={"data_source_id": data_source.id}),
                 duration_seconds=record.duration_seconds or 0,
                 sleep_duration_seconds=sleep_duration_seconds,
                 time_in_bed_seconds=time_in_bed_seconds,

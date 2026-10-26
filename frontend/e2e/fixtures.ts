@@ -704,19 +704,27 @@ const buildSleep = () =>
 		const asleep = isNap ? 3600 : shape.asleep;
 		// Nights start the evening before; naps sit in the afternoon.
 		const start = new Date(`${isoDay(index * 2 + 1)}T${isNap ? '13:20' : '22:40'}:00.000Z`);
+		const source = {
+			provider: shape.provider,
+			source: shape.provider === 'oura' ? 'Oura' : index === 3 ? '   ' : null,
+			device: DEVICES[shape.provider].model,
+			device_type: DEVICES[shape.provider].type,
+			device_name: DEVICES[shape.provider].model
+		};
+		if (index === 2 || index === 6) {
+			source.provider = 'apple';
+			source.source = index === 2 ? 'AutoSleep' : "Zofia Kowalska's Apple Watch Series 10";
+			source.device = index === 2 ? 'iPhone15,4' : 'Watch7,17';
+			source.device_type = index === 2 ? 'phone' : 'watch';
+			source.device_name = index === 2 ? 'iPhone 15' : 'Apple Watch Series 10';
+		}
 
 		return {
 			id: `s0000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
 			start_time: start.toISOString(),
 			end_time: new Date(start.getTime() + inBed * 1000).toISOString(),
 			zone_offset: '+02:00',
-			source: {
-				provider: shape.provider,
-				source: shape.provider,
-				device: DEVICES[shape.provider].model,
-				device_type: DEVICES[shape.provider].type,
-				device_name: DEVICES[shape.provider].model
-			},
+			source,
 			duration_seconds: inBed,
 			sleep_duration_seconds: asleep,
 			time_in_bed_seconds: inBed,

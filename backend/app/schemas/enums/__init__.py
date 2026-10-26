@@ -29,6 +29,7 @@ from .series_types import (
     get_series_type_id,
     get_series_type_unit,
 )
+from .summary_source_selection import SummarySourceSelection
 from .timeline import (
     TimelineBucket,
     TimelineGroupBy,
@@ -64,6 +65,7 @@ __all__ = [
     "DEFAULT_PROVIDER_PRIORITY",
     "HealthScoreCategory",
     "SdkConnectionOutcome",
+    "SummarySourceSelection",
     "TimelineBucket",
     "TimelineGroupBy",
 ]

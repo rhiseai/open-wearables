@@ -26,7 +26,7 @@ from app.services import raw_payload_storage
 from app.services.api_key_service import API_KEY_REQUIRED
 from app.services.endpoint_usage import endpoint_usage
 from app.services.outgoing_webhooks import svix as svix_service
-from app.utils.exceptions import DatetimeParseError, handle_exception
+from app.utils.exceptions import DatetimeParseError, SDKAuthenticationError, handle_exception
 from app.utils.logging_setup import configure_logging
 
 # Configure logging to use stdout instead of stderr
@@ -148,6 +148,8 @@ async def datetime_parse_exception_handler(_: Request, exc: DatetimeParseError) 
 @api.exception_handler(StarletteHTTPException)
 async def http_exception_handler_with_body_log(request: Request, exc: StarletteHTTPException) -> Response:
     # request.state survives the middleware boundary, so the access log can read it.
+    if isinstance(exc, SDKAuthenticationError):
+        request.state.sdk_auth_failure_reason = exc.reason
     _capture_error_body(request, exc.status_code, exc.detail)
     # real cause behind an opaque HTTPException (e.g. FastAPI's body-parse 400): explicit
     # `from e`, else the implicitly-chained exception unless suppressed via `from None`.

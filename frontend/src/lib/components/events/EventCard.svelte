@@ -9,6 +9,7 @@
 		icon,
 		source,
 		providerLabel,
+		showSourceApp = false,
 		title,
 		when,
 		metrics,
@@ -17,16 +18,16 @@
 		icon: Component;
 		source: SourceMetadata;
 		providerLabel: string;
+		showSourceApp?: boolean;
 		title: Snippet;
 		when: Snippet;
 		metrics: Snippet;
 		details: Snippet;
 	} = $props();
 
-	// The device is the useful half when one provider carries several: "Garmin"
-	// twice tells an admin nothing, "Forerunner 265" tells them which watch.
 	const device = $derived(source.device_name ?? source.device);
-	const origin = $derived([providerLabel, device].filter(Boolean).join(' · '));
+	const sourceApp = $derived(showSourceApp ? source.source?.trim() : null);
+	const origin = $derived([providerLabel, sourceApp, device].filter(Boolean).join(' · '));
 	const DeviceIcon = $derived(deviceIcon(source.device_type));
 </script>
 
@@ -41,6 +42,10 @@
 			<ProviderMark provider={source.provider} label={providerLabel} size="sm" />
 			<span class="hidden items-center gap-1 text-xs text-muted-foreground sm:inline-flex">
 				{providerLabel}
+				{#if sourceApp}
+					<span aria-hidden="true" class="text-muted-foreground/40">·</span>
+					<span class="max-w-32 truncate md:max-w-48">{sourceApp}</span>
+				{/if}
 				{#if device}
 					<span aria-hidden="true" class="text-muted-foreground/40">·</span>
 					<DeviceIcon size={12} aria-hidden="true" class="shrink-0 text-muted-foreground/60" />

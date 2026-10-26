@@ -1205,6 +1205,15 @@
             }
           },
           {
+            "name": "source_selection",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SummarySourceSelection",
+              "default": "priority"
+            }
+          },
+          {
             "name": "X-Open-Wearables-API-Key",
             "in": "header",
             "required": false,
@@ -1424,6 +1433,15 @@
               "minimum": 1,
               "default": 50,
               "title": "Limit"
+            }
+          },
+          {
+            "name": "source_selection",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SummarySourceSelection",
+              "default": "priority"
             }
           },
           {
@@ -17074,6 +17092,19 @@
             "title": "Provider",
             "example": "apple"
           },
+          "data_source_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Source Id",
+            "description": "OW source identity for requesting the same source’s detailed sleep sessions."
+          },
           "source": {
             "anyOf": [
               {
@@ -17270,6 +17301,15 @@
         ],
         "title": "StorageEstimate",
         "description": "Storage sizes across all database tables."
+      },
+      "SummarySourceSelection": {
+        "type": "string",
+        "enum": [
+          "priority",
+          "per_provider"
+        ],
+        "title": "SummarySourceSelection",
+        "description": "Whether daily summaries choose globally or expose one candidate per provider."
       },
       "Sync247Summary": {
         "properties": {

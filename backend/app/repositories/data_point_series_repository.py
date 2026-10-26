@@ -1296,6 +1296,7 @@ class DataPointSeriesRepository(
         minute_bucket = (
             db_session.query(
                 local_date.label("activity_date"),
+                DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
                 minute_trunc.label("minute_bucket"),
@@ -1310,6 +1311,7 @@ class DataPointSeriesRepository(
             )
             .group_by(
                 local_date,
+                DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
                 minute_trunc,
@@ -1321,6 +1323,7 @@ class DataPointSeriesRepository(
         results = (
             db_session.query(
                 minute_bucket.c.activity_date,
+                minute_bucket.c.provider,
                 minute_bucket.c.source,
                 minute_bucket.c.device_model,
                 # Count minutes where steps >= threshold (active)
@@ -1332,6 +1335,7 @@ class DataPointSeriesRepository(
             )
             .group_by(
                 minute_bucket.c.activity_date,
+                minute_bucket.c.provider,
                 minute_bucket.c.source,
                 minute_bucket.c.device_model,
             )
@@ -1348,6 +1352,7 @@ class DataPointSeriesRepository(
             aggregates.append(
                 {
                     "activity_date": row.activity_date,
+                    "provider": row.provider,
                     "source": row.source,
                     "device_model": row.device_model,
                     "active_minutes": active,
@@ -1397,6 +1402,7 @@ class DataPointSeriesRepository(
         minute_bucket = (
             db_session.query(
                 local_date.label("activity_date"),
+                DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
                 minute_trunc.label("minute_bucket"),
@@ -1410,6 +1416,7 @@ class DataPointSeriesRepository(
             )
             .group_by(
                 local_date,
+                DataSource.provider,
                 DataSource.source,
                 DataSource.device_model,
                 minute_trunc,
@@ -1421,6 +1428,7 @@ class DataPointSeriesRepository(
         results = (
             db_session.query(
                 minute_bucket.c.activity_date,
+                minute_bucket.c.provider,
                 minute_bucket.c.source,
                 minute_bucket.c.device_model,
                 # Light: 50-63% of max HR
@@ -1459,6 +1467,7 @@ class DataPointSeriesRepository(
             )
             .group_by(
                 minute_bucket.c.activity_date,
+                minute_bucket.c.provider,
                 minute_bucket.c.source,
                 minute_bucket.c.device_model,
             )
@@ -1471,6 +1480,7 @@ class DataPointSeriesRepository(
             aggregates.append(
                 {
                     "activity_date": row.activity_date,
+                    "provider": row.provider,
                     "source": row.source,
                     "device_model": row.device_model,
                     "light_minutes": int(row.light_minutes) if row.light_minutes else 0,

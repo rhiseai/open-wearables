@@ -8,8 +8,18 @@ from fastapi.exceptions import HTTPException, RequestValidationError
 from psycopg.errors import IntegrityError as PsycopgIntegrityError
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
 
+from app.utils.auth_diagnostics import AuthReason
+
 if TYPE_CHECKING:
     from app.services import AppService
+
+
+class SDKAuthenticationError(HTTPException):
+    """SDK credential rejection with an internal, bounded reason."""
+
+    def __init__(self, reason: AuthReason) -> None:
+        self.reason = reason
+        super().__init__(status_code=401, detail="Authentication required: provide SDK token or API key")
 
 
 class UnsupportedProviderError(Exception):

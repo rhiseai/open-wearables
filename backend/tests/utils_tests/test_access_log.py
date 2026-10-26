@@ -5,10 +5,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import Settings, settings
+from app.main import http_exception_handler_with_body_log
 from app.middlewares import add_access_log_middleware
+from app.utils.auth_diagnostics import AuthReason
 from app.utils.config_utils import AccessLogLevel, EnvironmentType
+from app.utils.exceptions import SDKAuthenticationError
 
 
 class TestAccessLogLevelDerivation:
@@ -31,6 +35,15 @@ class TestAccessLogLevelDerivation:
 
 def _build_client(level: AccessLogLevel) -> TestClient:
     app = FastAPI()
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler_with_body_log)
+
+    @app.get("/expired-access-token")
+    async def expired_access_token() -> None:
+        raise SDKAuthenticationError(AuthReason.SDK_TOKEN_EXPIRED)
+
+    @app.get("/ordinary-401")
+    async def ordinary_401() -> None:
+        raise HTTPException(status_code=401, detail="Authentication required: provide SDK token or API key")
 
     @app.get("/ok")
     async def ok() -> dict[str, str]:
@@ -55,6 +68,19 @@ def _logged_statuses(mock: MagicMock) -> list[int]:
 
 
 class TestAccessLogMiddleware:
+    def test_errors_mode_keeps_expiry_as_warning_without_matching_path_or_detail(self) -> None:
+        client = _build_client(AccessLogLevel.ERRORS)
+        with patch("app.middlewares.log_structured") as mock:
+            response = client.get("/expired-access-token")
+            assert response.status_code == 401
+            client.get("/ordinary-401")
+            client.get("/boom")
+        assert _logged_statuses(mock) == [401, 401, 500]
+        assert [call.args[1] for call in mock.call_args_list] == ["warning", "error", "error"]
+        assert mock.call_args_list[0].kwargs["auth_reason"] == "sdk_token_expired"
+        assert "auth_reason" not in mock.call_args_list[1].kwargs
+        assert "auth_reason" not in mock.call_args_list[2].kwargs
+
     def test_all_level_logs_every_status(self) -> None:
         client = _build_client(AccessLogLevel.ALL)
         with patch("app.middlewares.log_structured") as mock:

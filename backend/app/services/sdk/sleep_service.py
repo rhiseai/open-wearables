@@ -135,6 +135,24 @@ def delete_sleep_state(user_id: str, *, storage_key: str | None = None) -> None:
         redis_client.srem(active_users_key(), user_id)
 
 
+def drop_user_sleep_state(user_id: str) -> None:
+    """Forget every in-progress sleep of a deleted user.
+
+    Holds the user's sleep lock so a batch that committed before the deletion
+    publishes its state first and is dropped with the rest.
+    """
+    redis_client = get_redis_client()
+    lock = redis_client.lock(f"sleep:lock:{user_id}", timeout=30, blocking_timeout=SLEEP_LOCK_WAIT_SECONDS)
+    acquired = lock.acquire()
+    try:
+        storage_keys = list(redis_client.smembers(source_states_key(user_id)))
+        redis_client.delete(key(user_id), source_states_key(user_id), *storage_keys)
+        redis_client.srem(active_users_key(), user_id)
+    finally:
+        if acquired:
+            release_sleep_lock(lock, user_id)
+
+
 def prune_sleep_state_registry(user_id: str) -> None:
     """Retire expired cache keys while the caller owns sleep processing."""
     redis_client = get_redis_client()

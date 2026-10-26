@@ -4,6 +4,7 @@ from logging import Logger, getLogger
 from uuid import UUID
 
 from pydantic import ValidationError
+from redis.exceptions import RedisError
 
 from app.database import DbSession
 from app.integrations.celery.tasks.delete_user_webhook_payloads_task import delete_user_webhook_payloads
@@ -24,6 +25,7 @@ from app.schemas.utils import OldPaginatedResponse
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.garmin.backfill_state import force_release_backfill_lock
+from app.services.sdk.sleep_service import drop_user_sleep_state
 from app.services.services import AppService
 from app.services.sync_coordination import release_stale_primary
 from app.services.user_connection_service import user_connection_service
@@ -116,6 +118,17 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
 
         user_id = user.id
         deleted = self.crud.delete(db_session, user)
+        # Left behind, the stale-sleep task retries this user's sleep forever.
+        try:
+            drop_user_sleep_state(str(user_id))
+        except RedisError as e:
+            log_structured(
+                self.logger,
+                "warning",
+                "Failed to drop sleep state on user deletion",
+                user_id=user_id,
+                error=str(e),
+            )
         self._schedule_webhook_payload_deletion(user_id)
         return deleted
 
