@@ -13,6 +13,7 @@ from app.repositories.api_key_repository import ApiKeyRepository
 from app.repositories.developer_repository import DeveloperRepository
 from app.schemas.auth import SDKAuthContext
 from app.utils.auth_diagnostics import AuthOutcome, AuthReason, log_auth_decision
+from app.utils.exceptions import SDKAuthenticationError
 from app.utils.security import hash_api_key
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
@@ -154,10 +155,7 @@ async def get_sdk_auth(
         return SDKAuthContext(auth_type="api_key", api_key_id=str(api_key.id))
 
     log_auth_decision(reason, AuthOutcome.REJECTED)
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required: provide SDK token or API key",
-    )
+    raise SDKAuthenticationError(reason)
 
 
 SDKAuthDep = Annotated[SDKAuthContext, Depends(get_sdk_auth)]

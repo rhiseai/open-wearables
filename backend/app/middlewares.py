@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import settings
 from app.services.endpoint_usage import caller_type, endpoint_usage, route_key
+from app.utils.auth_diagnostics import AuthReason
 from app.utils.config_utils import AccessLogLevel
 from app.utils.sdk_request_metadata import sdk_request_metadata
 from app.utils.structured_logging import log_structured
@@ -99,6 +100,13 @@ def add_access_log_middleware(app: FastAPI) -> None:
             "status": status,
             "duration_ms": duration_ms,
         }
+        auth_reason = getattr(request.state, "sdk_auth_failure_reason", None)
+        if isinstance(auth_reason, AuthReason):
+            attributes["auth_reason"] = auth_reason.value
+        severity = "error" if status >= 400 else "info"
+        if status == 401 and auth_reason is AuthReason.SDK_TOKEN_EXPIRED:
+            # An expired access token is a refresh challenge, not a failed refresh.
+            severity = "warning"
 
         content_length = request.headers.get("content-length")
         if content_length is not None:
@@ -138,7 +146,7 @@ def add_access_log_middleware(app: FastAPI) -> None:
             attributes["traceback"] = formatted_traceback
         # a logging failure must never break request handling
         with contextlib.suppress(Exception):
-            log_structured(logger, "error" if status >= 400 else "info", "http_request", **attributes)
+            log_structured(logger, severity, "http_request", **attributes)
 
     @app.middleware("http")
     async def access_log(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:

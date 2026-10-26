@@ -1,4 +1,5 @@
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -12,6 +13,9 @@ class SourceMetadata(BaseModel):
     # HealthKit/Health Connect data ("Connect", "Zepp Life"), or the provider key
     # itself for native API integrations.
     provider: str = Field(..., example="apple")
+    data_source_id: UUID | None = Field(
+        None, description="OW source identity for requesting the same source’s detailed sleep sessions."
+    )
     source: str | None = Field(None, example="Connect")
     device: str | None = Field(None, example="iPhone15,2")
     device_type: DeviceType | None = Field(None, example="phone")

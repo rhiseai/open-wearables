@@ -16,7 +16,7 @@
 	}: { session: SleepSession; providerLabel: string; ondelete: () => void } = $props();
 </script>
 
-<EventCard icon={sleepIcon(session)} source={session.source} {providerLabel}>
+<EventCard icon={sleepIcon(session)} source={session.source} {providerLabel} showSourceApp>
 	{#snippet title()}
 		<span class={HEADING}>{sleepKind(session)}</span>
 	{/snippet}
