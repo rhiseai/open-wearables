@@ -1,8 +1,10 @@
 """Reconnecting WHOOP to a different account drops the previous account's data (RHISE-6353)."""
 
+from uuid import UUID
+
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, HealthScore, UserConnection
+from app.models import DataSource, EventRecord, HealthScore, User, UserConnection
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import OAuthState, OAuthTokenResponse
 from app.services.providers.whoop.strategy import WhoopStrategy
@@ -15,7 +17,7 @@ from tests.factories import (
 )
 
 
-def _reconnect(db: Session, user_id, whoop_user_id: int) -> None:
+def _reconnect(db: Session, user_id: UUID, whoop_user_id: int) -> None:
     oauth = WhoopStrategy().oauth
     assert oauth
     token = OAuthTokenResponse(
@@ -31,7 +33,7 @@ def _reconnect(db: Session, user_id, whoop_user_id: int) -> None:
     )
 
 
-def _seed_whoop_data(db: Session, user) -> DataSource:
+def _seed_whoop_data(db: Session, user: User) -> DataSource:
     data_source = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_model=None)
     EventRecordFactory(data_source=data_source, category="sleep", type_="sleep_session", source_name="whoop")
     HealthScoreFactory(data_source=data_source, provider=ProviderName.WHOOP)
