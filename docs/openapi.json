@@ -1139,7 +1139,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1147,7 +1147,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -1155,7 +1155,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1163,7 +1163,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "cursor",
@@ -1284,7 +1284,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1292,7 +1292,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -1300,7 +1300,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1308,7 +1308,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "X-Open-Wearables-API-Key",
@@ -1381,7 +1381,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1389,7 +1389,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -1397,7 +1397,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1405,7 +1405,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "cursor",
@@ -1515,7 +1515,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1523,7 +1523,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -1531,7 +1531,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -1539,7 +1539,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "cursor",
@@ -1743,7 +1743,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"
@@ -1765,7 +1765,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"
@@ -1852,7 +1852,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"
@@ -1874,7 +1874,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"
@@ -1997,7 +1997,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2005,7 +2005,7 @@
               "format": "date-time",
               "title": "Start Time"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_time",
@@ -2013,7 +2013,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2021,7 +2021,7 @@
               "format": "date-time",
               "title": "End Time"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "types",
@@ -2219,7 +2219,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2227,7 +2227,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -2235,7 +2235,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2243,7 +2243,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "include",
@@ -2524,7 +2524,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2532,7 +2532,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -2540,7 +2540,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2548,7 +2548,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "record_type",
@@ -2720,7 +2720,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2728,7 +2728,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -2736,7 +2736,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2744,7 +2744,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "include",
@@ -2952,7 +2952,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2960,7 +2960,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -2968,7 +2968,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -2976,7 +2976,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "provider",
@@ -3144,7 +3144,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -3152,7 +3152,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -3160,7 +3160,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -3168,7 +3168,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "cursor",
@@ -3334,7 +3334,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -3342,7 +3342,7 @@
               "format": "date-time",
               "title": "Start Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "end_date",
@@ -3350,7 +3350,7 @@
             "required": true,
             "schema": {
               "type": "string",
-              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+              "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
               "examples": [
                 "2023-11-07T05:31:56Z",
                 "2023-11-07"
@@ -3358,7 +3358,7 @@
               "format": "date-time",
               "title": "End Date"
             },
-            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days."
+            "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC."
           },
           {
             "name": "cursor",
@@ -3798,7 +3798,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"
@@ -3820,7 +3820,7 @@
               "anyOf": [
                 {
                   "type": "string",
-                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days.",
+                  "description": "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, so a date-only range includes both boundary days. A value without an offset is read as UTC.",
                   "examples": [
                     "2023-11-07T05:31:56Z",
                     "2023-11-07"

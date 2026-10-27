@@ -11,7 +11,7 @@ Tests cover:
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
@@ -20,6 +20,7 @@ from app.models import HealthScore
 from app.repositories.health_score_repository import HealthScoreRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
+from app.schemas.model_crud.activities.health_score import ScoreComponent
 from tests.factories import DataSourceFactory, HealthScoreFactory, UserFactory
 
 
@@ -230,3 +231,134 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
         assert results[0].value == Decimal("80.00")
+
+
+class TestHealthScoreRepositoryProviderDailyUpsert:
+    DAY = datetime(2026, 10, 21, tzinfo=timezone.utc)
+
+    def _score(self, user_id: UUID, value: int = 61) -> HealthScoreCreate:
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.OURA,
+            category=HealthScoreCategory.SLEEP,
+            value=value,
+            recorded_at=self.DAY,
+            components={"deep_sleep": ScoreComponent(value=40), "restfulness": ScoreComponent(value=30)},
+        )
+
+    def test_rescore_retains_identity_and_replaces_components(self, db: Session, repo: HealthScoreRepository) -> None:
+        user = UserFactory()
+        original = self._score(user.id)
+        counts, created = repo.bulk_upsert_provider_daily_scores(db, [original])
+        db.commit()
+        stored = created[0]
+        created_at = stored.created_at
+
+        assert (counts.inserted, counts.updated) == (1, 0)
+        revised = self._score(user.id, 75).model_copy(update={"components": {"deep_sleep": ScoreComponent(value=80)}})
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [revised])
+
+        assert (counts.inserted, counts.updated) == (0, 1)
+        assert changed == [stored]
+        assert stored.id == original.id
+        assert stored.created_at == created_at
+        assert stored.value == Decimal("75.000")
+        assert stored.components == {"deep_sleep": {"value": 80, "qualifier": None}}
+        assert db.query(HealthScore).filter(HealthScore.user_id == user.id).count() == 1
+
+    def test_components_only_change_and_clear_are_updates(self, db: Session, repo: HealthScoreRepository) -> None:
+        score = self._score(UserFactory().id)
+        repo.bulk_upsert_provider_daily_scores(db, [score])
+        replacement = score.model_copy(update={"components": {"deep_sleep": ScoreComponent(value=90)}})
+
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [replacement])
+
+        assert (counts.inserted, counts.updated) == (0, 1)
+        assert changed[0].value == 61
+        assert changed[0].components == {"deep_sleep": {"value": 90, "qualifier": None}}
+
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [score.model_copy(update={"components": None})])
+
+        assert (counts.inserted, counts.updated) == (0, 1)
+        assert changed[0].components is None
+
+    def test_identical_replay_writes_nothing(self, db: Session, repo: HealthScoreRepository) -> None:
+        score = self._score(UserFactory().id)
+        repo.bulk_upsert_provider_daily_scores(db, [score])
+        db.commit()
+
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [score.model_copy(update={"id": uuid4()})])
+
+        assert (counts.inserted, counts.updated) == (0, 0)
+        assert changed == []
+
+    def test_empty_batch_writes_nothing(self, db: Session, repo: HealthScoreRepository) -> None:
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [])
+
+        assert (counts.inserted, counts.updated) == (0, 0)
+        assert changed == []
+
+    def test_duplicate_batch_key_uses_last_value(self, db: Session, repo: HealthScoreRepository) -> None:
+        user_id = UserFactory().id
+        first, last = self._score(user_id), self._score(user_id, 75)
+
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [first, last])
+
+        assert (counts.inserted, counts.updated) == (1, 0)
+        assert len(changed) == 1
+        assert changed[0].id == last.id
+        assert changed[0].value == 75
+
+        first, last = self._score(user_id, 85), self._score(user_id, 61)
+        counts, changed = repo.bulk_upsert_provider_daily_scores(db, [first, last])
+
+        assert (counts.inserted, counts.updated) == (0, 1)
+        assert len(changed) == 1
+        assert changed[0].value == 61
+
+    def test_unique_key_scopes_updates_and_counts(self, db: Session, repo: HealthScoreRepository) -> None:
+        original = self._score(UserFactory().id)
+        other_user = self._score(UserFactory().id)
+        other_provider = original.model_copy(update={"id": uuid4(), "provider": ProviderName.WHOOP})
+        other_category = original.model_copy(update={"id": uuid4(), "category": HealthScoreCategory.RECOVERY})
+        other_day = original.model_copy(update={"id": uuid4(), "recorded_at": self.DAY + timedelta(days=1)})
+        originals = [original, other_user, other_provider, other_category, other_day]
+        counts, _ = repo.bulk_upsert_provider_daily_scores(db, originals)
+
+        assert (counts.inserted, counts.updated) == (5, 0)
+        new_day = original.model_copy(update={"id": uuid4(), "recorded_at": self.DAY + timedelta(days=2)})
+        counts, changed = repo.bulk_upsert_provider_daily_scores(
+            db, [original.model_copy(update={"id": uuid4(), "value": 75}), other_day, new_day]
+        )
+
+        assert (counts.inserted, counts.updated) == (1, 1)
+        assert {row.id for row in changed} == {original.id, new_day.id}
+        for score in originals[1:]:
+            assert db.get(HealthScore, score.id).value == 61
+
+    def test_caller_can_roll_back_rescore_and_insert(self, db: Session, repo: HealthScoreRepository) -> None:
+        score = self._score(UserFactory().id)
+        repo.bulk_upsert_provider_daily_scores(db, [score])
+        db.commit()
+        new_day = score.model_copy(update={"id": uuid4(), "recorded_at": self.DAY + timedelta(days=1)})
+
+        repo.bulk_upsert_provider_daily_scores(db, [score.model_copy(update={"value": 75}), new_day])
+        db.rollback()
+
+        assert db.get(HealthScore, score.id).value == 61
+        assert db.get(HealthScore, new_day.id) is None
+
+    @pytest.mark.parametrize("invalid_kind", ["internal", "event_linked"])
+    def test_rejects_other_score_kinds_before_writing(
+        self, db: Session, repo: HealthScoreRepository, invalid_kind: str
+    ) -> None:
+        valid = self._score(UserFactory().id)
+        invalid = valid.model_copy(
+            update={"provider": ProviderName.INTERNAL} if invalid_kind == "internal" else {"event_record_id": uuid4()}
+        )
+
+        with pytest.raises(ValueError, match="Daily score upserts require provider scores without an event record"):
+            repo.bulk_upsert_provider_daily_scores(db, [valid, invalid])
+
+        assert db.get(HealthScore, valid.id) is None

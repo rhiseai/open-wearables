@@ -11,7 +11,7 @@ from app.utils.exceptions import DatetimeParseError
 _DATE_PARAM_DESCRIPTION = (
     "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. "
     "Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, "
-    "so a date-only range includes both boundary days."
+    "so a date-only range includes both boundary days. A value without an offset is read as UTC."
 )
 
 _DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -46,7 +46,11 @@ ZoneOffset = Annotated[
 
 
 def parse_query_datetime(dt_str: str) -> datetime:
-    """Parse datetime from ISO string or Unix timestamp (seconds).
+    """Parse datetime from ISO string or Unix timestamp (seconds), always timezone-aware.
+
+    An ISO value without an offset, date-only included, is read as UTC, the way the
+    `timestamptz` columns already compare it; an explicit offset is kept. A naive bound
+    would raise against the aware timestamps and cursors it is compared with.
 
     Raises:
         DatetimeParseError: If the string is not a valid ISO 8601 datetime or Unix timestamp.
@@ -61,19 +65,20 @@ def parse_query_datetime(dt_str: str) -> datetime:
         pass
 
     try:
-        return datetime.fromisoformat(dt_str)
+        parsed = datetime.fromisoformat(dt_str)
     except ValueError:
         raise DatetimeParseError(dt_str)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def parse_query_end_datetime(dt_str: str) -> datetime:
-    """Parse an end-of-range bound. A date-only string spans that whole day.
+    """Parse an end-of-range bound. A date-only string spans that whole (UTC) day.
 
     Bounds are compared with `<`, so a date-only end resolves to the start of the next day.
     """
     if _DATE_ONLY_RE.fullmatch(dt_str):
         with suppress(ValueError, OverflowError):
-            return datetime.combine(date.fromisoformat(dt_str) + timedelta(days=1), time.min)
+            return datetime.combine(date.fromisoformat(dt_str) + timedelta(days=1), time.min, tzinfo=timezone.utc)
     return parse_query_datetime(dt_str)
 
 

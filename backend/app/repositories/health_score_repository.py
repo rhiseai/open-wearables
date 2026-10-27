@@ -3,7 +3,7 @@ from typing import Any
 from typing import cast as typing_cast
 from uuid import UUID
 
-from sqlalchemy import Date, and_, asc, cast, desc, func, select, tuple_
+from sqlalchemy import Date, and_, asc, cast, desc, func, literal_column, or_, select, tuple_
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -65,6 +65,39 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         inserted = len(db_session.execute(stmt).scalars().all())
         # Caller is responsible for commit — allows batching with other operations
         return WriteCounts(inserted, 0)
+
+    def bulk_upsert_provider_daily_scores(
+        self, db_session: DbSession, creators: list[HealthScoreCreate]
+    ) -> tuple[WriteCounts, list[HealthScore]]:
+        """Replace provider daily scores and return only rows actually changed.
+
+        Daily provider values are snapshots that can be rescored. Internal and
+        event-linked scores keep their existing create-only path. The last item
+        for each daily identity wins within a batch; sorting those identities
+        keeps concurrent writers' row-lock order consistent. The caller owns
+        the transaction and may queue change notifications before committing.
+        """
+        if not creators:
+            return WriteCounts(0, 0), []
+
+        daily_scores: dict[tuple[UUID, ProviderName, HealthScoreCategory, datetime], HealthScoreCreate] = {}
+        for creator in creators:
+            if creator.provider == ProviderName.INTERNAL or creator.event_record_id is not None:
+                raise ValueError("Daily score upserts require provider scores without an event record")
+            daily_scores[(creator.user_id, creator.provider, creator.category, creator.recorded_at)] = creator
+
+        stmt = insert(HealthScore).values([daily_scores[key].model_dump() for key in sorted(daily_scores)])
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_category_time",
+            set_={"value": stmt.excluded.value, "components": stmt.excluded.components},
+            where=or_(
+                HealthScore.value.is_distinct_from(stmt.excluded.value),
+                HealthScore.components.is_distinct_from(stmt.excluded.components),
+            ),
+        ).returning(HealthScore, literal_column("xmax = 0").label("is_inserted"))
+        rows = db_session.execute(stmt, execution_options={"populate_existing": True}).all()
+        inserted = sum(bool(is_inserted) for _, is_inserted in rows)
+        return WriteCounts(inserted, len(rows) - inserted), [score for score, _ in rows]
 
     def get_latest_by_category(
         self,

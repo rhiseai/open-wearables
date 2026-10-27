@@ -19,6 +19,16 @@ class TestParseQueryDatetime:
         result = parse_query_datetime("2024-01-01T00:00:00+00:00")
         assert result == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
+    @pytest.mark.parametrize("value", ["2024-01-01", "2024-01-01T00:00:00"])
+    def test_value_without_offset_is_read_as_utc(self, value: str) -> None:
+        result = parse_query_datetime(value)
+        assert result.tzinfo is not None
+        assert result == datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_explicit_offset_is_kept(self) -> None:
+        result = parse_query_datetime("2024-01-01T00:00:00+02:00")
+        assert result.utcoffset() == timedelta(hours=2)
+
     def test_invalid_format_raises_error(self) -> None:
         with pytest.raises(DatetimeParseError) as exc_info:
             parse_query_datetime("invalid")
@@ -58,12 +68,13 @@ class TestParseQueryEndDatetime:
 
     def test_date_only_spans_the_whole_day(self) -> None:
         result = parse_query_end_datetime("2024-01-01")
-        assert result == datetime(2024, 1, 2)
+        assert result.tzinfo is not None
+        assert result == datetime(2024, 1, 2, tzinfo=timezone.utc)
 
     def test_single_day_range_covers_the_whole_day(self) -> None:
         start = parse_query_datetime("2024-01-01")
         end = parse_query_end_datetime("2024-01-01")
-        last_moment = datetime(2024, 1, 1, 23, 59, 59, 999999)
+        last_moment = datetime(2024, 1, 1, 23, 59, 59, 999999, tzinfo=timezone.utc)
         assert start <= last_moment < end
 
     def test_full_iso_datetime_passes_through(self) -> None:
@@ -83,7 +94,7 @@ class TestParseQueryEndDatetime:
             parse_query_end_datetime("2024-02-30")
 
     def test_max_date_falls_back_to_midnight(self) -> None:
-        assert parse_query_end_datetime("9999-12-31") == datetime(9999, 12, 31)
+        assert parse_query_end_datetime("9999-12-31") == datetime(9999, 12, 31, tzinfo=timezone.utc)
 
 
 class TestAlignTzAwareness:

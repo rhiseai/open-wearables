@@ -876,6 +876,47 @@ class TestActivitySummaryEndpoint:
         assert data["data"][1]["date"] == "2025-12-27"
         assert data["data"][1]["steps"] == 7500
 
+    @pytest.mark.parametrize("sort_order", ["asc", "desc"])
+    @pytest.mark.parametrize("source_selection", ["priority", "per_provider"])
+    def test_pages_a_date_only_range(
+        self, client: TestClient, db: Session, sort_order: str, source_selection: str
+    ) -> None:
+        """Paging a range given as bare dates, as Lucie sends it, returns what one big page does."""
+        user = UserFactory()
+        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, device_type="watch")
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, device_type="ring")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        for day in range(1, 8):
+            for data_source in (watch, ring):
+                DataPointSeriesFactory(
+                    mapping=data_source,
+                    series_type=steps_type,
+                    value=Decimal("1000"),
+                    recorded_at=datetime(2025, 12, day, 12, 0, 0, tzinfo=timezone.utc),
+                )
+        headers = api_key_headers(ApiKeyFactory().plain_key)
+        url = f"/api/v1/users/{user.id}/summaries/activity"
+        params = {
+            "start_date": "2025-12-01",
+            "end_date": "2025-12-31",
+            "sort_order": sort_order,
+            "source_selection": source_selection,
+        }
+
+        everything = client.get(url, headers=headers, params={**params, "limit": 50}).json()["data"]
+        paged: list[dict] = []
+        page_params: dict[str, str | int] = {**params, "limit": 2}
+        while True:
+            page = client.get(url, headers=headers, params=page_params)
+            assert page.status_code == 200
+            paged += page.json()["data"]
+            if not page.json()["pagination"]["has_more"]:
+                break
+            page_params["cursor"] = page.json()["pagination"]["next_cursor"]
+
+        assert len(everything) == (7 if source_selection == "priority" else 14)
+        assert paged == everything
+
     def test_get_activity_summary_with_elevation(self, client: TestClient, db: Session) -> None:
         """Test activity summary includes elevation from workouts."""
         user = UserFactory()
