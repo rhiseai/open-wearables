@@ -134,12 +134,16 @@ class TimeSeriesService(
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
     ) -> WriteCounts:
         counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
-        samples_copy = list(samples)
+        # A once-listener stays registered, closure and all, for the session's lifetime, so
+        # the listener takes the samples out of this list when it fires. Captured directly,
+        # every write of a long sync would stay in memory until its task ends.
+        pending = [list(samples)]
         # Read here, not in the thread: a ContextVar does not cross into one.
         sync = current_sync_payload()
 
         @sa_event.listens_for(db_session, "after_commit", once=True)
         def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
+            samples_copy = pending.pop()
             if not svix_service.is_enabled():
                 return
             # Context variables do not propagate to a new thread. Keep SDK writes

@@ -1,15 +1,19 @@
 """Tests for Polar247Data normalization."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
 
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import HealthScoreCategory, SeriesType
 from app.services.providers.polar.data_247 import Polar247Data
 from app.services.providers.polar.strategy import PolarStrategy
+from tests.factories import UserFactory
 
 
 @pytest.fixture
@@ -658,3 +662,78 @@ class TestPolar247HypnogramParsing:
         start = datetime(2024, 1, 15, 23, 0, tzinfo=timezone.utc)
         end = datetime(2024, 1, 16, 7, 0, tzinfo=timezone.utc)
         assert data_247._parse_hypnogram({}, start, end) == []
+
+
+# ---------------------------------------------------------------------------
+# Historical sync: one request window at a time
+# ---------------------------------------------------------------------------
+
+
+class TestPolar247BackfillWindows:
+    """A 90-day backfill is saved and committed per request window, so memory holds one window."""
+
+    START = datetime(2026, 8, 2, tzinfo=timezone.utc)
+    END = datetime(2026, 10, 31, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _hr_window(params: dict[str, str]) -> dict[str, Any]:
+        day, last = date.fromisoformat(params["from"]), date.fromisoformat(params["to"])
+        days = []
+        while day <= last:
+            days.append(
+                {
+                    "polar_user": "https://www.polaraccesslink.com/v3/users/1",
+                    "date": day.isoformat(),
+                    "heart_rate_samples": [{"heart_rate": 60, "sample_time": "08:00"}],
+                }
+            )
+            day += timedelta(days=1)
+        return {"heart_rates": days}
+
+    def _sync(self, db: Session, fail_on_window: int | None = None) -> tuple[Any, list[str]]:
+        user = UserFactory()
+        events: list[str] = []
+        hr_requests = 0
+
+        def fake_request(_self: Polar247Data, _db: Any, _user_id: Any, endpoint: str, params: Any = None) -> Any:
+            nonlocal hr_requests
+            if endpoint != "/v3/users/continuous-heart-rate":
+                return None
+            hr_requests += 1
+            events.append(f"fetch {params['from']}")
+            if hr_requests == fail_on_window:
+                raise HTTPException(status_code=502, detail="Polar unavailable")
+            return self._hr_window(params)
+
+        original_commit = db.commit
+
+        def recording_commit() -> None:
+            events.append("commit")
+            original_commit()
+
+        data_247 = PolarStrategy().data_247
+        assert isinstance(data_247, Polar247Data)
+        with (
+            patch.object(Polar247Data, "_make_api_request", fake_request),
+            patch.object(db, "commit", recording_commit),
+        ):
+            result = data_247.load_and_save_all(db, UUID(str(user.id)), self.START, self.END, is_first_sync=True)
+        return result, events
+
+    def test_each_window_is_committed_before_the_next_is_fetched(self, db: Session) -> None:
+        result, events = self._sync(db)
+
+        hr_events = events[events.index("fetch 2026-08-02") :]
+        fetches = [e for e in hr_events if e.startswith("fetch")]
+        assert fetches == ["fetch 2026-08-02", "fetch 2026-08-30", "fetch 2026-09-27", "fetch 2026-10-25"]
+        for fetch in fetches[1:]:
+            assert hr_events[hr_events.index(fetch) - 1] == "commit"
+        assert result.outcomes["continuous_hr"].rows_written == 91
+
+    def test_a_failed_window_keeps_the_windows_before_it_and_stops_the_type(self, db: Session) -> None:
+        result, events = self._sync(db, fail_on_window=2)
+
+        assert [e for e in events if e.startswith("fetch")] == ["fetch 2026-08-02", "fetch 2026-08-30"]
+        outcome = result.outcomes["continuous_hr"]
+        assert outcome.rows_written == 28
+        assert outcome.error_codes
