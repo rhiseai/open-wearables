@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, TypeVar
@@ -66,6 +66,21 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 _T = TypeVar("_T", bound=BaseModel)
+
+# Polar's range endpoints accept at most 28 days per request.
+_MAX_REQUEST_SPAN = timedelta(days=27)
+
+# Saves one data type for one window (from, to) and reports the rows it wrote.
+_WindowSave = Callable[[datetime, datetime], WriteCounts | int]
+
+
+def _request_windows(start: datetime, end: datetime) -> Iterator[tuple[datetime, datetime]]:
+    """The windows a range endpoint is fetched in, one request each."""
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + _MAX_REQUEST_SPAN, end)
+        yield chunk_start, chunk_end
+        chunk_start = chunk_end + timedelta(days=1)
 
 
 def _expand_repeated_steps(points: list[tuple[datetime, int]], interval: timedelta) -> dict[datetime, int]:
@@ -334,11 +349,8 @@ class Polar247Data(Base247DataTemplate):
         start_date: datetime,
         end_date: datetime,
     ) -> list[dict[str, Any]]:
-        # Polar enforces a max 28-day window per request
         results: list[dict[str, Any]] = []
-        chunk_start = start_date
-        while chunk_start < end_date:
-            chunk_end = min(chunk_start + timedelta(days=27), end_date)
+        for chunk_start, chunk_end in _request_windows(start_date, end_date):
             params = {
                 "from": chunk_start.date().isoformat(),
                 "to": chunk_end.date().isoformat(),
@@ -348,7 +360,6 @@ class Polar247Data(Base247DataTemplate):
             }
             response = self._make_api_request(db, user_id, "/v3/users/activities", params=params)
             results.extend(response or [])
-            chunk_start = chunk_end + timedelta(days=1)
         return results
 
     def normalize_daily_activity(
@@ -431,13 +442,10 @@ class Polar247Data(Base247DataTemplate):
         end_time: datetime,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        chunk_start = start_time
-        while chunk_start < end_time:
-            chunk_end = min(chunk_start + timedelta(days=27), end_time)
+        for chunk_start, chunk_end in _request_windows(start_time, end_time):
             params = {"from": chunk_start.date().isoformat(), "to": chunk_end.date().isoformat()}
             response = self._make_api_request(db, user_id, "/v3/users/continuous-heart-rate", params=params)
             results.extend((response or {}).get("heart_rates", []))
-            chunk_start = chunk_end + timedelta(days=1)
         return results
 
     def normalize_continuous_hr(
@@ -479,13 +487,10 @@ class Polar247Data(Base247DataTemplate):
         end_time: datetime,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
-        chunk_start = start_time
-        while chunk_start < end_time:
-            chunk_end = min(chunk_start + timedelta(days=27), end_time)
+        for chunk_start, chunk_end in _request_windows(start_time, end_time):
             params = {"from": chunk_start.date().isoformat(), "to": chunk_end.date().isoformat()}
             response = self._make_api_request(db, user_id, "/v3/users/cardio-load/date", params=params)
             results.extend(response or [])
-            chunk_start = chunk_end + timedelta(days=1)
         return results
 
     def normalize_cardio_load(
@@ -1071,55 +1076,82 @@ class Polar247Data(Base247DataTemplate):
     ) -> Sync247Result:
         start_time, end_time = self.resolve_window(start_time, end_time)
 
-        tasks: dict[str, Callable[[], WriteCounts | int]] = {
-            "sleep": lambda: self._save_sleep(db, user_id, start_time, end_time),
-            "daily_activity": lambda: self._save_timeseries(
-                db,
-                self.normalize_daily_activity(
-                    self.get_daily_activity_statistics(db, user_id, start_time, end_time), user_id
+        # The range endpoints are saved one request window at a time, each committed before
+        # the next is fetched: a 90-day backfill of continuous heart rate held whole runs to
+        # hundreds of thousands of rows and gigabytes of memory.
+        windows = list(_request_windows(start_time, end_time))
+        whole = [(start_time, end_time)]
+        tasks: dict[str, tuple[list[tuple[datetime, datetime]], _WindowSave]] = {
+            "sleep": (whole, lambda frm, to: self._save_sleep(db, user_id, frm, to)),
+            "daily_activity": (
+                windows,
+                lambda frm, to: self._save_timeseries(
+                    db, self.normalize_daily_activity(self.get_daily_activity_statistics(db, user_id, frm, to), user_id)
                 ),
             ),
-            "continuous_hr": lambda: self._save_timeseries(
-                db,
-                self.normalize_continuous_hr(self.get_continuous_hr_data(db, user_id, start_time, end_time), user_id),
-            ),
-            "cardio_load": lambda: self._save_scores(
-                db, self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, start_time, end_time), user_id)
-            ),
-            "nightly_recharge": lambda: self._save_nightly_recharge(db, user_id, start_time, end_time),
-            "alertness": lambda: self._save_scores(
-                db, self.normalize_alertness(self.get_alertness_data(db, user_id, start_time, end_time), user_id)
-            ),
-            "circadian_bedtime": lambda: self._save_scores(
-                db,
-                self.normalize_circadian_bedtime(
-                    self.get_circadian_bedtime_data(db, user_id, start_time, end_time), user_id
+            "continuous_hr": (
+                windows,
+                lambda frm, to: self._save_timeseries(
+                    db, self.normalize_continuous_hr(self.get_continuous_hr_data(db, user_id, frm, to), user_id)
                 ),
             ),
-            "body_temperature": lambda: self._save_timeseries(
-                db,
-                self.normalize_body_temperature(
-                    self.get_body_temperature_data(db, user_id, start_time, end_time), user_id
+            "cardio_load": (
+                windows,
+                lambda frm, to: self._save_scores(
+                    db, self.normalize_cardio_load(self.get_cardio_load_data(db, user_id, frm, to), user_id)
                 ),
             ),
-            "sleep_skin_temperature": lambda: self._save_timeseries(
-                db,
-                self.normalize_sleep_skin_temperature(
-                    self.get_sleep_skin_temperature_data(db, user_id, start_time, end_time), user_id
+            "nightly_recharge": (whole, lambda frm, to: self._save_nightly_recharge(db, user_id, frm, to)),
+            "alertness": (
+                whole,
+                lambda frm, to: self._save_scores(
+                    db, self.normalize_alertness(self.get_alertness_data(db, user_id, frm, to), user_id)
                 ),
             ),
-            "spo2": lambda: self._save_timeseries(
-                db, self.normalize_spo2(self.get_spo2_data(db, user_id, start_time, end_time), user_id)
+            "circadian_bedtime": (
+                whole,
+                lambda frm, to: self._save_scores(
+                    db, self.normalize_circadian_bedtime(self.get_circadian_bedtime_data(db, user_id, frm, to), user_id)
+                ),
             ),
-            "wrist_ecg": lambda: self._save_timeseries(
-                db, self.normalize_wrist_ecg(self.get_wrist_ecg_data(db, user_id, start_time, end_time), user_id)
+            "body_temperature": (
+                whole,
+                lambda frm, to: self._save_timeseries(
+                    db, self.normalize_body_temperature(self.get_body_temperature_data(db, user_id, frm, to), user_id)
+                ),
+            ),
+            "sleep_skin_temperature": (
+                whole,
+                lambda frm, to: self._save_timeseries(
+                    db,
+                    self.normalize_sleep_skin_temperature(
+                        self.get_sleep_skin_temperature_data(db, user_id, frm, to), user_id
+                    ),
+                ),
+            ),
+            "spo2": (
+                whole,
+                lambda frm, to: self._save_timeseries(
+                    db, self.normalize_spo2(self.get_spo2_data(db, user_id, frm, to), user_id)
+                ),
+            ),
+            "wrist_ecg": (
+                whole,
+                lambda frm, to: self._save_timeseries(
+                    db, self.normalize_wrist_ecg(self.get_wrist_ecg_data(db, user_id, frm, to), user_id)
+                ),
             ),
         }
 
         run = self.sync_run(db, user_id)
-        for data_type, fn in tasks.items():
-            with run.step(data_type, commit=True, capture=True) as step:
-                step.record(fn())
+        run.expect(*tasks)
+        for data_type, (spans, save) in tasks.items():
+            for frm, to in spans:
+                with run.step(data_type, accumulate=True, commit=True, capture=True) as step:
+                    step.record(save(frm, to))
+                # A failed window ends the type, as it did when the whole window was one write.
+                if data_type in run.result.failures:
+                    break
 
         run.log_summary()
         return run.result
