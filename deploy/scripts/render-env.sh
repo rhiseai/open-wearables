@@ -51,6 +51,8 @@ ADMIN_EMAIL                       admin/email                                req
 ADMIN_PASSWORD                    admin/password                             required
 SENTRY_DSN                        core/sentry-dsn                            optional
 RESEND_API_KEY                    core/resend-api-key                        optional
+GOOGLE_CLIENT_ID                  providers/google-client-id                 required
+GOOGLE_CLIENT_SECRET              providers/google-client-secret             required
 GARMIN_CLIENT_ID                  providers/garmin-client-id                 optional
 GARMIN_CLIENT_SECRET              providers/garmin-client-secret             optional
 OURA_CLIENT_ID                    providers/oura-client-id                   required
