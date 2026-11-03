@@ -15,8 +15,11 @@ Provision these secrets before deploying a renderer that requires them:
 | `lucie-staging/ow/providers/google-client-id` | `GOOGLE_CLIENT_ID` |
 | `lucie-staging/ow/providers/google-client-secret` | `GOOGLE_CLIENT_SECRET` |
 
-Use a web application OAuth client in a non-production Google Cloud project with
-the Google Health API enabled and the read scopes described in the
+Staging uses the existing `Web App` OAuth client in the `Lucie`
+(`lucie-465111`) Google Cloud project. Its credentials are already stored for
+Lucie's Google integrations; provision the same client ID and client secret in
+the two OpenWearables entries above. The project needs the Google Health API
+enabled and the read scopes described in the
 [Google Health integration guide](../../docs/providers/google-api-integration.mdx).
 Register this exact authorized redirect URI for the current staging configuration:
 
