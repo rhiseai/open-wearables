@@ -977,10 +977,13 @@ class Polar247Data(Base247DataTemplate):
         user_id: UUID,
         event_type: PolarWebhookEventType | str,
         path: str,
+        params: dict[str, str] | None = None,
     ) -> dict[str, int]:
-        """Fetch a single entity from the webhook URL path and save it. Used by webhook handler."""
-        params = {"activity_zones": "true"} if event_type == PolarWebhookEventType.ACTIVITY_SUMMARY else None
-        raw = self._make_api_request(db, user_id, path, params=params)
+        """Fetch the webhook entity or SleepWise range using the URL's query parameters."""
+        request_params = dict(params or {})
+        if event_type == PolarWebhookEventType.ACTIVITY_SUMMARY:
+            request_params["activity_zones"] = "true"
+        raw = self._make_api_request(db, user_id, path, params=request_params or None)
         if not raw:
             return {}
 
@@ -1001,10 +1004,10 @@ class Polar247Data(Base247DataTemplate):
                 return {"continuous_hr": self._save_timeseries(db, self.normalize_continuous_hr([raw], user_id))}
 
             case PolarWebhookEventType.SLEEP_WISE_ALERTNESS:
-                return {"alertness": self._save_scores(db, self.normalize_alertness([raw], user_id))}
+                return {"alertness": self._save_scores(db, self.normalize_alertness(raw, user_id))}
 
             case PolarWebhookEventType.SLEEP_WISE_CIRCADIAN_BEDTIME:
-                return {"circadian_bedtime": self._save_scores(db, self.normalize_circadian_bedtime([raw], user_id))}
+                return {"circadian_bedtime": self._save_scores(db, self.normalize_circadian_bedtime(raw, user_id))}
 
             case _:
                 log_structured(
