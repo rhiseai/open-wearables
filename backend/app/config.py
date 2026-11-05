@@ -248,8 +248,7 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
         "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly "
         "https://www.googleapis.com/auth/googlehealth.nutrition.readonly "
-        "https://www.googleapis.com/auth/googlehealth.sleep.readonly "
-        "https://www.googleapis.com/auth/googlehealth.settings.readonly"
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly"
     )
     # Bearer secret Google echoes in the Authorization header of every webhook
     # notification. Defaults to secret_key (see derive_google_webhook_secret).
