@@ -18,6 +18,11 @@ def refresh_token(
     a new access token of the same type. Implements refresh token rotation:
     the old refresh token is revoked and a new one is issued.
 
+    A token that rotation revoked can be presented again, for a client that
+    never read the response: it returns the same new refresh token with a fresh
+    access token, until that refresh token is used or revoked or the replay
+    window (`REFRESH_TOKEN_REPLAY_WINDOW_SECONDS`, 7 days by default) ends.
+
     Args:
         payload: Request containing the refresh token
         db: Database session
@@ -26,7 +31,7 @@ def refresh_token(
         TokenResponse with new access token and new refresh token
 
     Raises:
-        401: If the refresh token is invalid or revoked
+        401: If the refresh token is invalid, revoked, or rotated outside its replay window
     """
     return refresh_token_service.refresh_token(db, payload.refresh_token)
 

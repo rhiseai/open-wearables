@@ -144,12 +144,12 @@ With `LOG_FORMAT=json`, SDK credential failures, SDK subject mismatches, and ref
 | Field | Values |
 |-------|--------|
 | `auth_boundary` | `sdk_credentials`, `sdk_subject`, `refresh` |
-| `auth_reason` | `credentials_missing`, `sdk_token_expired`, `sdk_token_invalid`, `sdk_token_wrong_scope`, `api_key_invalid`, `subject_mismatch`, `refresh_invalid_or_revoked`, `refresh_rotated` |
+| `auth_reason` | `credentials_missing`, `sdk_token_expired`, `sdk_token_invalid`, `sdk_token_wrong_scope`, `api_key_invalid`, `subject_mismatch`, `refresh_invalid_or_revoked`, `refresh_rotated`, `refresh_replayed` |
 | `auth_outcome` | `rejected`, `recovered`, `accepted` |
 
 `rejected` is a warning at the boundary that refuses the request. When a rejected Bearer token is followed by a valid API key in the same request, one `recovered` info event records the Bearer reason. A valid SDK token takes precedence over the API-key header. Ordinary successful SDK-token and API-key authentication emits no decision event. The optional developer-token probe emits no decision either.
 
-Refresh exchanges emit `accepted` with `refresh_rotated` after generating the replacement tokens and response, or `rejected` with `refresh_invalid_or_revoked`. The repository does not distinguish invalid tokens from revoked tokens. Refresh-token rotation and HTTP response contracts are unchanged.
+Refresh exchanges emit `accepted` with `refresh_rotated` after generating the replacement tokens and response, `recovered` with `refresh_replayed` when a token that rotation revoked is presented again and its successor is returned once more, or `rejected` with `refresh_invalid_or_revoked`. The repository does not distinguish invalid tokens from revoked tokens.
 
 These events do not include tokens, identifiers, request headers, payloads, exception text, or contextual trace IDs. The same restricted attributes are passed to OTLP export. Expected rejections use warning level so they do not add another error-level record alongside the existing HTTP request log. With `LOG_LEVEL=error`, these decision events are filtered out.
 
