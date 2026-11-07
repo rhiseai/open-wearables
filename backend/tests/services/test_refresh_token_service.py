@@ -339,6 +339,33 @@ class TestRevokeToken:
         assert db_token is not None
         assert db_token.revoked_at is not None
 
+    @pytest.mark.parametrize("kind", TOKEN_KINDS)
+    def test_revoking_a_replayable_rotated_token_revokes_its_successor(self, db: Session, kind: str) -> None:
+        """Within the window a rotated token gives access to its successor, so revoking it ends that."""
+        old, _ = _issue(db, kind)
+        first = refresh_token_service.refresh_token(db, old)
+
+        assert refresh_token_service.revoke_token(db, old) is True
+
+        successor = db.get(RefreshToken, first.refresh_token)
+        assert successor is not None
+        assert successor.revoked_at is not None
+        _assert_rejected(db, old)
+        _assert_rejected(db, first.refresh_token)
+
+    def test_revoking_a_rotated_token_whose_successor_was_used_raises_404(self, db: Session) -> None:
+        old, _ = _issue(db, "sdk-admin")
+        first = refresh_token_service.refresh_token(db, old)
+        second = refresh_token_service.refresh_token(db, first.refresh_token)
+
+        with pytest.raises(HTTPException) as exc_info:
+            refresh_token_service.revoke_token(db, old)
+
+        assert exc_info.value.status_code == 404
+        live = db.get(RefreshToken, second.refresh_token)
+        assert live is not None
+        assert live.revoked_at is None
+
     def test_revoke_nonexistent_token_raises_404(self, db: Session) -> None:
         """Revoking non-existent token should raise 404."""
         # Arrange

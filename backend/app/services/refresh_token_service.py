@@ -47,7 +47,6 @@ class RefreshTokenService:
         origin: SDKTokenOrigin,
         application: Application | None = None,
         issued_by_developer_id: UUID | None = None,
-        replaces_id: str | None = None,
     ) -> tuple[str, str]:
         """Issue an SDK access token and a matching refresh token.
 
@@ -57,7 +56,6 @@ class RefreshTokenService:
             origin: How the token is being issued
             application: The application that requested the token (APPLICATION origin)
             issued_by_developer_id: The developer who issued the token (ADMIN / INVITE origin)
-            replaces_id: The refresh token this one replaces, when issued by rotation
 
         Returns:
             Tuple of (access_token, refresh_token)
@@ -72,7 +70,6 @@ class RefreshTokenService:
             origin=origin,
             application_id=application.id if application else None,
             issued_by_developer_id=issued_by_developer_id,
-            replaces_id=replaces_id,
         )
         return access_token, refresh_token
 
@@ -176,54 +173,34 @@ class RefreshTokenService:
         if not token:
             return self._replay_rotation(db_session, refresh_token_str)
 
-        # Storing the new refresh token commits the old one's revocation with it, so a failure
-        # before that leaves the old token usable
+        # Minting first rejects an unknown token type before anything is stored. Storing the new
+        # refresh token commits the old one's revocation with it, so a failure before that leaves
+        # the old token usable
+        access_token = self._mint_access_token(token)
         if token.token_type == TokenType.SDK:
-            access_token, new_refresh_token = self.issue_sdk_tokens(
+            new_refresh_token = self.create_sdk_refresh_token(
                 db_session,
                 user_id=token.user_id,  # ty:ignore[invalid-argument-type]
                 origin=token.origin,  # ty:ignore[invalid-argument-type]
-                application=token.application,
+                application_id=token.application_id,
                 issued_by_developer_id=token.issued_by_developer_id,
                 replaces_id=token.id,
             )
-            self.logger.debug("Refreshed SDK token (rotated)")
-        elif token.token_type == TokenType.DEVELOPER:
-            access_token = create_access_token(subject=str(token.developer_id))
+        else:
             new_refresh_token = self.create_developer_refresh_token(
                 db_session,
                 developer_id=token.developer_id,  # ty:ignore[invalid-argument-type]
                 replaces_id=token.id,
             )
-            self.logger.debug("Refreshed developer token (rotated)")
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown token type: {token.token_type}",
-            )
-
+        self.logger.debug("Refreshed refresh token (rotated)")
         log_auth_decision(AuthReason.REFRESH_ROTATED, AuthOutcome.ACCEPTED, boundary=AuthBoundary.REFRESH)
         return self._token_response(access_token, new_refresh_token)
 
     def _replay_rotation(self, db_session: DbSession, refresh_token_str: str) -> TokenResponse:
-        """Answer a replay of a rotated token with its successor, or reject the token.
-
-        Only rotation gives a token a successor, so a token revoked any other way (revoke,
-        password change) never replays. A successor that was used or revoked since ends the
-        replays of its predecessor.
-        """
+        """Answer a replay of a rotated token with its successor, or reject the token."""
         old = self.repo.get_by_id(db_session, refresh_token_str)
-        successor = (
-            self.repo.get_successor(db_session, old.id) if old is not None and old.revoked_at is not None else None
-        )
-        window = timedelta(seconds=settings.refresh_token_replay_window_seconds)
-        if (
-            old is None
-            or old.revoked_at is None
-            or successor is None
-            or successor.revoked_at is not None
-            or datetime.now(timezone.utc) - old.revoked_at > window
-        ):
+        successor = self._replayable_successor(db_session, old) if old is not None else None
+        if old is None or successor is None:
             log_auth_decision(
                 AuthReason.REFRESH_INVALID_OR_REVOKED, AuthOutcome.REJECTED, boundary=AuthBoundary.REFRESH
             )
@@ -237,6 +214,23 @@ class RefreshTokenService:
         self.logger.debug("Replayed a rotated refresh token")
         log_auth_decision(AuthReason.REFRESH_REPLAYED, AuthOutcome.RECOVERED, boundary=AuthBoundary.REFRESH)
         return self._token_response(access_token, successor.id)
+
+    def _replayable_successor(self, db_session: DbSession, token: RefreshToken) -> RefreshToken | None:
+        """The successor a replay of `token` would be given, or None when `token` cannot replay.
+
+        Only rotation gives a token a successor, so a token revoked any other way (revoke,
+        password change) never replays. A successor that was used or revoked since, or a
+        rotation older than `refresh_token_replay_window_seconds`, ends the replays.
+        """
+        if token.revoked_at is None:
+            return None
+        window = timedelta(seconds=settings.refresh_token_replay_window_seconds)
+        if datetime.now(timezone.utc) - token.revoked_at > window:
+            return None
+        successor = self.repo.get_successor(db_session, token.id)
+        if successor is None or successor.revoked_at is not None:
+            return None
+        return successor
 
     def _mint_access_token(self, token: RefreshToken) -> str:
         """Mint an access token for the subject of `token`."""
@@ -268,6 +262,9 @@ class RefreshTokenService:
     def revoke_token(self, db_session: DbSession, refresh_token_str: str) -> bool:
         """Revoke a refresh token.
 
+        A rotated token that could still be replayed revokes its successor instead: within the
+        replay window it gives access to that successor, so revoking it must end that access.
+
         Args:
             db_session: Database session
             refresh_token_str: The refresh token string
@@ -279,6 +276,10 @@ class RefreshTokenService:
             HTTPException: If the refresh token is not found
         """
         token = self.repo.claim_valid_token(db_session, refresh_token_str)
+        if not token:
+            rotated = self.repo.get_by_id(db_session, refresh_token_str)
+            successor = self._replayable_successor(db_session, rotated) if rotated is not None else None
+            token = self.repo.claim_valid_token(db_session, successor.id) if successor is not None else None
         if not token:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,

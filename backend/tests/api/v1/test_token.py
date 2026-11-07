@@ -240,6 +240,23 @@ class TestRevokeRefreshToken:
         )
         assert refresh_response.status_code == 401
 
+    def test_revoke_with_a_rotated_token_ends_its_successor(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """A client that only kept the rotated token can still log out."""
+        user = UserFactory()
+        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 200
+        new_refresh_token = response.json()["refresh_token"]
+
+        response = client.post(f"{api_v1_prefix}/token/revoke", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 204
+
+        for token in (old_refresh_token, new_refresh_token):
+            response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": token})
+            assert response.status_code == 401
+
     def test_revoke_token_not_found(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Non-existent refresh token should return 404."""
         # Act
