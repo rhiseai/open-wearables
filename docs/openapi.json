@@ -8226,7 +8226,7 @@
           "External: Token"
         ],
         "summary": "Refresh Token",
-        "description": "Exchange refresh token for new access token.\n\nThis endpoint accepts both SDK and Developer refresh tokens and returns\na new access token of the same type. Implements refresh token rotation:\nthe old refresh token is revoked and a new one is issued.\n\nArgs:\n    payload: Request containing the refresh token\n    db: Database session\n\nReturns:\n    TokenResponse with new access token and new refresh token\n\nRaises:\n    401: If the refresh token is invalid or revoked",
+        "description": "Exchange refresh token for new access token.\n\nThis endpoint accepts both SDK and Developer refresh tokens and returns\na new access token of the same type. Implements refresh token rotation:\nthe old refresh token is revoked and a new one is issued.\n\nA token that rotation revoked can be presented again, for a client that\nnever read the response: it returns the same new refresh token with a fresh\naccess token, until that refresh token is used or revoked or the replay\nwindow (`REFRESH_TOKEN_REPLAY_WINDOW_SECONDS`, 7 days by default) ends.\n\nArgs:\n    payload: Request containing the refresh token\n    db: Database session\n\nReturns:\n    TokenResponse with new access token and new refresh token\n\nRaises:\n    401: If the refresh token is invalid, revoked, or rotated outside its replay window",
         "operationId": "refresh_token_api_v1_token_refresh_post",
         "requestBody": {
           "content": {

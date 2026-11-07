@@ -18,6 +18,7 @@ class AuthReason(StrEnum):
     SUBJECT_MISMATCH = "subject_mismatch"
     REFRESH_INVALID_OR_REVOKED = "refresh_invalid_or_revoked"
     REFRESH_ROTATED = "refresh_rotated"
+    REFRESH_REPLAYED = "refresh_replayed"
 
 
 class AuthOutcome(StrEnum):

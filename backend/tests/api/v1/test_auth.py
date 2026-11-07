@@ -683,6 +683,31 @@ class TestPasswordChangeRevokesRefreshTokens:
         assert response.status_code == 401
         assert response.json()["detail"] == "Invalid or revoked refresh token"
 
+    def test_change_password_refuses_a_replay_of_a_rotated_token(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """A token rotated before the change cannot be replayed to get its successor back."""
+        developer = DeveloperFactory(email="victim@example.com", password="OldPassword123")
+        old_refresh_token = self._login(client, api_v1_prefix, "victim@example.com", "OldPassword123")
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 200
+        rotated_refresh_token = response.json()["refresh_token"]
+
+        response = client.post(
+            f"{api_v1_prefix}/auth/change-password",
+            json={
+                "current_password": "OldPassword123",
+                "new_password": "NewPassword456",
+                "confirm_password": "NewPassword456",
+            },
+            headers=developer_auth_headers(developer.id),
+        )
+        assert response.status_code == 200
+
+        for token in (old_refresh_token, rotated_refresh_token):
+            response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": token})
+            assert response.status_code == 401
+
     def test_update_me_with_password_revokes_refresh_tokens(
         self, client: TestClient, db: Session, api_v1_prefix: str
     ) -> None:

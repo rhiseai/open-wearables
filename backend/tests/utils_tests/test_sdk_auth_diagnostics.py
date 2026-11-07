@@ -137,6 +137,7 @@ def test_existing_structured_trace_inheritance_and_explicit_values_are_preserved
         (AuthReason.SUBJECT_MISMATCH, AuthOutcome.REJECTED, AuthBoundary.SDK_SUBJECT, "warning"),
         (AuthReason.SDK_TOKEN_EXPIRED, AuthOutcome.RECOVERED, AuthBoundary.SDK_CREDENTIALS, "info"),
         (AuthReason.REFRESH_ROTATED, AuthOutcome.ACCEPTED, AuthBoundary.REFRESH, "info"),
+        (AuthReason.REFRESH_REPLAYED, AuthOutcome.RECOVERED, AuthBoundary.REFRESH, "info"),
     ],
 )
 def test_fixed_decision_fields_and_severity(
