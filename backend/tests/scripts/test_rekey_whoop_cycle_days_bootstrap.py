@@ -1,22 +1,36 @@
 """Bootstrap outcomes must not hide a rolled-back attempt or expose database details.
 
-These synthetic Session fixtures exercise the script without loading application
-configuration or connecting to a database. They do not validate the re-key SQL itself.
+The PostgreSQL case exercises the same SQL used at startup. The mocked
+Session cases cover transaction boundaries and diagnostics.
 """
 
 import importlib.util
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from psycopg.errors import QueryCanceled
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+
+from app.models import DataPointSeries, DataSource, HealthScore, SeriesTypeDefinition
+from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
+from tests.factories import (
+    DataPointSeriesFactory,
+    DataSourceFactory,
+    EventRecordFactory,
+    HealthScoreFactory,
+    SleepDetailsFactory,
+    UserFactory,
+)
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migrations" / "rekey_whoop_cycle_days.py"
 
@@ -24,7 +38,7 @@ _SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "data_migration
 @pytest.fixture
 def script() -> ModuleType:
     database = ModuleType("app.database")
-    database.SessionLocal = MagicMock()
+    database.__dict__["SessionLocal"] = MagicMock()
     spec = importlib.util.spec_from_file_location("rekey_whoop_bootstrap_test", _SCRIPT_PATH)
     assert spec is not None
     assert spec.loader is not None
@@ -32,6 +46,99 @@ def script() -> ModuleType:
     with patch.dict(sys.modules, {"app.database": database, spec.name: module}):
         spec.loader.exec_module(module)
     return module
+
+
+def _daily_point(source: DataSource, metric: SeriesTypeDefinition | None, recorded_at: datetime) -> DataPointSeries:
+    assert metric is not None
+    return cast(
+        DataPointSeries,
+        DataPointSeriesFactory(data_source=source, series_type=metric, recorded_at=recorded_at, is_daily_total=True),
+    )
+
+
+def test_rekey_moves_only_uncontested_whoop_cycle_values(db: Session, script: ModuleType) -> None:
+    user = UserFactory()
+    whoop = cast(DataSource, DataSourceFactory(provider=ProviderName.WHOOP, user=user))
+    apple = cast(DataSource, DataSourceFactory(provider=ProviderName.APPLE, user=user))
+    steps = db.get(SeriesTypeDefinition, get_series_type_id(SeriesType.steps))
+    energy = db.get(SeriesTypeDefinition, get_series_type_id(SeriesType.active_energy))
+    start = datetime(2026, 1, 2, 10, 30, tzinfo=UTC)
+    target = datetime(2026, 1, 3, tzinfo=UTC)
+
+    # An early nap would anchor the cycle on Jan 2. The next full sleep is
+    # exactly 30h later, which puts the midpoint on Jan 3 instead of Jan 2.
+    for hours, is_nap in ((2, True), (30, False)):
+        event = EventRecordFactory(
+            category="sleep", type="sleep", data_source=whoop, start_datetime=start + timedelta(hours=hours)
+        )
+        SleepDetailsFactory(event_record=event, is_nap=is_nap)
+
+    winner = _daily_point(whoop, steps, start)
+    # Without a later onset, both evening starts map to the next day under
+    # the 24h fallback. The later start overlaps more of that target day.
+    earlier = _daily_point(whoop, steps, start + timedelta(days=2, hours=10))
+    later = _daily_point(whoop, steps, earlier.recorded_at + timedelta(hours=1))
+    conflict = _daily_point(whoop, energy, start)
+    occupied = cast(
+        DataPointSeries,
+        DataPointSeriesFactory(data_source=whoop, series_type=energy, recorded_at=target, is_daily_total=False),
+    )
+    unrelated = _daily_point(apple, steps, start)
+    strain = HealthScoreFactory(
+        data_source=whoop,
+        provider=ProviderName.WHOOP,
+        category=HealthScoreCategory.STRAIN,
+        recorded_at=start,
+        components={},
+    )
+    workout_strain = HealthScoreFactory(
+        data_source=whoop,
+        provider=ProviderName.WHOOP,
+        category=HealthScoreCategory.STRAIN,
+        recorded_at=start + timedelta(hours=1),
+        components={"percent_recorded": 95},
+    )
+    expected_series = {row.id: row.recorded_at for row in (winner, earlier, later, conflict, occupied, unrelated)}
+    expected_scores = {strain.id: start, workout_strain.id: workout_strain.recorded_at}
+
+    def timestamps(model: type[DataPointSeries] | type[HealthScore]) -> dict[UUID, datetime]:
+        return dict(db.execute(select(model.id, model.recorded_at)).tuples().all())
+
+    assert script.rekey_whoop_cycle_days(db, dry_run=True) == 0
+    assert timestamps(DataPointSeries) == expected_series
+    assert timestamps(HealthScore) == expected_scores
+
+    assert script.rekey_whoop_cycle_days(db, dry_run=False) == 3
+    expected_series[winner.id] = target
+    expected_series[later.id] = target + timedelta(days=2)
+    expected_scores[strain.id] = target
+    assert timestamps(DataPointSeries) == expected_series
+    assert timestamps(HealthScore) == expected_scores
+    assert script.rekey_whoop_cycle_days(db, dry_run=False) == 0
+
+
+@pytest.mark.parametrize(("minutes_until_sleep", "expected_utc_day"), [(1800, 2), (1801, 1)])
+def test_rekey_uses_local_day_and_falls_back_beyond_thirty_hours(
+    db: Session, script: ModuleType, minutes_until_sleep: int, expected_utc_day: int
+) -> None:
+    whoop = DataSourceFactory(provider=ProviderName.WHOOP)
+    start = datetime(2026, 1, 2, 9, 30, tzinfo=UTC)
+    event = EventRecordFactory(
+        category="sleep", type="sleep", data_source=whoop, start_datetime=start + timedelta(minutes=minutes_until_sleep)
+    )
+    SleepDetailsFactory(event_record=event, is_nap=None)
+    strain = HealthScoreFactory(
+        data_source=whoop,
+        provider=ProviderName.WHOOP,
+        category=HealthScoreCategory.STRAIN,
+        recorded_at=start,
+        zone_offset="+01:00",
+        components={},
+    )
+
+    assert script.rekey_whoop_cycle_days(db, dry_run=False) == 1
+    db.refresh(strain)
+    assert strain.recorded_at == datetime(2026, 1, expected_utc_day, 23, tzinfo=UTC)
 
 
 def _session(*results: Any) -> MagicMock:

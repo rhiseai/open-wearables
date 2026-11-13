@@ -80,73 +80,70 @@ class _Table:
     """One table's worth of cycle-derived rows, and how to find their owner."""
 
     name: str
-    label: str
-    eligible: str  # identifies whole-day cycle rows
-    user_id: str  # expression yielding the owning user
-    key: str  # the columns the unique constraint scopes recorded_at by
+    candidates: str
+    key: tuple[str, ...]  # the columns the unique constraint scopes recorded_at by
 
 
 _HEALTH_SCORE = _Table(
     name="health_score",
-    label="health_score (strain)",
-    # percent_recorded is on WorkoutScore and never on CycleScore, so it excludes the
-    # legacy workout strain that backfill_whoop_strain_event_record.py could not link.
-    eligible=(
-        "t.provider = 'whoop' AND t.category = 'strain' AND t.event_record_id IS NULL"
-        " AND NOT (t.components ? 'percent_recorded')"
-    ),
-    user_id="t.user_id",
-    key="t.user_id, t.provider, t.category",
+    candidates="""
+        SELECT id, user_id, provider, category, recorded_at, zone_offset
+        FROM health_score
+        WHERE provider = 'whoop' AND category = 'strain' AND event_record_id IS NULL
+          -- percent_recorded is on WorkoutScore, never CycleScore.
+          AND NOT (components ? 'percent_recorded')
+    """,
+    key=("user_id", "provider", "category"),
 )
 
 _DATA_POINT_SERIES = _Table(
     name="data_point_series",
-    label="data_point_series (active_energy, total_energy, steps)",
-    eligible=(
-        "t.is_daily_total IS TRUE"
-        " AND EXISTS (SELECT 1 FROM data_source ds WHERE ds.id = t.data_source_id AND ds.provider = 'whoop')"
-        " AND EXISTS (SELECT 1 FROM series_type_definition std"
-        "             WHERE std.id = t.series_type_definition_id"
-        "               AND std.code IN ('active_energy', 'total_energy', 'steps'))"
-    ),
-    user_id="(SELECT ds.user_id FROM data_source ds WHERE ds.id = t.data_source_id)",
-    key="t.data_source_id, t.series_type_definition_id",
+    # Keep the source/metric lookup correlated so it uses the leading columns
+    # of the unique index instead of scanning rows from unrelated providers.
+    candidates="""
+        SELECT sample.*, source.user_id
+        FROM data_source source
+        CROSS JOIN series_type_definition metric
+        CROSS JOIN LATERAL (
+            SELECT id, data_source_id, series_type_definition_id, recorded_at, zone_offset
+            FROM data_point_series
+            WHERE data_source_id = source.id AND series_type_definition_id = metric.id
+              AND is_daily_total IS TRUE
+            OFFSET 0
+        ) sample
+        WHERE source.provider = 'whoop' AND metric.code IN ('active_energy', 'total_energy', 'steps')
+    """,
+    key=("data_source_id", "series_type_definition_id"),
 )
 
 
 def _mapping(table: _Table) -> str:
     """Every eligible row with the local midnight it belongs on, ranked within its day."""
+    partition = ", ".join(f"t.{column}" for column in table.key)
     return f"""
         SELECT t.*,
-               c.cycle_end,
                d.new_recorded_at,
                row_number() OVER (
-                   PARTITION BY {table.key}, d.new_recorded_at
+                   PARTITION BY {partition}, d.new_recorded_at
                    ORDER BY least(c.cycle_end, d.new_recorded_at + interval '1 day')
                           - greatest(t.recorded_at, d.new_recorded_at) DESC,
                             t.recorded_at DESC
                ) AS rank
-        FROM {table.name} t
+        FROM ({table.candidates}) t
         CROSS JOIN LATERAL (
             SELECT cast(coalesce(t.zone_offset, '+00:00') AS interval) AS off
         ) o
         CROSS JOIN LATERAL (
-            SELECT CASE
-                       WHEN n.onset IS NOT NULL AND n.onset <= t.recorded_at + interval '{_MAX_CYCLE_SPAN}'
-                       THEN n.onset
-                       ELSE t.recorded_at + interval '24 hours'
-                   END AS cycle_end
-            FROM (
-                SELECT min(er.start_datetime) AS onset
-                FROM data_source ds
-                JOIN event_record er ON er.data_source_id = ds.id
-                JOIN sleep_details sd ON sd.record_id = er.id
-                WHERE ds.user_id = {table.user_id}
-                  AND ds.provider = 'whoop'
-                  AND er.category = 'sleep'
-                  AND sd.is_nap IS NOT TRUE
-                  AND er.start_datetime > t.recorded_at
-            ) n
+            SELECT coalesce(min(er.start_datetime), t.recorded_at + interval '24 hours') AS cycle_end
+            FROM data_source ds
+            JOIN event_record er ON er.data_source_id = ds.id
+            JOIN sleep_details sd ON sd.record_id = er.id
+            WHERE ds.user_id = t.user_id
+              AND ds.provider = 'whoop'
+              AND er.category = 'sleep'
+              AND sd.is_nap IS NOT TRUE
+              AND er.start_datetime > t.recorded_at
+              AND er.start_datetime <= t.recorded_at + interval '{_MAX_CYCLE_SPAN}'
         ) c
         CROSS JOIN LATERAL (
             SELECT ((
@@ -154,30 +151,37 @@ def _mapping(table: _Table) -> str:
                 - o.off
             ) AT TIME ZONE 'UTC') AS new_recorded_at
         ) d
-        WHERE {table.eligible}
-          AND ((t.recorded_at + o.off) AT TIME ZONE 'UTC')::time <> '00:00:00'
+        WHERE ((t.recorded_at + o.off) AT TIME ZONE 'UTC')::time <> '00:00:00'
     """
 
 
-def _movable(table: _Table) -> str:
-    """The mapping, minus rows whose target is contested. Reported, not merged."""
+def _candidate_queries(table: _Table) -> str:
+    """Share one mapping between the diagnostics and their conflict check."""
+    # All key columns are NOT NULL, so equality can use the unique index.
+    same_key = " AND ".join(f"x.{column} = m.{column}" for column in table.key)
     return f"""
-        SELECT m.* FROM ({_mapping(table)}) m
-        WHERE m.rank = 1
-          AND NOT EXISTS (
-              SELECT 1 FROM {table.name} x
-              WHERE ({table.key.replace("t.", "x.")}) IS NOT DISTINCT FROM ({table.key.replace("t.", "m.")})
-                AND x.recorded_at = m.new_recorded_at
-                AND x.id <> m.id
-          )
+        WITH mapping AS MATERIALIZED ({_mapping(table)}),
+        movable AS (
+            SELECT m.id, m.new_recorded_at
+            FROM mapping m
+            WHERE m.rank = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM {table.name} x
+                  WHERE {same_key}
+                    AND x.recorded_at = m.new_recorded_at
+                    AND x.id <> m.id
+              )
+        )
     """
 
 
 def _rekey(db: Session, table: _Table, *, dry_run: bool) -> int:
+    candidates = _candidate_queries(table)
     eligible, contested = db.execute(
         text(f"""
-            SELECT count(*), count(*) FILTER (WHERE id NOT IN (SELECT id FROM ({_movable(table)}) v))
-            FROM ({_mapping(table)}) m
+            {candidates}
+            SELECT count(*), count(*) - (SELECT count(*) FROM movable)
+            FROM mapping
         """)
     ).one()
     _emit(
@@ -197,9 +201,10 @@ def _rekey(db: Session, table: _Table, *, dry_run: bool) -> int:
 
     moved = db.execute(
         text(f"""
+            {candidates}
             UPDATE {table.name} tgt
             SET recorded_at = v.new_recorded_at
-            FROM ({_movable(table)}) v
+            FROM movable v
             WHERE tgt.id = v.id
         """)
     ).rowcount  # ty: ignore[unresolved-attribute]
