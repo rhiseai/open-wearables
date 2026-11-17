@@ -12,6 +12,7 @@ import os
 import socket
 import sys
 from collections.abc import Generator
+from contextlib import nullcontext
 from typing import Any
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
@@ -137,7 +138,17 @@ def set_factory_session(db: Session) -> Generator[None, None, None]:
 
 
 @pytest.fixture
-def client(db: Session) -> Generator[TestClient, None, None]:
+def auth_sessions(db: Session) -> Generator[None, None, None]:
+    """Let auth lookups see the fixture rows in the test transaction."""
+    with (
+        patch("app.services.api_key_service.SessionLocal", return_value=nullcontext(db)),
+        patch("app.utils.auth.SessionLocal", return_value=nullcontext(db)),
+    ):
+        yield
+
+
+@pytest.fixture
+def client(db: Session, auth_sessions: None) -> Generator[TestClient, None, None]:
     """
     Create a test client with database dependency override.
     """
