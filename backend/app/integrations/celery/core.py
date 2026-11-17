@@ -13,6 +13,7 @@ from celery.schedules import crontab
 from app.config import settings
 from app.constants.celery_tasks import CeleryQueue, CeleryTask
 from app.extensions import collect_beat_schedule, collect_event_handlers, events, get_active_extensions
+from app.integrations.celery.routing import route_historical_task
 from app.integrations.otel import init_otel, shutdown_otel
 from app.services import raw_payload_storage
 from app.services.outgoing_webhooks.routing import route_webhook_task
@@ -190,6 +191,7 @@ def create_celery() -> Celery:
         control_queue_expires=300,
         task_queues={queue: {} for queue in CeleryQueue},
         task_routes=(
+            route_historical_task,
             # emit_webhook_event: webhook_priority or webhook_outgoing, picked per event type.
             route_webhook_task,
             {

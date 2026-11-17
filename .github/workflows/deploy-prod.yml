@@ -7,7 +7,7 @@
 # Both tagged :latest + :sha-<short>.
 #
 # Then runs alembic migrator, then rolls services in order:
-#   migrate → (deploy-frontend ‖ deploy-svix → deploy-app)
+#   migrate → (deploy-frontend ‖ deploy-svix → history consumer → worker/API/beat)
 
 name: Deploy to production
 
@@ -93,6 +93,7 @@ jobs:
       migrator_task_definition: ${{ steps.register.outputs.ow_migrator }}
       backend_task_definition: ${{ steps.register.outputs.ow_backend }}
       worker_task_definition: ${{ steps.register.outputs.ow_celery_worker }}
+      history_task_definition: ${{ steps.register.outputs.ow_celery_history }}
       beat_task_definition: ${{ steps.register.outputs.ow_celery_beat }}
       frontend_task_definition: ${{ steps.register.outputs.ow_frontend }}
     steps:
@@ -121,7 +122,7 @@ jobs:
             }
           done
 
-          for family in ow-migrator ow-backend ow-celery-worker ow-celery-beat ow-frontend; do
+          for family in ow-migrator ow-backend ow-celery-history ow-celery-worker ow-celery-beat ow-frontend; do
             image="${ECR_REGISTRY}/${BACKEND_REPO}@${BACKEND_DIGEST}"
             if [[ "${family}" == "ow-frontend" ]]; then
               image="${ECR_REGISTRY}/${FRONTEND_REPO}@${FRONTEND_DIGEST}"
@@ -295,59 +296,29 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.eu
 
-      - name: Force new deployment on 3 services
+      - uses: actions/checkout@v4
+
+      # Terraform must provision the fixed-capacity history service before this release.
+      # A missing service/family fails before producers can route work to the new queues.
+      - name: Roll historical consumer before ordinary workers, API and beat
         env:
+          HISTORY_TASK_DEFINITION: ${{ needs.prepare-release.outputs.history_task_definition }}
           BACKEND_TASK_DEFINITION: ${{ needs.prepare-release.outputs.backend_task_definition }}
           WORKER_TASK_DEFINITION: ${{ needs.prepare-release.outputs.worker_task_definition }}
           BEAT_TASK_DEFINITION: ${{ needs.prepare-release.outputs.beat_task_definition }}
         run: |
+          set -euo pipefail
           for deployment in \
-            "ow-backend:${BACKEND_TASK_DEFINITION}" \
+            "ow-celery-history:${HISTORY_TASK_DEFINITION}" \
             "ow-celery-worker:${WORKER_TASK_DEFINITION}" \
+            "ow-backend:${BACKEND_TASK_DEFINITION}" \
             "ow-celery-beat:${BEAT_TASK_DEFINITION}"; do
             svc=${deployment%%:*}
             task_definition=${deployment#*:}
-            aws ecs update-service --cluster "${ECS_CLUSTER}" \
-              --service "${svc}" --task-definition "${task_definition}" \
-              --query 'service.serviceName' --output text
+            expected_count=""
+            if [[ "$svc" == "ow-celery-history" ]]; then expected_count=2; fi
+            bash deploy/scripts/roll-ecs-service.sh "$svc" "$task_definition" "$expected_count"
           done
-
-      - name: Wait for all 3 rollouts
-        run: |
-          set -e
-          DEADLINE=$(( $(date +%s) + 1800 ))
-          for svc in ow-backend ow-celery-worker ow-celery-beat; do
-            echo "Polling $svc..."
-            while true; do
-              R=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "$svc" \
-                --query 'services[0].deployments[0].rolloutState' --output text)
-              echo "  [$svc] rolloutState=$R"
-              case "$R" in COMPLETED|FAILED) break ;; esac
-              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
-                echo "::error::[$svc] rollout did not reach terminal state within 30 min"
-                exit 1
-              fi
-              sleep 20
-            done
-          done
-
-      - name: Confirm all 3 outcomes
-        run: |
-          set -e
-          FAILED=0
-          for svc in ow-backend ow-celery-worker ow-celery-beat; do
-            R=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "$svc" \
-              --query 'services[0].deployments[0].rolloutState' --output text)
-            REASON=$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "$svc" \
-              --query 'services[0].deployments[0].rolloutStateReason' --output text)
-            echo "[$svc] rollout=$R reason=$REASON"
-            if [ "$R" != "COMPLETED" ]; then
-              echo "::error::[$svc] deployment failed: $REASON"
-              aws logs tail "/ecs/$svc" --since 5m --region "${AWS_REGION}" || true
-              FAILED=1
-            fi
-          done
-          exit "${FAILED}"
 
       - name: Deployment summary
         env:
@@ -359,7 +330,7 @@ jobs:
             echo "| Property | Value |"
             echo "|---|---|"
             echo "| Cluster | \`${ECS_CLUSTER}\` |"
-            echo "| Services rolled | ow-frontend, ow-svix-server, ow-backend, ow-celery-worker, ow-celery-beat |"
+            echo "| Services rolled | ow-frontend, ow-svix-server, ow-celery-history, ow-backend, ow-celery-worker, ow-celery-beat |"
             echo "| Image tag | \`latest\` + \`sha-${COMMIT_SHA:0:7}\` |"
             echo "| Commit | \`${COMMIT_SHA}\` |"
             echo "| URL | https://ow.getlucie.ai |"

@@ -17,7 +17,8 @@ The single backend image covers every backend role. The start command selects wh
 | Command | Role |
 |---------|------|
 | `scripts/start/app.sh` | API server. Also applies database migrations and seed scripts on startup |
-| `scripts/start/worker.sh` | Celery worker (data syncs, background jobs) |
+| `scripts/start/worker.sh` | Celery worker (current data syncs, background jobs) |
+| `scripts/start/history-worker.sh` | Historical SDK and provider imports (two concurrent tasks by default) |
 | `scripts/start/beat.sh` | Celery beat (scheduler) |
 | `scripts/start/flower.sh` | Flower (Celery monitoring UI, port `5555`) |
 
@@ -49,6 +50,7 @@ A typical deployment consists of the application containers plus their backing s
 
 - `app` - the API, from the backend image
 - `celery-worker` - background jobs, from the backend image
+- `celery-history` - historical imports, from the backend image
 - `celery-beat` - schedules recurring syncs, from the backend image
 - `frontend` - the web UI, from the frontend image
 - PostgreSQL - primary database
@@ -131,6 +133,20 @@ services:
       - app
     restart: unless-stopped
 
+  celery-history:
+    image: themomentum/open-wearables-backend:latest
+    command: scripts/start/history-worker.sh
+    env_file:
+      - ./.env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+      - CELERY_HISTORICAL_CONCURRENCY=2
+    depends_on:
+      - app
+    stop_grace_period: 120s
+    restart: unless-stopped
+
   frontend:
     image: themomentum/open-wearables-frontend:latest
     environment:
@@ -172,6 +188,14 @@ Open Wearables does not use `OTEL_PROPAGATORS`, but FastAPI loads the propagator
 ### Mobile SDK syncs
 
 By default every mobile SDK sync payload is queued in Redis. That's fine for ongoing syncs, but a historical backfill sends a lot of data at once. How much depends on whether your app runs a backfill and how far back it goes, which you set in the SDK. With many users backfilling long periods, Redis can run out of memory. In that case we recommend setting `SDK_PAYLOAD_S3_OFFLOAD=true`. Payloads then go to an S3-compatible bucket and Redis only holds a reference. See [SDK Payload Offload](/dev-guides/raw-payload-storage#sdk-payload-offload) for the required bucket settings.
+
+### Historical worker capacity
+
+Historical SDK uploads and deferred sleep processing use `historical_sdk`; provider tasks with `is_historical=true` use `historical_vendor`. Both queues require a history worker. The ordinary worker does not consume them. An SDK batch explicitly marked `live` keeps the ordinary SDK queue, including while that device exports history.
+
+The history worker uses Redis with prefetch disabled, so queued imports stay in the broker until a processing slot is free. Each worker consumes both history queues. Size the total capacity across **all replicas**: two replicas at concurrency one, or one replica at concurrency two, allow two concurrent history tasks. Do not autoscale this service with ordinary workers or temporarily add replicas during a rolling deployment. The queues still share the same database; the limit bounds import concurrency, not total database load.
+
+On an upgrade, start and verify the history consumers before updating any API, worker or beat that can enqueue historical tasks. Messages already in the old queues drain there; they are not moved automatically. On rollback, keep the history consumers running until their queues and active tasks have drained. Existing task acknowledgement and retry policies are unchanged: a forced stop can still interrupt an acknowledged import, which needs to be requested again. A normal stop allows active work to finish up to the container's stop timeout.
 
 ### Running it
 

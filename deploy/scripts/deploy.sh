@@ -9,7 +9,8 @@
 #   3. Wait for DB to accept connections
 #   4. Run alembic upgrade in a THROWAWAY container — abort if it fails,
 #      before touching any live service
-#   5. For each ROLLING service (app, frontend, celery-worker):
+#   5. Restart the fixed-capacity history consumer and wait for readiness.
+#      Then, for each ROLLING service (app, frontend, celery-worker):
 #        - Snapshot currently-running container IDs
 #        - Scale N → N+1 (new container starts alongside old)
 #        - Wait for the NEW container to become healthy
@@ -23,7 +24,7 @@
 #   7. Prune dangling images
 #
 # Zero-downtime holds for: app, frontend, celery-worker
-# Brief gap on: celery-beat (scheduler), db/redis/traefik (not touched)
+# Brief gap on: celery-history (queued imports), celery-beat (scheduler)
 #
 # Preconditions (enforced by compose file):
 #   * Rolling services must NOT set container_name
@@ -195,7 +196,7 @@ roll_service() {
 # ---------------------------------------------------------------------------
 
 log "Pulling new images..."
-"${COMPOSE[@]}" pull "${ROLLING_SERVICES[@]}" "${SINGLETON_SERVICES[@]}"
+"${COMPOSE[@]}" pull celery-history "${ROLLING_SERVICES[@]}" "${SINGLETON_SERVICES[@]}"
 
 log "Ensuring stateful services are running (db, redis, traefik, svix-server)..."
 "${COMPOSE[@]}" up -d db redis traefik svix-server
@@ -220,6 +221,15 @@ if ! "${COMPOSE[@]}" run --rm --no-deps \
     uv run alembic upgrade head; then
   die "alembic migrations failed — aborting before touching live services"
 fi
+
+# History must consume the new queues before any new API/worker/beat publishes to them.
+# Recreate in place: an N+1 rollout would temporarily increase the fixed import budget.
+log "Starting the historical import consumer before producers..."
+"${COMPOSE[@]}" up -d --no-deps --force-recreate --scale celery-history=1 celery-history
+history_ids=$("${COMPOSE[@]}" ps -q celery-history)
+[[ -n "$history_ids" ]] || die "No historical import consumer was created"
+wait_containers_healthy "$HEALTH_TIMEOUT_SECONDS" "$history_ids" \
+  || die "Historical import consumer is not ready; producers were not rolled"
 
 # --- Rolling services (zero-downtime) --------------------------------------
 for svc in "${ROLLING_SERVICES[@]}"; do
