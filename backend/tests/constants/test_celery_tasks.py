@@ -42,7 +42,18 @@ def test_beat_schedule_and_routes_use_constants() -> None:
 
 
 def test_workers_consume_every_queue_and_only_those() -> None:
-    worker_script = Path(__file__).resolve().parents[2] / "scripts" / "start" / "worker.sh"
-    consumed = {queue for flag in re.findall(r"-Q (\S+)", worker_script.read_text()) for queue in flag.split(",")}
+    scripts = Path(__file__).resolve().parents[2] / "scripts" / "start"
+    consumed = {
+        queue
+        for name in ("worker.sh", "history-worker.sh")
+        for flag in re.findall(r"-Q (\S+)", (scripts / name).read_text())
+        for queue in flag.split(",")
+    }
 
     assert consumed == set(CeleryQueue)
+
+
+def test_live_workers_do_not_consume_historical_imports() -> None:
+    script = Path(__file__).resolve().parents[2] / "scripts" / "start" / "worker.sh"
+    consumed = {queue for flag in re.findall(r"-Q (\S+)", script.read_text()) for queue in flag.split(",")}
+    assert not {CeleryQueue.HISTORICAL_SDK, CeleryQueue.HISTORICAL_VENDOR} & consumed

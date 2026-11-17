@@ -1,4 +1,28 @@
-# Staging provider credentials
+# Staging deployment
+
+## Historical workers
+
+The Compose stack runs one `celery-history` container with two threads, separate
+from `celery-worker`. `deploy/scripts/deploy.sh` recreates this fixed-capacity
+consumer in place and waits for its health check before rolling the producers.
+Do not add it to the services temporarily scaled to two replicas during a deploy.
+
+Production uses the Terraform `ow-celery-history` ECS service in the Lucie runtime
+stack: two replicas, one thread each, no autoscaling, deployment maximum 100% and
+minimum healthy 50%. Before first promoting this routing change to production, a
+human must run Lucie's `Infra · Apply` for the runtime stack and verify both
+consumers are healthy. The service can initially run the existing OW image; its
+task names and queues are backward compatible. OW's production workflow registers
+the new image and verifies the expected history revision before rolling ordinary
+workers, API and beat. A missing history service or a failed rollout stops that
+sequence before the producers change.
+
+Previously queued messages stay in their original queues. During rollback, keep
+the history service until both history queues and active tasks have drained,
+including delayed retries. This change preserves the existing acknowledgement
+and retry policies; forced termination does not guarantee replay of active tasks.
+
+## Provider credentials
 
 The staging host renders its runtime configuration with
 `deploy/scripts/render-env.sh`. Provider credentials belong in AWS Secrets Manager

@@ -88,6 +88,33 @@ services:
           path: ./backend/scripts
           target: /root_project/scripts
 
+  # Keep one history service: scaling the ordinary workers must not add import slots.
+  celery-history:
+    container_name: celery-history__open-wearables
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/history-worker.sh
+    env_file:
+      - ./backend/config/.env
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+      - PYTHONPYCACHEPREFIX=/tmp/pycache
+    depends_on:
+      - redis
+      - db
+      - app
+    volumes:
+      - ./extensions:/root_project/extensions
+    develop:
+      watch:
+        - action: sync+restart
+          path: ./backend/app
+          target: /root_project/app
+        - action: sync+restart
+          path: ./backend/scripts
+          target: /root_project/scripts
+
   celery-beat:
     container_name: celery-beat__open-wearables
     image: open-wearables-platform:latest

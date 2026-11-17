@@ -1,10 +1,10 @@
 """Oura Ring 247 Data implementation for sleep, readiness, heart rate, activity, and SpO2."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from itertools import groupby
+from itertools import batched, groupby
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -31,6 +31,7 @@ from app.schemas.providers.oura import (
     OuraSleepJSON,
 )
 from app.schemas.providers.oura.imports import OuraIntervalData, OuraMetJSON, OuraPersonalInfoJSON
+from app.schemas.sync_status import SyncScope
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.api_client import make_authenticated_request
@@ -41,14 +42,24 @@ from app.services.providers.oura.coverage import (
     SLEEP_INTERVAL_SERIES,
     SLEEP_SCALAR_SERIES,
 )
-from app.services.providers.sync_247_result import Sync247Result
+from app.services.providers.sync_247_result import Sync247Result, Sync247Run
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
+from app.utils.context import sync_run_var
 from app.utils.conversion import energy_difference, seconds_to_minutes
 from app.utils.dates import iso_zone_offset, offset_to_iso, parse_iso_datetime, to_rfc3339
 from app.utils.structured_logging import LogContext, log_structured
+
+_DAILY_ACTIVITY_ENDPOINT = "/v2/usercollection/daily_activity"
+_HEART_RATE_ENDPOINT = "/v2/usercollection/heartrate"
+# Oura limits a heart-rate request to 30 days. Historical writes use smaller units so
+# the database can commit part of the range before the next page is fetched.
+_HEART_RATE_REQUEST_DAYS = 30
+_HISTORICAL_HEART_RATE_BATCH_SIZE = 10_000
+# An activity day contains up to 1,440 one-minute MET samples, plus the daily totals.
+_HISTORICAL_ACTIVITY_BATCH_SIZE = 7
 
 
 class Oura247Data(Base247DataTemplate):
@@ -86,15 +97,14 @@ class Oura247Data(Base247DataTemplate):
             headers=headers,
         )
 
-    def _paginate(
+    def _iter_pages(
         self,
         db: DbSession,
         user_id: UUID,
         endpoint: str,
         params: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        """Generic paginator for Oura API endpoints that return {data: [...], next_token: ...}."""
-        all_data: list[dict[str, Any]] = []
+    ) -> Iterator[list[dict[str, Any]]]:
+        """Yield each nonempty provider page and propagate a failed fetch to the caller."""
         next_token: str | None = None
 
         while True:
@@ -113,12 +123,8 @@ class Oura247Data(Base247DataTemplate):
                 )
 
                 data = response.get("data", []) if isinstance(response, dict) else []
-                all_data.extend(data)
-
+                page = data if isinstance(data, list) else list(data)
                 next_token = response.get("next_token") if isinstance(response, dict) else None
-                if not data or not next_token:
-                    break
-
             except Exception as e:
                 log_structured(
                     self.logger,
@@ -129,24 +135,50 @@ class Oura247Data(Base247DataTemplate):
                     error=str(e),
                     user_id=str(user_id),
                 )
-                if all_data:
-                    log_structured(
-                        self.logger,
-                        "warning",
-                        "Returning partial data due to error",
-                        action="oura_api_partial_data",
-                        endpoint=endpoint,
-                        error=str(e),
-                        user_id=str(user_id),
-                    )
-                    break
                 raise
 
+            if not page:
+                return
+            yield page
+            if not next_token:
+                return
+
+    def _paginate(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        endpoint: str,
+        params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Collect pages for a caller that can use partial data after a failed fetch."""
+        all_data: list[dict[str, Any]] = []
+        try:
+            for page in self._iter_pages(db, user_id, endpoint, params):
+                all_data.extend(page)
+        except Exception as e:
+            if not all_data:
+                raise
+            log_structured(
+                self.logger,
+                "warning",
+                "Returning partial data due to error",
+                action="oura_api_partial_data",
+                endpoint=endpoint,
+                error=str(e),
+                user_id=str(user_id),
+            )
         return all_data
 
     # -------------------------------------------------------------------------
     # Daily Activity Data - /v2/usercollection/daily_activity
     # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _activity_date_params(start_time: datetime, end_time: datetime) -> dict[str, str]:
+        return {
+            "start_date": start_time.strftime("%Y-%m-%d"),
+            "end_date": end_time.strftime("%Y-%m-%dT23:59:59"),
+        }
 
     def get_activity_samples(
         self,
@@ -156,11 +188,8 @@ class Oura247Data(Base247DataTemplate):
         end_time: datetime,
     ) -> list[dict[str, Any]]:
         """Fetch daily activity data from Oura API."""
-        params = {
-            "start_date": start_time.strftime("%Y-%m-%d"),
-            "end_date": end_time.strftime("%Y-%m-%dT23:59:59"),
-        }
-        return self._paginate(db, user_id, "/v2/usercollection/daily_activity", params)
+        params = self._activity_date_params(start_time, end_time)
+        return self._paginate(db, user_id, _DAILY_ACTIVITY_ENDPOINT, params)
 
     def _normalize_activity_scores(
         self,
@@ -1113,6 +1142,15 @@ class Oura247Data(Base247DataTemplate):
     # Heart Rate Data
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _heart_rate_request_windows(start_time: datetime, end_time: datetime) -> Iterator[dict[str, str]]:
+        chunk_start = start_time.astimezone(timezone.utc)
+        end_utc = end_time.astimezone(timezone.utc)
+        while chunk_start < end_utc:
+            chunk_end = min(chunk_start + timedelta(days=_HEART_RATE_REQUEST_DAYS), end_utc)
+            yield {"start_datetime": to_rfc3339(chunk_start), "end_datetime": to_rfc3339(chunk_end)}
+            chunk_start = chunk_end
+
     def get_heart_rate_data(
         self,
         db: DbSession,
@@ -1124,19 +1162,16 @@ class Oura247Data(Base247DataTemplate):
 
         Oura limits the timerange to 30 days per request; chunk accordingly.
         """
-        _CHUNK_DAYS = 30  # noqa: N806
         results: list[dict[str, Any]] = []
-        chunk_start = start_time.astimezone(timezone.utc)
-        end_utc = end_time.astimezone(timezone.utc)
-        while chunk_start < end_utc:
-            chunk_end = min(chunk_start + timedelta(days=_CHUNK_DAYS), end_utc)
-            params = {
-                "start_datetime": to_rfc3339(chunk_start),
-                "end_datetime": to_rfc3339(chunk_end),
-            }
-            results.extend(self._paginate(db, user_id, "/v2/usercollection/heartrate", params))
-            chunk_start = chunk_end
+        for params in self._heart_rate_request_windows(start_time, end_time):
+            results.extend(self._paginate(db, user_id, _HEART_RATE_ENDPOINT, params))
         return results
+
+    def _iter_heart_rate_pages(
+        self, db: DbSession, user_id: UUID, start_time: datetime, end_time: datetime
+    ) -> Iterator[list[dict[str, Any]]]:
+        for params in self._heart_rate_request_windows(start_time, end_time):
+            yield from self._iter_pages(db, user_id, _HEART_RATE_ENDPOINT, params)
 
     def save_heart_rate_data(
         self,
@@ -1340,6 +1375,26 @@ class Oura247Data(Base247DataTemplate):
     # Combined Load
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _save_historical_batches(
+        run: Sync247Run,
+        data_type: str,
+        pages: Iterator[list[dict[str, Any]]],
+        batch_size: int,
+        save: Callable[[list[dict[str, Any]]], WriteCounts],
+    ) -> None:
+        batches = (list(batch) for page in pages for batch in batched(page, batch_size))
+        while True:
+            # The saver commits before returning. Keep those counts if advancing the iterator
+            # or saving a later batch fails, and leave the rest of this type for a retry.
+            with run.step(data_type, accumulate=True) as step:
+                batch = next(batches, None)
+                if batch is None:
+                    return
+                step.record(save(batch))
+            if data_type in run.result.failures:
+                return
+
     def load_and_save_all(
         self,
         db: DbSession,
@@ -1359,12 +1414,14 @@ class Oura247Data(Base247DataTemplate):
         """
         start_time, end_time = self.resolve_window(start_time, end_time)
 
+        def save_activity(raw: list[dict[str, Any]]) -> WriteCounts:
+            return self.save_activity_data(db, user_id, self.normalize_activity_samples(raw, user_id))
+
+        def save_heart_rate(raw: list[dict[str, Any]]) -> WriteCounts:
+            return self.save_heart_rate_data(db, user_id, raw)
+
         tasks: dict[str, Callable[[], WriteCounts | int]] = {
-            "activity": lambda: self.save_activity_data(
-                db,
-                user_id,
-                self.normalize_activity_samples(self.get_activity_samples(db, user_id, start_time, end_time), user_id),
-            ),
+            "activity": lambda: save_activity(self.get_activity_samples(db, user_id, start_time, end_time)),
             "cardiovascular_age": lambda: self.save_cardiovascular_age_data(
                 db,
                 user_id,
@@ -1388,15 +1445,29 @@ class Oura247Data(Base247DataTemplate):
                 ),
             ),
             "spo2": lambda: self.save_spo2_data(db, user_id, self.get_spo2_data(db, user_id, start_time, end_time)),
-            "heart_rate": lambda: self.save_heart_rate_data(
-                db, user_id, self.get_heart_rate_data(db, user_id, start_time, end_time)
-            ),
+            "heart_rate": lambda: save_heart_rate(self.get_heart_rate_data(db, user_id, start_time, end_time)),
             "personal_info": lambda: self.save_personal_info(db, user_id, self.get_personal_info(db, user_id)),
             "vo2_max": lambda: self.save_vo2_data(db, user_id, self.get_vo2_data(db, user_id, start_time, end_time)),
         }
 
         run = self.sync_run(db, user_id)
+        sync = sync_run_var.get()
+        historical = sync is not None and sync.scope == SyncScope.HISTORICAL
         for data_type, fn in tasks.items():
+            if historical and data_type == "activity":
+                activity_pages = self._iter_pages(
+                    db, user_id, _DAILY_ACTIVITY_ENDPOINT, self._activity_date_params(start_time, end_time)
+                )
+                self._save_historical_batches(
+                    run, data_type, activity_pages, _HISTORICAL_ACTIVITY_BATCH_SIZE, save_activity
+                )
+                continue
+            if historical and data_type == "heart_rate":
+                heart_rate_pages = self._iter_heart_rate_pages(db, user_id, start_time, end_time)
+                self._save_historical_batches(
+                    run, data_type, heart_rate_pages, _HISTORICAL_HEART_RATE_BATCH_SIZE, save_heart_rate
+                )
+                continue
             with run.step(data_type) as step:
                 step.record(fn())
 

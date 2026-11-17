@@ -95,6 +95,12 @@ Key variables you may want to customize on the **Backend** service:
 Database and Redis connection strings are injected automatically by Railway — you do not need to set these manually. `REDIS_SSL` defaults to `false` and is only needed if you swap Railway's built-in Redis for an external managed instance with TLS enabled.
 </Note>
 
+## Upgrading to dedicated historical workers
+
+Before deploying a revision that routes imports to `historical_sdk` and `historical_vendor`, add a history worker service using the same backend image, database, Redis and provider environment as the ordinary worker. Set its start command to `scripts/start/history-worker.sh`. Start and verify it before upgrading the API, ordinary worker or beat. A template deployed without this service will leave historical imports queued after that upgrade.
+
+Keep a total of two historical processing slots across replicas, including during deployment; the script defaults to two threads per replica. See [Historical worker capacity](/deployment/docker#historical-worker-capacity) for deployment and rollback requirements.
+
 ## Related guides
 
 <CardGroup cols={2}>

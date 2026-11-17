@@ -42,6 +42,9 @@ class CeleryQueue(StrEnum):
 
     DEFAULT = "default"
     SDK_SYNC = "sdk_sync"
+    # Historical imports have a fixed worker budget separate from live sync.
+    HISTORICAL_SDK = "historical_sdk"
+    HISTORICAL_VENDOR = "historical_vendor"
     GARMIN_SYNC = "garmin_sync"
     WEBHOOK_SYNC = "webhook_sync"
     XML_SYNC = "xml_sync"

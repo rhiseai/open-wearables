@@ -22,6 +22,7 @@ from app.constants.series_types.sdk import (
 )
 from app.constants.workout_types import get_unified_sdk_workout_type
 from app.database import DbSession
+from app.integrations.celery.routing import sdk_import_queue
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import DeviceType, EventCategory, SeriesType, daily_total_flag
 from app.schemas.model_crud.activities import (
@@ -448,14 +449,18 @@ class ImportService:
         """Hand the batch's sleep to process_sdk_sleep, which retries until the lock frees up."""
         sleep_only = request.model_copy(update={"data": SyncRequestData(sleep=request.data.sleep)})
         webhook_batch = current_sdk_webhook_batch()
+        historical = webhook_batch.historical if webhook_batch is not None else False
         celery_app.send_task(
             CeleryTask.PROCESS_SDK_SLEEP,
             args=[
                 sleep_only.model_dump_json(),
                 user_id,
                 batch_id or str(uuid4()),
-                webhook_batch.historical if webhook_batch is not None else False,
+                historical,
             ],
+            # Keep scheduling independent of webhook suppression during an export.
+            # No task argument changes: old consumers can still handle this message.
+            queue=sdk_import_queue(request.syncType, historical),
         )
         log_structured(
             self.log,

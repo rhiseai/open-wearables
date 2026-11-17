@@ -17,7 +17,7 @@
 #   OW_DB_USER           = open-wearables
 #   OW_DB_PASSWORD       = from lucie-staging/ow/db/password
 #
-# /app/ow.env — env_file for app, celery-worker, celery-beat and svix-server:
+# /app/ow.env — env_file for app, celery-worker, celery-history, celery-beat and svix-server:
 #   backend settings plus every provider credential (lucie-staging/ow/*)
 
 services:
@@ -214,6 +214,39 @@ services:
       - db
       - redis
       - app
+    networks:
+      - ow-network
+
+  # Fixed two-slot history lane. Deploy restarts it in place before rolling producers.
+  celery-history:
+    image: ${OW_IMAGE_BACKEND}
+    pull_policy: always
+    restart: unless-stopped
+    command: scripts/start/history-worker.sh
+    env_file:
+      - /app/ow.env
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT}
+      - DB_HOST=db
+      - DB_NAME=${OW_DB_NAME:-open-wearables}
+      - DB_USER=${OW_DB_USER:-open-wearables}
+      - DB_PASSWORD=${OW_DB_PASSWORD}
+      - REDIS_HOST=redis
+      - CELERY_HISTORICAL_CONCURRENCY=2
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "uv run celery -A app.main:celery_app inspect ping -d history@$$HOSTNAME 2>/dev/null | grep -q pong",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    stop_grace_period: 120s
+    depends_on:
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
     networks:
       - ow-network
 
