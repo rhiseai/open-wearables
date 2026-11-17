@@ -22,7 +22,7 @@ from app.api.routes.v1.sync_status import (
 )
 from app.database import _get_db_dependency
 from app.schemas.sync_status import SyncScope, SyncSource, SyncStage, SyncStatus, SyncStatusEvent
-from app.services.api_key_service import _require_api_key, _require_api_key_detached
+from app.services.api_key_service import _require_api_key
 from tests.factories import UserFactory
 
 
@@ -200,8 +200,7 @@ class TestStreamHoldsNoDbSession:
         """
         stream_deps = _dependency_calls(stream_user_sync_status)
         assert _get_db_dependency not in stream_deps
-        assert _require_api_key not in stream_deps
-        assert _require_api_key_detached in stream_deps
+        assert _require_api_key in stream_deps
 
         assert _get_db_dependency in _dependency_calls(list_recent_sync_events)
 

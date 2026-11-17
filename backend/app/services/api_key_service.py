@@ -4,14 +4,14 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException
-from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.database import DbSession, SessionLocal
-from app.models import ApiKey, Developer
+from app.models import ApiKey
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.schemas.model_crud.credentials import ApiKeyCreate, ApiKeyUpdate
 from app.services.services import AppService
-from app.utils.auth import get_current_developer_optional, oauth2_scheme, validate_api_key
+from app.utils.auth import find_current_developer_optional, oauth2_scheme, validate_api_key
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
 from app.utils.security import hash_api_key
 
@@ -88,36 +88,23 @@ class ApiKeyService(AppService[ApiKeyRepository, ApiKey, ApiKeyCreate, ApiKeyUpd
 api_key_service = ApiKeyService(log=getLogger(__name__))
 
 
-async def _authenticate(db: Session, developer: Developer | None, api_key: str | None) -> str:
-    if developer:
-        return str(developer.id)
-    if api_key:
-        return str(api_key_service.validate_api_key(db, api_key).id)
+def _authenticate(token: str | None, api_key: str | None) -> str:
+    with SessionLocal() as db:
+        if developer := find_current_developer_optional(db, token):
+            return str(developer.id)
+        if api_key:
+            return str(api_key_service.validate_api_key(db, api_key).id)
     raise HTTPException(status_code=401, detail="Authentication required: provide JWT token or API key")
 
 
 async def _require_api_key(
-    db: DbSession,
-    developer: Developer | None = Depends(get_current_developer_optional),
-    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
-) -> str:
-    return await _authenticate(db, developer, x_open_wearables_api_key)
-
-
-async def _require_api_key_detached(
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
-    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+    x_open_wearables_api_key: Annotated[str | None, Header(alias="X-Open-Wearables-API-Key")] = None,
 ) -> str:
-    """Same rule as ApiKeyDep, but on a session released before the endpoint returns.
-
-    DbSession is a yield dependency, so anything that declares it — including the usual auth
-    dependency — holds a pooled connection until the response completes. For a stream that is
-    until the client disconnects, so a streaming endpoint has to authenticate detached.
-    """
-    with SessionLocal() as db:
-        return await _authenticate(db, await get_current_developer_optional(db, token), x_open_wearables_api_key)
+    """Authenticate off the event loop and release the connection before the handler runs."""
+    return await run_in_threadpool(_authenticate, token, x_open_wearables_api_key)
 
 
 API_KEY_REQUIRED = Depends(_require_api_key)
 ApiKeyDep = Annotated[str, API_KEY_REQUIRED]
-StreamingApiKeyDep = Annotated[str, Depends(_require_api_key_detached)]
+StreamingApiKeyDep = ApiKeyDep

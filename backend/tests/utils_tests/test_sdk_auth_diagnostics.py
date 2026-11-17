@@ -10,7 +10,6 @@ from unittest.mock import patch
 import pytest
 from fastapi import HTTPException
 from jose import jwt
-from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.services.sdk_token_service import create_sdk_user_token
@@ -20,6 +19,9 @@ from app.utils.config_utils import LogFormat, LogLevel
 from app.utils.context import trace_id_var
 from app.utils.structured_logging import log_structured
 from tests.factories import ApiKeyFactory
+
+pytestmark = pytest.mark.usefixtures("auth_sessions")
+
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
 PRIVATE_TRACE = "private-trace-must-not-be-auth-diagnostic-data"
@@ -180,14 +182,14 @@ def test_unavailable_stdout_does_not_change_auth_decisions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_closed_stdout_preserves_the_original_auth_401(db: Session) -> None:
+async def test_closed_stdout_preserves_the_original_auth_401() -> None:
     closed = StringIO()
     closed.close()
     with (
         patch("app.utils.structured_logging.sys.stdout", closed),
         pytest.raises(HTTPException) as raised,
     ):
-        await get_sdk_auth(db, None, None)
+        await get_sdk_auth(None, None)
     assert raised.value.status_code == 401
     assert raised.value.detail == "Authentication required: provide SDK token or API key"
     assert raised.value.headers is None
@@ -197,7 +199,6 @@ async def test_closed_stdout_preserves_the_original_auth_401(db: Session) -> Non
 @pytest.mark.parametrize(("kind", "reason"), BEARER_FAILURES)
 @pytest.mark.parametrize("has_api_key", [False, True])
 async def test_bearer_failure_has_one_final_rejection_or_recovered_fallback(
-    db: Session,
     kind: str,
     reason: AuthReason,
     has_api_key: bool,
@@ -207,13 +208,13 @@ async def test_bearer_failure_has_one_final_rejection_or_recovered_fallback(
     bearer = _bearer(kind)
     capsys.readouterr()
     if api_key is not None:
-        result = await get_sdk_auth(db, bearer, api_key.plain_key)
+        result = await get_sdk_auth(bearer, api_key.plain_key)
         assert result.auth_type == "api_key"
         assert result.api_key_id == str(api_key.id)
         outcome = AuthOutcome.RECOVERED
     else:
         with pytest.raises(HTTPException) as raised:
-            await get_sdk_auth(db, bearer, None)
+            await get_sdk_auth(bearer, None)
         assert raised.value.status_code == 401
         assert raised.value.detail == "Authentication required: provide SDK token or API key"
         assert raised.value.headers is None
@@ -230,12 +231,11 @@ async def test_bearer_failure_has_one_final_rejection_or_recovered_fallback(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", [None, "expired"])
 async def test_real_invalid_api_key_is_the_final_rejection_reason(
-    db: Session,
     kind: str | None,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     with pytest.raises(HTTPException) as raised:
-        await get_sdk_auth(db, _bearer(kind) if kind else None, "private-invalid-api-key")
+        await get_sdk_auth(_bearer(kind) if kind else None, "private-invalid-api-key")
     assert raised.value.status_code == 401
     assert raised.value.detail == "Invalid or missing API key"
     assert raised.value.headers is None
@@ -246,7 +246,6 @@ async def test_real_invalid_api_key_is_the_final_rejection_reason(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [401, 503])
 async def test_api_key_exception_is_preserved_and_only_401_is_an_auth_rejection(
-    db: Session,
     status_code: int,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -255,7 +254,7 @@ async def test_api_key_exception_is_preserved_and_only_401_is_an_auth_rejection(
         patch("app.utils.auth.validate_api_key", side_effect=error),
         pytest.raises(HTTPException) as raised,
     ):
-        await get_sdk_auth(db, None, "private-api-key-fixture")
+        await get_sdk_auth(None, "private-api-key-fixture")
     assert raised.value is error
     output = capsys.readouterr().out
     assert "original private detail" not in output
@@ -269,13 +268,12 @@ async def test_api_key_exception_is_preserved_and_only_401_is_an_auth_rejection(
 
 @pytest.mark.asyncio
 async def test_sdk_precedence_and_optional_developer_probe_emit_no_rejections(
-    db: Session,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     token = create_sdk_user_token("private-app-fixture", USER_ID)
     with patch("app.utils.auth.validate_api_key", side_effect=AssertionError("fallback must not run")):
-        result = await get_sdk_auth(db, token, "invalid-unused-api-key")
-        combined = await get_combined_auth(db, token, "invalid-unused-api-key")
+        result = await get_sdk_auth(token, "invalid-unused-api-key")
+        combined = await get_combined_auth(token, "invalid-unused-api-key")
     assert result.auth_type == combined.auth_type == "sdk_token"
     assert str(result.user_id) == str(combined.user_id) == USER_ID
     assert _events(capsys.readouterr().out) == []
@@ -283,12 +281,11 @@ async def test_sdk_precedence_and_optional_developer_probe_emit_no_rejections(
 
 @pytest.mark.asyncio
 async def test_api_key_without_bearer_is_ordinary_success_not_recovery(
-    db: Session,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     api_key = ApiKeyFactory()
     capsys.readouterr()
-    result = await get_sdk_auth(db, None, api_key.plain_key)
+    result = await get_sdk_auth(None, api_key.plain_key)
     assert result.auth_type == "api_key"
     assert result.api_key_id == str(api_key.id)
     assert _events(capsys.readouterr().out) == []
@@ -296,7 +293,6 @@ async def test_api_key_without_bearer_is_ordinary_success_not_recovery(
 
 @pytest.mark.asyncio
 async def test_malformed_sdk_subject_does_not_start_a_new_fallback_path(
-    db: Session,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     token = jwt.encode(
@@ -308,5 +304,5 @@ async def test_malformed_sdk_subject_does_not_start_a_new_fallback_path(
         patch("app.utils.auth.validate_api_key", side_effect=AssertionError("fallback must not run")),
         pytest.raises(ValueError, match="UUID"),
     ):
-        await get_sdk_auth(db, token, "unused-api-key")
+        await get_sdk_auth(token, "unused-api-key")
     assert _events(capsys.readouterr().out) == []

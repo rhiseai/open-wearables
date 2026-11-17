@@ -5,9 +5,11 @@ from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from jose.exceptions import ExpiredSignatureError
+from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
-from app.database import DbSession
+from app.database import DbSession, SessionLocal
 from app.models import ApiKey, Developer
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.repositories.developer_repository import DeveloperRepository
@@ -28,8 +30,12 @@ def validate_api_key(db: DbSession, key: str | None) -> ApiKey:
     return api_key
 
 
+def _find_developer(developer_id: UUID) -> Developer | None:
+    with SessionLocal() as db:
+        return developer_repository.get(db, developer_id)
+
+
 async def get_current_developer(
-    db: DbSession,
     token: Annotated[str | None, Depends(oauth2_scheme)],
 ) -> Developer:
     """Get current authenticated developer from JWT token.
@@ -62,7 +68,7 @@ async def get_current_developer(
     except JWTError:
         raise credentials_exception
 
-    developer = developer_repository.get(db, UUID(developer_id))
+    developer = await run_in_threadpool(_find_developer, UUID(developer_id))
     if not developer:
         raise credentials_exception
 
@@ -70,9 +76,17 @@ async def get_current_developer(
 
 
 async def get_current_developer_optional(
-    db: DbSession,
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
 ) -> Developer | None:
+    return await run_in_threadpool(_find_optional_developer, token)
+
+
+def _find_optional_developer(token: str | None) -> Developer | None:
+    with SessionLocal() as db:
+        return find_current_developer_optional(db, token)
+
+
+def find_current_developer_optional(db: Session, token: str | None) -> Developer | None:
     """Get current authenticated developer from JWT token, or None if not authenticated.
 
     SDK-scoped tokens return None - they are not developer tokens.
@@ -107,8 +121,12 @@ DeveloperDep = Annotated[Developer, Depends(get_current_developer)]
 DeveloperOptionalDep = Annotated[Developer | None, Depends(get_current_developer_optional)]
 
 
+def _find_api_key_id(key: str) -> str:
+    with SessionLocal() as db:
+        return str(validate_api_key(db, key).id)
+
+
 async def get_sdk_auth(
-    db: DbSession,
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
     x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
 ) -> SDKAuthContext:
@@ -145,14 +163,14 @@ async def get_sdk_auth(
     # Fall back to API key (backwards compatibility)
     if x_open_wearables_api_key:
         try:
-            api_key = validate_api_key(db, x_open_wearables_api_key)
+            api_key_id = await run_in_threadpool(_find_api_key_id, x_open_wearables_api_key)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_401_UNAUTHORIZED:
                 log_auth_decision(AuthReason.API_KEY_INVALID, AuthOutcome.REJECTED)
             raise
         if token:
             log_auth_decision(reason, AuthOutcome.RECOVERED)
-        return SDKAuthContext(auth_type="api_key", api_key_id=str(api_key.id))
+        return SDKAuthContext(auth_type="api_key", api_key_id=api_key_id)
 
     log_auth_decision(reason, AuthOutcome.REJECTED)
     raise SDKAuthenticationError(reason)
@@ -162,7 +180,6 @@ SDKAuthDep = Annotated[SDKAuthContext, Depends(get_sdk_auth)]
 
 
 async def get_combined_auth(
-    db: DbSession,
     token: Annotated[str | None, Depends(oauth2_scheme)] = None,
     x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
 ) -> SDKAuthContext:
@@ -173,10 +190,10 @@ async def get_combined_auth(
     through to ``get_sdk_auth``. An ``sdk_token`` caller speaks only for its own user, so
     endpoints branching on ``auth_type`` have to scope it themselves.
     """
-    if developer := await get_current_developer_optional(db, token):
+    if developer := await get_current_developer_optional(token):
         return SDKAuthContext(auth_type="developer", developer_id=str(developer.id))
 
-    return await get_sdk_auth(db, token, x_open_wearables_api_key)
+    return await get_sdk_auth(token, x_open_wearables_api_key)
 
 
 CombinedAuthDep = Annotated[SDKAuthContext, Depends(get_combined_auth)]
