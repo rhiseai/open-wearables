@@ -295,3 +295,26 @@ def test_finalizer_busy_lease_defers_without_reporting_an_error() -> None:
     load.assert_not_called()
     capture.assert_not_called()
     redis_client.lock.return_value.release.assert_not_called()
+
+
+@patch("app.services.sdk.sleep_service.celery_app")
+@pytest.mark.parametrize(("provider", "records", "naps"), [("apple", 2, 1), ("samsung", 1, 0)])
+def test_an_hour_and_three_quarters_awake_ends_an_apple_sleep(
+    mock_finalize: MagicMock, db: Session, provider: str, records: int, naps: int
+) -> None:
+    """RHISE-7780: Apple samples 1h45 apart are two sleeps; other SDK sources keep the 2-hour gap."""
+    user = UserFactory()
+    night_start = datetime(2026, 11, 15, 23, 0, tzinfo=timezone.utc)
+    handle_sleep_data(
+        db,
+        _request(
+            _sample(night_start, night_start + timedelta(hours=3)),
+            _sample(night_start + timedelta(hours=4, minutes=45), night_start + timedelta(hours=8, minutes=30)),
+            provider=provider,
+        ),
+        str(user.id),
+    )
+
+    stored = db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user.id).all()
+    assert len(stored) == records
+    assert sum(bool(record.sleep_detail and record.sleep_detail.is_nap) for record in stored) == naps

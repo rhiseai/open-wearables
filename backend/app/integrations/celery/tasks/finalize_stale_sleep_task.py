@@ -5,7 +5,6 @@ from uuid import UUID
 
 from celery import shared_task
 
-from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.database import SessionLocal
 from app.integrations.redis_client import get_redis_client
@@ -20,6 +19,7 @@ from app.services.sdk.sleep_service import (
     prune_sleep_state_registry,
     release_sleep_lock,
 )
+from app.services.sleep_naps import sleep_gap_minutes
 from app.utils.sentry_helpers import log_and_capture_error
 
 logger = getLogger(__name__)
@@ -30,7 +30,7 @@ def finalize_stale_sleeps() -> None:
     """Housekeeping: close Redis sleep sessions that have gone quiet.
 
     Sessions are already flushed to Postgres on every SDK batch. This task only
-    needs to persist+close Redis state once ``sleep_end_gap_minutes`` of quiet
+    needs to persist+close Redis state once :func:`sleep_gap_minutes` of quiet
     time has elapsed (or re-flush if an earlier write failed).
     """
     now = datetime.now(timezone.utc)
@@ -57,7 +57,7 @@ def finalize_stale_sleeps() -> None:
                         end_time = state.end_time
                         if end_time.tzinfo is None:
                             end_time = end_time.replace(tzinfo=timezone.utc)
-                        if now - end_time >= timedelta(minutes=settings.sleep_end_gap_minutes):
+                        if now - end_time >= timedelta(minutes=sleep_gap_minutes(state.provider)):
                             finish_sleep(db, user_id, state, commit=False)
                             closed_keys.append(storage_key)
                     db.commit()

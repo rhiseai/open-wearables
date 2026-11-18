@@ -83,7 +83,7 @@ Apple Health provides the widest range of health data types:
 
 - **Activity**: Steps, distance, flights climbed, active energy
 - **Heart**: Heart rate, resting HR, HRV, VO2 max
-- **Sleep**: Sleep sessions with stages (flushed to the database on every SDK sync batch; Redis only holds the in-progress accumulator until a 2-hour quiet gap closes the session)
+- **Sleep**: Sleep sessions with stages (flushed to the database on every SDK sync batch; Redis only holds the in-progress accumulator until a 90-minute quiet gap closes the session). Sessions less than 90 minutes apart are one sleep; on each local wake date the sleep with the most minutes is the main sleep and every other one is stored as a nap (`is_nap`), which daily summaries count apart from the night
 - **Workouts**: All workout types with detailed metrics
 - **Body**: Weight, height, body fat percentage, basal body temperature
 - **Nutrition**: Dietary energy, protein, carbohydrates, fat, fiber, sugar, caffeine, water (→ `hydration`)
