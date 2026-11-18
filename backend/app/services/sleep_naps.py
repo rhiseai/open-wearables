@@ -16,10 +16,26 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
+from app.config import settings
+from app.schemas.enums import ProviderName
+
 # An hour and a half awake still belongs to the same sleep: people can lie
 # awake that long trying to fall asleep again. A longer gap starts a separate
 # sleep (product decision on RHISE-7667, as WHOOP splits them).
 MAX_SPLIT_GAP = timedelta(minutes=90)
+
+
+def sleep_gap_minutes(provider: str | None) -> int:
+    """Minutes without sleep data after which a source's raw samples start a new sleep.
+
+    Apple's samples end a sleep after :data:`MAX_SPLIT_GAP`, the same gap that
+    splits a day into its main sleep and naps; with the general
+    ``sleep_end_gap_minutes`` (120) a 90-120 minute wake was stored inside the
+    night and could never become a nap. Other sources keep the general gap.
+    """
+    if provider == ProviderName.APPLE:
+        return int(MAX_SPLIT_GAP.total_seconds() // 60)
+    return settings.sleep_end_gap_minutes
 
 
 @dataclass(frozen=True)

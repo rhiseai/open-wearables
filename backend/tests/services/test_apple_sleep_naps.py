@@ -12,12 +12,12 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
-from app.config import settings
 from app.models import DataSource, EventRecord
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate
 from app.schemas.responses.activity import SleepSummary
 from app.services.event_record_service import event_record_service
+from app.services.sleep_naps import sleep_gap_minutes
 from app.services.summaries_service import SummariesService
 from tests.factories import DataSourceFactory, UserFactory
 
@@ -62,7 +62,7 @@ def _write(db: Session, source: DataSource, start: str, end: str, sleep_minutes:
         source.user_id,
         record,
         detail,
-        settings.sleep_end_gap_minutes,
+        sleep_gap_minutes(source.provider),
     )
 
 
@@ -127,14 +127,34 @@ def test_the_main_sleep_moves_to_a_longer_session_that_arrives_later(db: Session
     assert summary.nap_count == 1
 
 
-def test_sessions_less_than_two_hours_apart_still_merge_into_one_night(db: Session) -> None:
-    """OW's own merge (``sleep_end_gap_minutes``) runs first and is unchanged."""
+def test_an_hour_awake_is_still_one_night(db: Session) -> None:
+    """Apple sessions less than 90 minutes apart merge into one record, as before."""
     source = DataSourceFactory(provider=ProviderName.APPLE)
     _write(db, source, "2026-11-15T23:00:00", "2026-11-16T02:00:00", 170)
     _write(db, source, "2026-11-16T03:00:00", "2026-11-16T07:00:00", 220)
 
     assert _naps(db, source) == {"23:00": False}
     assert _summary(db, source, "2026-11-16").nap_count == 0
+
+
+def test_an_hour_and_three_quarters_awake_splits_off_a_nap(db: Session) -> None:
+    """A 1h45 wake used to stay inside the night (OW merged Apple records up to 2 hours apart)."""
+    source = DataSourceFactory(provider=ProviderName.APPLE)
+    _write(db, source, "2026-11-15T23:00:00", "2026-11-16T02:00:00", 170)
+    _write(db, source, "2026-11-16T03:45:00", "2026-11-16T07:00:00", 190)
+
+    assert _naps(db, source) == {"23:00": True, "03:45": False}
+    summary = _summary(db, source, "2026-11-16")
+    assert summary.duration_minutes == 190
+    assert summary.nap_count == 1
+
+
+def test_other_providers_still_merge_up_to_two_hours(db: Session) -> None:
+    source = DataSourceFactory(provider=ProviderName.OURA, source="oura")
+    _write(db, source, "2026-11-15T23:00:00", "2026-11-16T02:00:00", 170)
+    _write(db, source, "2026-11-16T03:45:00", "2026-11-16T07:00:00", 190)
+
+    assert _naps(db, source) == {"23:00": False}
 
 
 def test_another_apple_device_is_marked_on_its_own(db: Session) -> None:
