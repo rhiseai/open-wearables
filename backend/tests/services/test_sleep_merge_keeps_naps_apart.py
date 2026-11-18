@@ -125,3 +125,12 @@ def test_apple_sessions_merge_as_before(db: Session) -> None:
     _write(db, source, "2026-11-16T03:00:00", "2026-11-16T07:00:00", is_nap=False)
 
     assert _stored(db, source) == [("23:00", "07:00", False)]
+
+
+def test_the_same_sleep_sent_twice_with_another_flag_still_merges(db: Session) -> None:
+    """Overlapping records are one sleep: two copies must never be counted as a night and a nap."""
+    source = DataSourceFactory(provider=ProviderName.GARMIN, source="garmin")
+    _write(db, source, "2026-11-16T13:00:00", "2026-11-16T14:00:00", is_nap=True)
+    _write(db, source, "2026-11-16T13:05:00", "2026-11-16T14:10:00", is_nap=False)
+
+    assert _stored(db, source) == [("13:00", "14:10", False)]
