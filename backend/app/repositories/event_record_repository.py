@@ -357,11 +357,15 @@ class EventRecordRepository(
         external_id: str | None = None,
         *,
         replace_own_window: bool = False,
+        is_nap: bool | None = None,
     ) -> list[EventRecord]:
         """Lock the complete adjacent component of one exact data source.
 
         Own-ID rows are included even after an authoritative provider moves its
         session. Their stale window must not enlarge a shortened replacement.
+        With ``is_nap`` set, only adjacent rows of the same kind join: a nap the
+        provider flagged never merges into a main sleep, nor the reverse
+        (RHISE-7796). Own-ID rows join whatever their flag.
         The caller holds the user advisory lock before this first read.
         """
         threshold = timedelta(minutes=threshold_minutes)
@@ -371,6 +375,8 @@ class EventRecordRepository(
                 self.model.start_datetime <= end_time + threshold,
                 self.model.end_datetime >= start_time - threshold,
             )
+            if is_nap is not None:
+                adjacent = and_(adjacent, _nap_condition(is_nap))
             if external_id is not None:
                 adjacent = or_(adjacent, self.model.external_id == external_id)
             records = (

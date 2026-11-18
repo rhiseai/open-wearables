@@ -569,6 +569,8 @@ class EventRecordService(
             threshold_minutes,
             record.external_id,
             replace_own_window=authoritative,
+            # Apple has no nap flag of its own: every SDK session arrives as main sleep.
+            is_nap=bool(detail.is_nap) if record.provider != ProviderName.APPLE else None,
         )
         own = [
             candidate
