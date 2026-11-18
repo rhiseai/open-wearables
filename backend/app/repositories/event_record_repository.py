@@ -397,6 +397,28 @@ class EventRecordRepository(
             if len(candidates) == previous:
                 return sorted(candidates.values(), key=lambda record: (record.start_datetime, record.id))
 
+    def get_sleep_sessions_ending_between(
+        self,
+        db_session: DbSession,
+        data_source_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[EventRecord]:
+        """One exact data source's sleep sessions ending in ``[start_time, end_time)``, with details."""
+        return (
+            db_session.query(self.model)
+            .options(selectinload(self.model.sleep_detail))
+            .filter(
+                self.model.data_source_id == data_source_id,
+                self.model.category == "sleep",
+                self.model.type == "sleep_session",
+                self.model.end_datetime >= start_time,
+                self.model.end_datetime < end_time,
+            )
+            .order_by(self.model.start_datetime, self.model.id)
+            .all()
+        )
+
     def _resolve_values(self, db_session: DbSession, creators: list[EventRecordCreate]) -> list[dict]:
         """Resolve data sources in batch and build event_record row values."""
         identity_to_source_id = self.data_source_repo.resolve_creators(db_session, creators)
