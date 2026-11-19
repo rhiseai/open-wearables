@@ -456,9 +456,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        if provider_user_id and not connection.provider_user_id:
+        if provider_user_id and provider_user_id != connection.provider_user_id:
+            # The new tokens belong to this account, and webhooks are routed by its id.
             connection.provider_user_id = provider_user_id
-        if provider_username and not connection.provider_username:
+            connection.provider_username = provider_username
+        elif provider_username and not connection.provider_username:
             connection.provider_username = provider_username
         if scope and connection.scope != scope:
             connection.scope = scope

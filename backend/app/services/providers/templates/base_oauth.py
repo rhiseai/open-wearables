@@ -16,9 +16,11 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_5
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
+from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import (
     OAuthState,
     OAuthTokenResponse,
@@ -446,7 +448,9 @@ class BaseOAuthTemplate(ABC):
         oauth_state: OAuthState,
     ) -> None:
         """Saves or updates the user connection."""
-        provider_user_id = user_info.get("user_id")
+        # The column is text; compare like with like when an account switch is detected below.
+        raw_provider_user_id = user_info.get("user_id")
+        provider_user_id = str(raw_provider_user_id) if raw_provider_user_id is not None else None
         provider_username = user_info.get("username")
 
         scope = user_info.get("scope") or token_response.scope
@@ -461,6 +465,22 @@ class BaseOAuthTemplate(ABC):
 
         if existing_connection:
             was_inactive = existing_connection.status != ConnectionStatus.ACTIVE
+            previous_provider_user_id = existing_connection.provider_user_id
+            if provider_user_id and previous_provider_user_id and provider_user_id != previous_provider_user_id:
+                # A different provider account: its data belongs to another person and would
+                # merge with this account's overlapping sleep, so drop it before the backfill.
+                deleted = DataSourceRepository().delete_user_provider_data(
+                    db, user_id, ProviderName(self.provider_name)
+                )
+                log_structured(
+                    logger,
+                    "warning",
+                    "Provider account switched, previous account data deleted",
+                    action="provider_account_switched",
+                    provider=self.provider_name,
+                    user_id=str(user_id),
+                    deleted_data_sources=deleted,
+                )
             # Update tokens, user info, and scope
             self.connection_repo.update_connection_info(
                 db,
