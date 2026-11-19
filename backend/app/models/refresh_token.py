@@ -4,7 +4,17 @@ from sqlalchemy import CheckConstraint
 from sqlalchemy.orm import Mapped, relationship
 
 from app.database import BaseDbModel
-from app.mappings import FKApplication, FKDeveloper, FKUser, Indexed, ManyToOne, PrimaryKey, str_64
+from app.mappings import (
+    FKApplication,
+    FKDeveloper,
+    FKRefreshToken,
+    FKUser,
+    Indexed,
+    ManyToOne,
+    PrimaryKey,
+    Unique,
+    str_64,
+)
 from app.models import Application
 from app.schemas.auth import SDKTokenOrigin, TokenType
 
@@ -41,6 +51,10 @@ class RefreshToken(BaseDbModel):
 
     # For Developer tokens
     developer_id: Mapped[Indexed[FKDeveloper] | None]
+
+    # Set on a token issued by rotation: the token it replaced. A client that never read the
+    # rotation response replays the old token and is given this one again.
+    replaces_id: Mapped[Unique[FKRefreshToken] | None]
 
     last_used_at: Mapped[datetime | None]
     revoked_at: Mapped[datetime | None]

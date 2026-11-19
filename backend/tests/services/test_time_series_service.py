@@ -9,6 +9,8 @@ Tests cover:
 - Reading time series at raw and downsampled resolutions
 """
 
+import gc
+import weakref
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -125,6 +127,30 @@ class TestTimeSeriesServiceBulkCreateSamples:
         # Assert
         total_count = timeseries_service.get_total_count(db)
         assert total_count >= initial_count + 2
+
+    def test_committed_samples_are_released_while_the_session_lives_on(self, db: Session) -> None:
+        """A sync commits many writes on one session; each write's samples go once it commits."""
+        user = UserFactory()
+        now = datetime.now(timezone.utc)
+        samples = [
+            HeartRateSampleCreate(
+                id=uuid4(),
+                user_id=user.id,
+                provider_name="polar",
+                recorded_at=now - timedelta(minutes=i),
+                value=60 + i,
+                series_type=SeriesType.heart_rate,
+            )
+            for i in range(3)
+        ]
+        refs = [weakref.ref(s) for s in samples]
+
+        timeseries_service.bulk_create_samples(db, samples)
+        db.commit()
+        del samples
+        gc.collect()
+
+        assert [ref() for ref in refs] == [None, None, None]
 
 
 class TestTimeSeriesServiceGetDailyHistogram:

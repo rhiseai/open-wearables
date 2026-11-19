@@ -141,7 +141,7 @@ Choose `list` (`GOOGLE_USE_RECONCILE=false`) only when you specifically need per
 #--- Google ---#
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
-GOOGLE_DEFAULT_SCOPE=openid email https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly https://www.googleapis.com/auth/googlehealth.nutrition.readonly https://www.googleapis.com/auth/googlehealth.sleep.readonly https://www.googleapis.com/auth/googlehealth.settings.readonly
+GOOGLE_DEFAULT_SCOPE=openid email https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly https://www.googleapis.com/auth/googlehealth.nutrition.readonly https://www.googleapis.com/auth/googlehealth.sleep.readonly
 # Fetch mode for 24/7 data (see "Data granularity and fetch modes")
 GOOGLE_USE_RECONCILE=true
 ```
@@ -152,7 +152,7 @@ GOOGLE_USE_RECONCILE=true
     |----------|-------------|---------|
     | `GOOGLE_CLIENT_ID` | OAuth Client ID | — |
     | `GOOGLE_CLIENT_SECRET` | OAuth Client Secret | — |
-    | `GOOGLE_DEFAULT_SCOPE` | Space-separated Health API scopes to request | (full read-only set) |
+    | `GOOGLE_DEFAULT_SCOPE` | Space-separated Health API scopes to request | Activity, health measurements, nutrition and sleep read-only scopes, plus `openid email` |
     | `GOOGLE_USE_RECONCILE` | `true` = reconcile (merged, app-accurate, no device attribution); `false` = list (per-device). | `true` |
     | `DEFAULT_DATA_GRANULARITY` | Must be `raw` for Google Health while `rollUp` is disabled — see the [fetch modes](#data-granularity-and-fetch-modes) table | `raw` |
 
@@ -276,8 +276,9 @@ Verification attaches to the **Google Cloud project** — its consent screen and
         | `health_metrics_and_measurements.readonly` | Heart rate, resting heart rate, HRV, SpO₂, respiratory rate, weight, body fat, core body temperature, blood glucose |
         | `nutrition.readonly` | Hydration |
         | `sleep.readonly` | Sleep sessions and stages |
-        | `settings.readonly` | The user's Health account settings. Open Wearables also reads `/v4/users/me/identity` during the OAuth callback to resolve the stable `healthUserId` that inbound webhooks are matched against |
         | `openid`, `email` | Sign-in only — neither is sensitive or restricted |
+
+        The OAuth callback resolves the stable `healthUserId` through `/v4/users/me/identity`, using one of the health read scopes above.
 
         <Tip>
         Trim `GOOGLE_DEFAULT_SCOPE` to the data types you actually surface before you submit. Every extra restricted scope is another justification to defend, and unused ones are reviewed just as hard as the rest.

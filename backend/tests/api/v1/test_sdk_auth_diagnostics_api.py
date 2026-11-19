@@ -323,7 +323,7 @@ def test_rejected_refresh_credentials_preserve_401_and_bearer_challenge(
 
 
 @pytest.mark.parametrize("token_kind", ["sdk", "developer"])
-def test_rotation_logs_accepted_not_cross_request_recovery_and_replay_is_rejected(
+def test_rotation_logs_accepted_and_replay_recovers_until_the_successor_is_used(
     client: TestClient,
     db: Session,
     token_kind: str,
@@ -353,17 +353,33 @@ def test_rotation_logs_accepted_not_cross_request_recovery_and_replay_is_rejecte
     assert saved_old is not None
     assert saved_old.revoked_at is not None
     replay = client.post("/api/v1/token/refresh", json={"refresh_token": old})
-    assert replay.status_code == 401
-    assert replay.json() == {"detail": "Invalid or revoked refresh token"}
-    assert replay.headers["www-authenticate"] == "Bearer"
+    assert replay.status_code == 200
+    replayed = replay.json()
+    assert replayed["refresh_token"] == data["refresh_token"]
+    replay_claims = jwt.decode(replayed["access_token"], settings.secret_key, algorithms=[settings.algorithm])
+    assert replay_claims["sub"] == identity_id
     next_response = client.post("/api/v1/token/refresh", json={"refresh_token": data["refresh_token"]})
     assert next_response.status_code == 200
+    late_replay = client.post("/api/v1/token/refresh", json={"refresh_token": old})
+    assert late_replay.status_code == 401
+    assert late_replay.json() == {"detail": "Invalid or revoked refresh token"}
+    assert late_replay.headers["www-authenticate"] == "Bearer"
     output = capsys.readouterr().out
-    first, failed_replay, second = _decisions(output)
+    first, recovered_replay, second, failed_replay = _decisions(output)
     _assert_decision(first, "refresh", "refresh_rotated", "accepted")
-    _assert_decision(failed_replay, "refresh", "refresh_invalid_or_revoked")
+    _assert_decision(recovered_replay, "refresh", "refresh_replayed", "recovered")
     _assert_decision(second, "refresh", "refresh_rotated", "accepted")
-    for private in (identity_id, old, old[:10], data["access_token"], data["refresh_token"]):
+    _assert_decision(failed_replay, "refresh", "refresh_invalid_or_revoked")
+    private_values = (
+        identity_id,
+        old,
+        old[:10],
+        data["access_token"],
+        data["refresh_token"],
+        replayed["access_token"],
+        next_response.json()["refresh_token"],
+    )
+    for private in private_values:
         assert private not in output
         assert private not in caplog.text
 

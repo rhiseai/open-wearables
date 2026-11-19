@@ -33,7 +33,7 @@ See: https://www.polar.com/accesslink-api/#webhooks
 import json
 import logging
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 from uuid import uuid4
 
 from celery import current_app as celery_app
@@ -208,7 +208,9 @@ class PolarWebhookHandler(BaseWebhookHandler):
             )
             return {"status": "error", "error": "missing url"}
 
-        path = urlparse(event.url).path
+        parsed_url = urlparse(event.url)
+        path = parsed_url.path
+        params = dict(parse_qsl(parsed_url.query, keep_blank_values=True))
         user_id = connection.user_id
 
         self.connection_repo.update_last_synced_at(db, connection)
@@ -234,7 +236,7 @@ class PolarWebhookHandler(BaseWebhookHandler):
 
             if not self.data_247:
                 return {"status": "error", "error": "data_247 service not initialised"}
-            saved = self.data_247.fetch_and_save_from_webhook(db, user_id, event.event, path)
+            saved = self.data_247.fetch_and_save_from_webhook(db, user_id, event.event, path, params=params)
             db.commit()
             return {"status": "accepted", "user_id": str(user_id), "saved": saved}
         except Exception as exc:

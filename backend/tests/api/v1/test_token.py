@@ -175,10 +175,10 @@ class TestRefreshToken:
         # Assert
         assert response.status_code in [400, 422]
 
-    def test_refresh_token_rotation_invalidates_old_token(
+    def test_refresh_token_replay_returns_the_same_successor_until_it_is_used(
         self, client: TestClient, db: Session, api_v1_prefix: str
     ) -> None:
-        """Old refresh token should be invalid after rotation."""
+        """A rotated token presented again gets the same new token until that one is used."""
         # Arrange
         user = UserFactory()
         old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
@@ -191,12 +191,14 @@ class TestRefreshToken:
         assert response.status_code == 200
         new_refresh_token = response.json()["refresh_token"]
 
-        # Assert - old token should be invalid
+        # Assert - a client that never read the response gets the same new token back
         response = client.post(
             f"{api_v1_prefix}/token/refresh",
             json={"refresh_token": old_refresh_token},
         )
-        assert response.status_code == 401
+        assert response.status_code == 200
+        assert response.json()["refresh_token"] == new_refresh_token
+        assert response.json()["access_token"]
 
         # Assert - new token should work
         response = client.post(
@@ -204,6 +206,13 @@ class TestRefreshToken:
             json={"refresh_token": new_refresh_token},
         )
         assert response.status_code == 200
+
+        # Assert - once the new token was used, the old one is refused
+        response = client.post(
+            f"{api_v1_prefix}/token/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert response.status_code == 401
 
 
 class TestRevokeRefreshToken:
@@ -230,6 +239,23 @@ class TestRevokeRefreshToken:
             json={"refresh_token": refresh_token},
         )
         assert refresh_response.status_code == 401
+
+    def test_revoke_with_a_rotated_token_ends_its_successor(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """A client that only kept the rotated token can still log out."""
+        user = UserFactory()
+        old_refresh_token = refresh_token_service.create_sdk_refresh_token(db, user.id, SDKTokenOrigin.ADMIN)
+        response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 200
+        new_refresh_token = response.json()["refresh_token"]
+
+        response = client.post(f"{api_v1_prefix}/token/revoke", json={"refresh_token": old_refresh_token})
+        assert response.status_code == 204
+
+        for token in (old_refresh_token, new_refresh_token):
+            response = client.post(f"{api_v1_prefix}/token/refresh", json={"refresh_token": token})
+            assert response.status_code == 401
 
     def test_revoke_token_not_found(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
         """Non-existent refresh token should return 404."""

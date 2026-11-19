@@ -22,6 +22,12 @@ In v0.7 and below, Open Wearables runs a historical sync automatically when a us
 To control the range yourself, set `HISTORICAL_SYNC_ON_CONNECT=false` and call `POST /api/v1/providers/{provider}/users/{user_id}/sync/historical` explicitly, where `days` defaults to 90 and is capped at 365. See [Historical Backfill](/dev-guides/integration-guide#step-3-historical-backfill-automatic) in the Integration Guide for the full flow.
 </Info>
 
+## Processing historical imports
+
+Historical mobile SDK imports and provider pulls run on dedicated workers with bounded concurrency, leaving the ordinary workers available for current syncs. Garmin webhook imports and XML uploads keep their existing queues. A busy history queue can delay the start of a backfill without changing its requested date range. See [Historical worker capacity](/deployment/docker#historical-worker-capacity) before upgrading a self-hosted deployment.
+
+Oura historical activity and heart rate are fetched page by page and committed in smaller batches: up to seven activity days or 10,000 heart-rate samples per write batch. Already committed batches remain available if a later fetch or write fails, and the sync result reports the affected data type as partial when it has saved data. Repeating the historical request updates existing samples instead of creating duplicate rows. Subscribed timeseries webhooks can arrive as multiple smaller events for the same historical run.
+
 ## Maximum Historical Range
 
 **Max range** is the furthest point in the past from which a provider allows historical data to be backfilled.

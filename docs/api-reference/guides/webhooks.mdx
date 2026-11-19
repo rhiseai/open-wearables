@@ -212,7 +212,7 @@ Fired once when a complete session is saved or merged.
 
 ### Timeseries Events
 
-Fired per ingestion batch — one canonical group event per distinct `(user, provider, series_type)` combination in a sync run. Open Wearables coalesces writes from the same Mobile SDK batch instead of emitting both group and granular duplicates. Each event carries the `samples` array, so consumers can store data directly from the webhook without issuing follow-up API calls.
+Fired per ingestion batch — one canonical group event per distinct `(user, provider, series_type)` combination in that batch. A historical sync run can commit several batches and emit several events for the same series type. Open Wearables coalesces writes from the same Mobile SDK batch instead of emitting both group and granular duplicates. Each event carries the `samples` array, so consumers can store data directly from the webhook without issuing follow-up API calls.
 
 | Event | Series types included |
 |-------|-----------------------|

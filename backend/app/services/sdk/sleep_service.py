@@ -38,6 +38,7 @@ from app.schemas.providers.mobile_sdk import (
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
+from app.services.sleep_naps import sleep_gap_minutes
 from app.services.sleep_reconciliation import merge_sleep_stages
 from app.utils.structured_logging import log_structured
 
@@ -247,7 +248,7 @@ def _apply_transition(
         # New sample is entirely after the session end.
         delta_seconds = (start_time - state.end_time).total_seconds()
 
-    if delta_seconds > settings.sleep_end_gap_minutes * 60:
+    if delta_seconds > sleep_gap_minutes(state.provider) * 60:
         persist_sleep(db_session, user_id, state, close=True, commit=commit)
         state = _create_new_sleep_state(
             start_time,
@@ -326,7 +327,7 @@ def handle_sleep_data(
     cloud providers) so summaries are available immediately — including while
     the night is still in progress. Redis state is only deleted when a session
     boundary is detected (inter-sample gap or wall-clock quiet gap >
-    ``sleep_end_gap_minutes``).
+    :func:`sleep_gap_minutes` for the source).
 
     A PostgreSQL user lock owns database reconciliation; the Redis lease also spans
     publishing the committed state. Redis remains a cache if that lease expires.
@@ -434,7 +435,7 @@ def handle_sleep_data(
             session_end = state.end_time
             if session_end.tzinfo is None:
                 session_end = session_end.replace(tzinfo=timezone.utc)
-            close = datetime.now(timezone.utc) - session_end >= timedelta(minutes=settings.sleep_end_gap_minutes)
+            close = datetime.now(timezone.utc) - session_end >= timedelta(minutes=sleep_gap_minutes(state.provider))
             persist_sleep(db_session, user_id, state, close=close, commit=False)
             to_publish.append((state, close))
 
@@ -647,7 +648,7 @@ def persist_sleep(
             UUID(user_id),
             sleep_record,
             detail,
-            settings.sleep_end_gap_minutes,
+            sleep_gap_minutes(state.provider),
             commit=False,
         )
         _save_provider_sleep_score(db_session, user_id, state, saved_record, start_time)

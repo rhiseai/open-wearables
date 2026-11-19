@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
     token_lifetime: int = 3600
+    # How long after a refresh token was rotated a replay of it still returns the same successor
+    # (with a fresh access token). Covers a mobile client whose refresh reached the server but
+    # whose response it never read, so it still holds the old token. Replays end sooner as soon
+    # as the successor is used or revoked.
+    refresh_token_replay_window_seconds: int = Field(7 * 24 * 3600, ge=0)
 
     # VALIDATION SETTINGS
     min_password_length: int = 8
@@ -248,8 +253,7 @@ class Settings(BaseSettings):
         "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly "
         "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly "
         "https://www.googleapis.com/auth/googlehealth.nutrition.readonly "
-        "https://www.googleapis.com/auth/googlehealth.sleep.readonly "
-        "https://www.googleapis.com/auth/googlehealth.settings.readonly"
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly"
     )
     # Bearer secret Google echoes in the Authorization header of every webhook
     # notification. Defaults to secret_key (see derive_google_webhook_secret).

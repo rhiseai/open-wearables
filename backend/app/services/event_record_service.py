@@ -76,6 +76,7 @@ from app.services.outgoing_webhooks.events import (
 )
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
+from app.services.sleep_naps import SleepBlock, nap_ids
 from app.services.sleep_reconciliation import merge_sleep_parts
 from app.utils.context import current_sync_payload
 from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
@@ -279,6 +280,52 @@ class EventRecordService(
     def _local_sleep_date(cls, start_datetime: datetime, zone_offset: str | None) -> date:
         """Return the local calendar date of a sleep session start."""
         return cls._to_local(start_datetime, zone_offset).date()
+
+    def _mark_apple_naps(self, db_session: DbSession, data_source_id: UUID, wake_dates: set[date]) -> set[UUID]:
+        """Re-mark which of one Apple source's sessions on each wake date are naps.
+
+        Apple writes every session as main sleep (RHISE-7780). The day is
+        decided again on every write, so the main sleep can move to a later,
+        longer session. Days are keyed by the local date a session ends, as the
+        daily sleep summary is. Returns the ids now marked as naps.
+        """
+        if not wake_dates:
+            return set()
+        records = self.crud.get_sleep_sessions_ending_between(
+            db_session,
+            data_source_id,
+            datetime.combine(min(wake_dates) - timedelta(days=1), time.min, tzinfo=timezone.utc),
+            datetime.combine(max(wake_dates) + timedelta(days=2), time.min, tzinfo=timezone.utc),
+        )
+        naps: set[UUID] = set()
+        for wake_date in wake_dates:
+            day = [
+                (record, detail)
+                for record in records
+                if (detail := record.sleep_detail) is not None
+                and self._to_local(record.end_datetime, record.zone_offset).date() == wake_date
+            ]
+            day_naps = nap_ids(
+                [
+                    SleepBlock(
+                        id=record.id,
+                        start=record.start_datetime,
+                        end=record.end_datetime,
+                        sleep_minutes=float(
+                            detail.sleep_total_duration_minutes
+                            if detail.sleep_total_duration_minutes is not None
+                            else (record.duration_seconds or 0) / 60
+                        ),
+                    )
+                    for record, detail in day
+                ]
+            )
+            for record, detail in day:
+                if bool(detail.is_nap) != (record.id in day_naps):
+                    detail.is_nap = record.id in day_naps
+            naps |= day_naps
+        db_session.flush()
+        return naps
 
     def _recompute_sleep_scores(
         self,
@@ -569,6 +616,8 @@ class EventRecordService(
             threshold_minutes,
             record.external_id,
             replace_own_window=authoritative,
+            # Apple has no nap flag of its own: every SDK session arrives as main sleep.
+            is_nap=bool(detail.is_nap) if record.provider != ProviderName.APPLE else None,
         )
         own = [
             candidate
@@ -601,11 +650,12 @@ class EventRecordService(
                 raise ValueError("Sleep window is occupied by another event category")
             final_detail = final_detail.model_copy(update={"record_id": survivor.id})
             self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
-            self._recompute_sleep_scores(
-                db_session,
-                user_id,
-                {self._to_local(boundary, record.zone_offset).date() for boundary in (start, end)},
-            )
+            dates = {self._to_local(boundary, record.zone_offset).date() for boundary in (start, end)}
+            if record.provider == ProviderName.APPLE:
+                db_session.expire(survivor, ["sleep_detail"])
+                naps = self._mark_apple_naps(db_session, data_source_id, dates)
+                final_detail = final_detail.model_copy(update={"is_nap": survivor.id in naps})
+            self._recompute_sleep_scores(db_session, user_id, dates)
             return survivor, "created", final_detail
 
         final_detail = final_detail.model_copy(update={"record_id": survivor.id})
@@ -634,6 +684,9 @@ class EventRecordService(
         self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
         db_session.expire(survivor, ["sleep_detail"])
         old_dates.update(self._to_local(boundary, zone_offset).date() for boundary in (start, end))
+        if record.provider == ProviderName.APPLE:
+            naps = self._mark_apple_naps(db_session, data_source_id, old_dates)
+            final_detail = final_detail.model_copy(update={"is_nap": survivor.id in naps})
         self._recompute_sleep_scores(db_session, user_id, old_dates)
         log_structured(
             self.logger,
