@@ -25,7 +25,7 @@ from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.integrations.celery.tasks import process_sdk_upload_task
 from app.main import api, celery_app
-from app.models import ApiKey, DataPointSeries, DataSource, ProviderPriority, User, UserConnection
+from app.models import ApiKey, DataSource, ProviderPriority, SeriesSample, User, UserConnection
 from app.repositories.provider_priority_repository import ProviderPriorityRepository
 from app.schemas.enums import ProviderName
 from app.services.api_key_service import api_key_service
@@ -309,8 +309,8 @@ def test_historical_backlog_leaves_live_sdk_worker_available(engine: Engine, mon
 
         with sessions() as db:
             counts = db.execute(
-                select(DataSource.provider, func.count(DataPointSeries.id))
-                .join(DataPointSeries, DataPointSeries.data_source_id == DataSource.id)
+                select(DataSource.provider, func.count(SeriesSample.id))
+                .join(SeriesSample, SeriesSample.data_source_id == DataSource.id)
                 .where(DataSource.user_id == user_id)
                 .group_by(DataSource.provider)
             ).all()

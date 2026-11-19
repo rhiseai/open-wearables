@@ -112,5 +112,5 @@ class TestTimeseriesResolution:
             },
         )
 
-        # The app maps request validation errors to 400.
-        assert response.status_code == 400
+        # A request validation error is a 422 problem.
+        assert response.status_code == 422

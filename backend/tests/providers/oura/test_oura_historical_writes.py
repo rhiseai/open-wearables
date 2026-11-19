@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries
+from app.models import SeriesSample
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
 from app.schemas.sync_status import SyncRunContext, SyncScope, SyncSource, SyncStatus
@@ -53,7 +53,7 @@ def _heart_rate(at: datetime) -> dict[str, Any]:
 
 
 def _row_count(db: Session) -> int:
-    return db.scalar(select(func.count()).select_from(DataPointSeries)) or 0
+    return db.scalar(select(func.count()).select_from(SeriesSample)) or 0
 
 
 def test_historical_commits_bounded_batches_before_fetching_the_next_page(db: Session, data_247: Oura247Data) -> None:

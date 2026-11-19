@@ -120,11 +120,11 @@ def test_failed_user_does_not_poison_later_score_fills(session_factory: Any) -> 
         with (
             patch.object(task_module, "SessionLocal", session_factory),
             patch.object(task_module.sleep_score_service, "build_internal_sleep_scores", side_effect=fail_first),
-            patch.object(task_module, "log_and_capture_error") as capture,
+            patch.object(task_module, "logger") as logger,
         ):
             result = task_module.fill_missing_sleep_scores.run()
         assert result == {"saved": 1, "skipped": 1}
-        assert capture.call_count == 1
+        assert logger.error.call_count == 1
         with session_factory() as db:
             assert [score.event_record_id for score in db.query(HealthScore)] == [healthy_id]
     finally:

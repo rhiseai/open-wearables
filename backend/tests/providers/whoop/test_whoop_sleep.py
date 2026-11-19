@@ -1,7 +1,6 @@
 """Tests for Whoop sleep ingestion: the night's local offset and the date it is summarised under."""
 
 from datetime import date, datetime
-from logging import getLogger
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -169,7 +168,7 @@ class TestWhoopNightsSummarisedByLocalWakeUpDate:
         _load(data_247, db, user.id, FIRST_NIGHT)
         _load(data_247, db, user.id, SECOND_NIGHT)
 
-        result = SummariesService(log=getLogger(__name__)).get_sleep_summaries(
+        result = SummariesService().get_sleep_summaries(
             db,
             user.id,
             datetime.fromisoformat("2026-10-13T00:00:00+00:00"),

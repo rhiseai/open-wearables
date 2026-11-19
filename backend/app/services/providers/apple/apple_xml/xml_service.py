@@ -1,6 +1,5 @@
 from datetime import datetime
 from decimal import Decimal
-from logging import Logger
 from pathlib import Path
 from typing import Any, BinaryIO, Generator
 from uuid import UUID, uuid4
@@ -11,7 +10,7 @@ from app.constants.series_types.sdk import SleepPhase, get_series_type_from_metr
 from app.constants.series_types.sdk.category_types import AppleCategoryType
 from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.constants.workout_types import get_unified_apple_workout_type_xml
-from app.schemas.enums import EventCategory, SeriesType, daily_total_flag
+from app.schemas.enums import EventCategory, SeriesType, daily_total_flag, get_series_type_unit
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -29,10 +28,19 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.schemas.providers.mobile_sdk.sync_request import MetricRecord
 from app.services.providers.apple.sample_normalization import (
-    normalize_apple_sample_value,
+    normalize_apple_category_value,
     parse_apple_raw_value,
 )
-from app.utils.structured_logging import log_structured
+from app.utils.dates import window_seconds
+from app.utils.structured_logging import get_logger
+from app.utils.units import EnergyUnit, UnitConverter
+
+logger = get_logger(__name__)
+
+_ENERGY_SERIES = {
+    "hkquantitytypeidentifieractiveenergyburned": SeriesType.active_energy,
+    "hkquantitytypeidentifierbasalenergyburned": SeriesType.basal_energy,
+}
 
 _MENSTRUAL_TYPES = {
     AppleCategoryType.MENSTRUAL_FLOW.value,
@@ -45,10 +53,9 @@ _MINDFUL_TYPES = {
 
 
 class XMLService:
-    def __init__(self, source: str | Path | BinaryIO, log: Logger):
+    def __init__(self, source: str | Path | BinaryIO):
         self.xml_source = source
         self.chunk_size: int = settings.xml_chunk_size
-        self.log: Logger = log
         self.stats: XMLParseStats = XMLParseStats()
         # Collected across the whole parse for menstrual_cycle assembly after import.
         self.menstrual_records: list[MetricRecord] = []
@@ -185,13 +192,18 @@ class XMLService:
         try:
             document = self._parse_date_fields(document)
         except ValueError as e:
-            self.log.warning("Failed to parse date for metric type %s: %s", metric_type, str(e))
+            logger.warning(
+                "Failed to parse date for metric type",
+                provider="apple_xml",
+                metric_type=metric_type,
+                error=str(e),
+            )
             self.stats.records.skip(f"invalid_date:{metric_type}")
             return None
 
         # Check required date field
         if "startDate" not in document:
-            self.log.warning("Missing startDate for metric type %s", metric_type)
+            logger.warning("Missing startDate for metric type", provider="apple_xml", metric_type=metric_type)
             self.stats.records.skip(f"missing_startDate:{metric_type}")
             return None
 
@@ -205,18 +217,28 @@ class XMLService:
         if raw_value is None and metric_type not in _MINDFUL_TYPES:
             self.stats.records.skip(f"invalid_value:{metric_type}")
             return None
-        if raw_value is None:
-            raw_value = Decimal("0")
-
-        value = normalize_apple_sample_value(
+        value = normalize_apple_category_value(
             series_type=series_type,
-            value=raw_value,
+            value=raw_value if raw_value is not None else Decimal("0"),
             metric_type=metric_type,
-            unit=document.get("unit"),
             start=document.get("startDate"),
             end=document.get("endDate"),
-            provider="apple",
         )
+
+        # Apple exports values in the user's display unit (km, lb, mmol/L, degF...); one in a unit that
+        # can't be converted to the series unit is skipped rather than stored in the wrong unit.
+        raw_unit = document.get("unit")
+        if raw_unit is not None:
+            converted = UnitConverter.to_series_unit(series_type, value, raw_unit)
+            if converted is None:
+                self.stats.records.skip(f"unconvertible_unit:{series_type.value}:{raw_unit}")
+                return None
+            value = converted
+
+        # HealthKit's "%" is a 0-1 fraction while percent series hold 0-100. Kept here
+        # rather than as a "%" unit alias, since Health Connect reports "%" as 0-100.
+        if raw_unit == "%" and get_series_type_unit(series_type) == "percent":
+            value *= 100
 
         device_info = self._extract_device_info(document.get("device", ""))
 
@@ -242,6 +264,7 @@ class XMLService:
             software_version=device_info.device_software_version,
             provider="apple",
             recorded_at=document["startDate"],
+            window_seconds=window_seconds(document["startDate"], document.get("endDate")),
             value=value,
             series_type=series_type,
             is_daily_total=daily_total_flag(series_type, is_daily=False),
@@ -332,9 +355,27 @@ class XMLService:
 
         # Summed across the energy statistics, and left unset when the export reports none
         energy = self._decimal_from_stat(statistic.get("sum")) if "energyburned" in lowered else None
+        raw_unit = statistic.get("unit")
+        if energy is not None and raw_unit is not None:
+            energy = UnitConverter.convert_raw(energy, raw_unit, EnergyUnit.kcal)
+            if energy is None:
+                logger.warning(
+                    "Workout energy in an unconvertible unit left out",
+                    provider="apple_xml",
+                    task="process_xml_upload",
+                    unit=raw_unit,
+                )
         if energy is not None:
             current = metrics["energy_burned"]
             metrics["energy_burned"] = energy if current is None else current + energy
+            series = _ENERGY_SERIES.get(lowered)
+            previous = metrics.get("energy_series")
+            if current is None:
+                metrics["energy_series"] = series
+            elif {previous, series} == {SeriesType.active_energy, SeriesType.basal_energy}:
+                metrics["energy_series"] = SeriesType.total_energy
+            else:
+                metrics["energy_series"] = None
 
     def _wrap_sleep_data(self, sleep_records: list[SleepRecord]) -> SyncRequest:
         """Wrap sleep data in a SyncRequest
@@ -385,15 +426,15 @@ class XMLService:
         for event, elem in ET.iterparse(self.xml_source, events=("end",)):
             if elem.tag == "Record" and event == "end":
                 if len(workouts) + len(time_series_records) + len(sleep_records) >= self.chunk_size:
-                    self.log.info(
-                        "Yielding chunk: %s time series records, %s workouts, %s sleep records \
-                            (skipped so far: %s records, %s workouts, %s sleep records)",
-                        len(time_series_records),
-                        len(workouts),
-                        len(sleep_records),
-                        self.stats.records.skipped,
-                        self.stats.workouts.skipped,
-                        self.stats.sleep.skipped,
+                    logger.info(
+                        "Yielding chunk",
+                        provider="apple_xml",
+                        record_count=len(time_series_records),
+                        workout_count=len(workouts),
+                        sleep_count=len(sleep_records),
+                        skipped_records=self.stats.records.skipped,
+                        skipped_workouts=self.stats.workouts.skipped,
+                        skipped_sleep=self.stats.sleep.skipped,
                     )
                     sync_request = self._wrap_sleep_data(sleep_records)
                     yield time_series_records, workouts, sync_request
@@ -412,9 +453,10 @@ class XMLService:
                             sleep_records.append(sleep_record)
                             self.stats.sleep.mark_processed()
                         else:
-                            self.log.warning(
-                                "Skipping sleep record with unsupported stage %s",
-                                record.get("value"),
+                            logger.warning(
+                                "Skipping sleep record with unsupported stage",
+                                provider="apple_xml",
+                                sleep_stage=record.get("value"),
                             )
                             self.stats.sleep.skip(f"unknown_sleep_stage:{record.get('value')}")
                         elem.clear()
@@ -427,10 +469,11 @@ class XMLService:
                 except Exception as e:
                     # Catch any unexpected errors to prevent entire import from failing
                     metric_type = elem.attrib.get("type", "unknown")
-                    self.log.warning(
-                        "Unexpected error parsing record of type %s: %s - skipping",
-                        metric_type,
-                        str(e),
+                    logger.warning(
+                        "Unexpected error parsing record - skipping",
+                        provider="apple_xml",
+                        metric_type=metric_type,
+                        error=str(e),
                     )
                     self.stats.records.skip(f"unexpected_error:{type(e).__name__}")
                 finally:
@@ -438,12 +481,13 @@ class XMLService:
 
             elif elem.tag == "Workout" and event == "end":
                 if len(workouts) + len(time_series_records) >= self.chunk_size:
-                    self.log.info(
-                        "Yielding chunk: %s time series records, %s workouts (skipped so far: %s records, %s workouts)",
-                        len(time_series_records),
-                        len(workouts),
-                        self.stats.records.skipped,
-                        self.stats.workouts.skipped,
+                    logger.info(
+                        "Yielding chunk",
+                        provider="apple_xml",
+                        record_count=len(time_series_records),
+                        workout_count=len(workouts),
+                        skipped_records=self.stats.records.skipped,
+                        skipped_workouts=self.stats.workouts.skipped,
                     )
                     sync_request = self._wrap_sleep_data(sleep_records)
                     yield time_series_records, workouts, sync_request
@@ -465,19 +509,18 @@ class XMLService:
                 except Exception as e:
                     # Catch any unexpected errors to prevent entire import from failing
                     workout_type = elem.attrib.get("workoutActivityType", "unknown")
-                    self.log.warning(
-                        "Unexpected error parsing workout of type %s: %s - skipping",
-                        workout_type,
-                        str(e),
+                    logger.warning(
+                        "Unexpected error parsing workout - skipping",
+                        provider="apple_xml",
+                        workout_type=workout_type,
+                        error=str(e),
                     )
                     self.stats.workouts.skip(f"unexpected_error:{type(e).__name__}")
                 finally:
                     elem.clear()
 
         # yield remaining records and workout pairs
-        log_structured(
-            self.log,
-            "info",
+        logger.info(
             "Final chunk",
             provider="apple_xml",
             task="process_xml_upload",
@@ -497,9 +540,7 @@ class XMLService:
         total_workouts = self.stats.workouts.processed + self.stats.workouts.skipped
         total_sleep = self.stats.sleep.processed + self.stats.sleep.skipped
 
-        log_structured(
-            self.log,
-            "info",
+        logger.info(
             "XML parsing complete",
             provider="apple_xml",
             task="process_xml_upload",
@@ -512,9 +553,7 @@ class XMLService:
         )
 
         if self.stats.any_skipped():
-            log_structured(
-                self.log,
-                "warning",
+            logger.warning(
                 "Records, workouts, or sleep skipped during import",
                 provider="apple_xml",
                 task="process_xml_upload",
@@ -525,11 +564,10 @@ class XMLService:
 
             # Log breakdown of skip reasons
             for type, reasons in self.stats.get_skip_summary().items():
-                log_structured(
-                    self.log,
-                    "warning",
-                    f"Skipped {type}: {reasons}",
+                logger.warning(
+                    "Skipped items during XML import",
                     provider="apple_xml",
                     task="process_xml_upload",
                     skip_type=type,
+                    reasons=reasons,
                 )

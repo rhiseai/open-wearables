@@ -13,11 +13,18 @@ from jose import jwt
 
 from app.config import settings
 from app.services.sdk_token_service import create_sdk_user_token
+from app.utils import auth_diagnostics
 from app.utils.auth import get_combined_auth, get_sdk_auth
-from app.utils.auth_diagnostics import AuthBoundary, AuthOutcome, AuthReason, log_auth_decision
+from app.utils.auth_diagnostics import (
+    AuthBoundary,
+    AuthOutcome,
+    AuthReason,
+    SDKAuthenticationError,
+    log_auth_decision,
+)
 from app.utils.config_utils import LogFormat, LogLevel
 from app.utils.context import trace_id_var
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 from tests.factories import ApiKeyFactory
 
 pytestmark = pytest.mark.usefixtures("auth_sessions")
@@ -90,29 +97,19 @@ def _bearer(kind: str) -> str:
 
 
 @pytest.mark.parametrize("log_format", [LogFormat.LEGACY, LogFormat.JSON, LogFormat.TEXT])
-def test_auth_event_omits_context_in_stdout_and_export(
+def test_auth_event_omits_context_in_stdout(
     log_format: LogFormat,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.setattr(settings, "log_format", log_format)
-    with patch("app.utils.structured_logging.export_structured") as export:
-        log_auth_decision(AuthReason.CREDENTIALS_MISSING, AuthOutcome.REJECTED)
+    log_auth_decision(AuthReason.CREDENTIALS_MISSING, AuthOutcome.REJECTED)
 
     output = capsys.readouterr().out
     assert PRIVATE_TRACE not in output
     assert "trace_id" not in output
     assert "credentials_missing" in output
     assert trace_id_var.get() == PRIVATE_TRACE
-    export.assert_called_once()
-    args = export.call_args.args
-    assert args[1:4] == (logging.WARNING, "auth_decision", None)
-    assert args[4] == {
-        "action": "auth_decision",
-        "auth_boundary": "sdk_credentials",
-        "auth_reason": "credentials_missing",
-        "auth_outcome": "rejected",
-    }
     if log_format is not LogFormat.TEXT:
         [event] = _events(output)
         _assert_event(event, AuthReason.CREDENTIALS_MISSING, AuthOutcome.REJECTED)
@@ -121,10 +118,10 @@ def test_auth_event_omits_context_in_stdout_and_export(
 def test_existing_structured_trace_inheritance_and_explicit_values_are_preserved(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    logger = logging.getLogger(__name__)
-    log_structured(logger, "info", "ordinary event", trace_id=None)
-    log_structured(logger, "info", "explicit event", trace_id="explicit-context")
-    log_structured(logger, "info", "opted out", inherit_trace_id=False)
+    logger = get_logger(__name__)
+    logger.info("ordinary event", trace_id=None)
+    logger.info("explicit event", trace_id="explicit-context")
+    logger.info("opted out", inherit_trace_id=False)
     inherited, explicit, omitted = map(json.loads, capsys.readouterr().out.splitlines())
     assert inherited["trace_id"] == PRIVATE_TRACE
     assert explicit["trace_id"] == "explicit-context"
@@ -160,22 +157,22 @@ def test_fixed_decision_fields_and_severity(
     )
 
 
-def test_auth_events_respect_existing_log_level(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    monkeypatch.setattr(settings, "log_level", LogLevel.WARNING)
-    with patch("app.utils.structured_logging.export_structured") as export:
+def test_auth_events_respect_existing_log_level(capsys: pytest.CaptureFixture[str]) -> None:
+    app_logger = logging.getLogger("app")
+    level = app_logger.level
+    app_logger.setLevel(logging.WARNING)
+    try:
         log_auth_decision(AuthReason.SDK_TOKEN_EXPIRED, AuthOutcome.RECOVERED)
+    finally:
+        app_logger.setLevel(level)
     assert capsys.readouterr().out == ""
-    export.assert_not_called()
 
 
 def test_unavailable_stdout_does_not_change_auth_decisions() -> None:
-    with patch("app.utils.auth_diagnostics.log_structured", side_effect=BrokenPipeError("private fixture")):
+    with patch.object(auth_diagnostics.logger, "log", side_effect=BrokenPipeError("private fixture")):
         log_auth_decision(AuthReason.CREDENTIALS_MISSING, AuthOutcome.REJECTED)
     with (
-        patch("app.utils.auth_diagnostics.log_structured", side_effect=TypeError("programming error")),
+        patch.object(auth_diagnostics.logger, "log", side_effect=TypeError("programming error")),
         pytest.raises(TypeError, match="programming error"),
     ):
         log_auth_decision(AuthReason.CREDENTIALS_MISSING, AuthOutcome.REJECTED)
@@ -186,8 +183,8 @@ async def test_closed_stdout_preserves_the_original_auth_401() -> None:
     closed = StringIO()
     closed.close()
     with (
-        patch("app.utils.structured_logging.sys.stdout", closed),
-        pytest.raises(HTTPException) as raised,
+        patch("sys.stdout", closed),
+        pytest.raises(SDKAuthenticationError) as raised,
     ):
         await get_sdk_auth(None, None)
     assert raised.value.status_code == 401
@@ -213,7 +210,7 @@ async def test_bearer_failure_has_one_final_rejection_or_recovered_fallback(
         assert result.api_key_id == str(api_key.id)
         outcome = AuthOutcome.RECOVERED
     else:
-        with pytest.raises(HTTPException) as raised:
+        with pytest.raises(SDKAuthenticationError) as raised:
             await get_sdk_auth(bearer, None)
         assert raised.value.status_code == 401
         assert raised.value.detail == "Authentication required: provide SDK token or API key"

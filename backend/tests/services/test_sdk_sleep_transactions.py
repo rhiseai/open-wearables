@@ -235,14 +235,14 @@ def test_importer_rolls_back_and_reports_original_database_error() -> None:
     failure = RuntimeError("original integrity failure")
     with (
         patch.object(import_service, "load_data", side_effect=failure),
-        patch("app.services.sdk.import_service.log_and_capture_error") as capture,
+        patch("app.services.sdk.import_service.logger") as logger,
     ):
         result = import_service.import_data_from_request(
             db, json.dumps({"provider": "apple", "data": {}}), "application/json", str(uuid4())
         )
     assert result.status_code == 400
     assert result.response == "Import failed: original integrity failure"
-    assert capture.call_args[0][0] is failure
+    assert logger.error.call_args.kwargs["exc_info"] is failure
     db.rollback.assert_called_once()
 
 
@@ -289,11 +289,11 @@ def test_finalizer_busy_lease_defers_without_reporting_an_error() -> None:
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client", return_value=redis_client),
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal"),
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state") as load,
-        patch("app.integrations.celery.tasks.finalize_stale_sleep_task.log_and_capture_error") as capture,
+        patch("app.integrations.celery.tasks.finalize_stale_sleep_task.logger") as logger,
     ):
         finalize_stale_sleeps()
     load.assert_not_called()
-    capture.assert_not_called()
+    logger.error.assert_not_called()
     redis_client.lock.return_value.release.assert_not_called()
 
 

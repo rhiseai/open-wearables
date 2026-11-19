@@ -97,7 +97,7 @@ _HEALTH_SCORE = _Table(
 )
 
 _DATA_POINT_SERIES = _Table(
-    name="data_point_series",
+    name="series_sample",
     # Keep the source/metric lookup correlated so it uses the leading columns
     # of the unique index instead of scanning rows from unrelated providers.
     candidates="""
@@ -106,7 +106,7 @@ _DATA_POINT_SERIES = _Table(
         CROSS JOIN series_type_definition metric
         CROSS JOIN LATERAL (
             SELECT id, data_source_id, series_type_definition_id, recorded_at, zone_offset
-            FROM data_point_series
+            FROM series_sample
             WHERE data_source_id = source.id AND series_type_definition_id = metric.id
               AND is_daily_total IS TRUE
             OFFSET 0
@@ -207,7 +207,7 @@ def _rekey(db: Session, table: _Table, *, dry_run: bool) -> int:
             FROM movable v
             WHERE tgt.id = v.id
         """)
-    ).rowcount  # ty: ignore[unresolved-attribute]
+    ).rowcount  # ty: ignore[missing-attribute]
     _emit(
         "info",
         "bootstrap_data_migration_staged",

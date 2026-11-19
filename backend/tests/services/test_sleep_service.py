@@ -16,6 +16,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.constants.sleep import SleepStageType
 from app.models import EventRecord, HealthScore
 from app.schemas.enums import HealthScoreCategory, ProviderName
@@ -33,6 +34,7 @@ from app.services.sdk.sleep_service import (
     _in_bed_bounds,
     finish_sleep,
     handle_sleep_data,
+    is_ready_to_finish,
     key,
     persist_sleep,
 )
@@ -632,9 +634,11 @@ class TestPersistSleep:
         assert record.external_id == state_uuid
         assert detail.sleep_total_duration_minutes is not None
         assert detail.sleep_total_duration_minutes > 0
-        assert detail.sleep_deep_minutes == 0
-        assert detail.sleep_rem_minutes == 0
-        assert detail.sleep_light_minutes == 0
+        # No breakdown available, so the stages are unreported
+        assert detail.sleep_deep_minutes is None
+        assert detail.sleep_rem_minutes is None
+        assert detail.sleep_light_minutes is None
+        assert detail.sleep_awake_minutes is None
         assert detail.sleep_stages is not None
         assert len(detail.sleep_stages) == 3
         assert all(s.stage == SleepStageType.SLEEPING for s in detail.sleep_stages)
@@ -744,6 +748,104 @@ class TestPersistSleep:
         assert detail.sleep_rem_minutes == 45
         assert detail.sleep_awake_minutes == 10
         assert detail.sleep_total_duration_minutes == 245  # light+deep+rem (no sleeping)
+
+
+def _stage(stage: SleepStageType, start: str, end: str) -> SleepStateStage:
+    return SleepStateStage(stage=stage, start_time=_dt(start), end_time=_dt(end))
+
+
+class TestPersistSleepUnreportedStages:
+    """Phases a source did not measure are saved as None; measured zeros stay 0 (#1953)."""
+
+    @staticmethod
+    def _persist(db: Session, stages: list[SleepStateStage]) -> EventRecordDetailCreate:
+        with (
+            patch("app.services.sdk.sleep_service.event_record_service") as mock_event_service,
+            patch("app.services.sdk.sleep_service.delete_sleep_state"),
+        ):
+            state = SleepState(
+                uuid=str(uuid4()),
+                source_name="iPhone",
+                provider="apple",
+                start_time=stages[0].start_time,
+                end_time=stages[-1].end_time,
+                last_start_timestamp=stages[-1].start_time,
+                last_end_timestamp=stages[-1].end_time,
+                stages=stages,
+            )
+            persist_sleep(db, str(uuid4()), state, close=True)
+            return mock_event_service.create_or_merge_sleep.call_args[0][3]
+
+    def test_only_in_bed_leaves_all_stages_none(self, db: Session) -> None:
+        detail = self._persist(db, [_stage(SleepStageType.IN_BED, "2026-03-15T23:00:00Z", "2026-03-16T07:00:00Z")])
+
+        assert detail.sleep_total_duration_minutes == 480
+        assert detail.sleep_deep_minutes is None
+        assert detail.sleep_light_minutes is None
+        assert detail.sleep_rem_minutes is None
+        assert detail.sleep_awake_minutes is None
+
+    def test_sleeping_and_awake_keep_awake_minutes(self, db: Session) -> None:
+        detail = self._persist(
+            db,
+            [
+                _stage(SleepStageType.SLEEPING, "2026-03-15T23:00:00Z", "2026-03-16T02:00:00Z"),
+                _stage(SleepStageType.AWAKE, "2026-03-16T02:00:00Z", "2026-03-16T02:20:00Z"),
+                _stage(SleepStageType.SLEEPING, "2026-03-16T02:20:00Z", "2026-03-16T06:00:00Z"),
+            ],
+        )
+
+        assert detail.sleep_awake_minutes == 20
+        assert detail.sleep_deep_minutes is None
+        assert detail.sleep_light_minutes is None
+        assert detail.sleep_rem_minutes is None
+
+    def test_detailed_stages_without_rem_or_awake_report_zero(self, db: Session) -> None:
+        detail = self._persist(
+            db,
+            [
+                _stage(SleepStageType.LIGHT, "2026-03-15T23:00:00Z", "2026-03-16T01:00:00Z"),
+                _stage(SleepStageType.DEEP, "2026-03-16T01:00:00Z", "2026-03-16T02:00:00Z"),
+            ],
+        )
+
+        assert detail.sleep_light_minutes == 120
+        assert detail.sleep_deep_minutes == 60
+        assert detail.sleep_rem_minutes == 0
+        assert detail.sleep_awake_minutes == 0
+
+
+class TestReadyToFinish:
+    """A session's Redis state closes once its source's sleep gap has passed since its last sleep sample."""
+
+    NOW = _dt("2026-04-18T09:00:00Z")
+
+    def _state(self, provider: str, ended_ago: int) -> SleepState:
+        end = self.NOW - timedelta(minutes=ended_ago)
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            provider=provider,
+            start_time=end - timedelta(hours=7),
+            end_time=end,
+            last_start_timestamp=end - timedelta(minutes=10),
+            last_end_timestamp=end,
+        )
+
+    def test_an_apple_session_closes_after_ninety_minutes(self) -> None:
+        assert not is_ready_to_finish(self._state("apple", ended_ago=89), self.NOW)
+        assert is_ready_to_finish(self._state("apple", ended_ago=90), self.NOW)
+
+    def test_other_sources_wait_for_the_general_end_gap(self) -> None:
+        gap = settings.sleep_end_gap_minutes
+        assert not is_ready_to_finish(self._state("samsung", ended_ago=gap - 1), self.NOW)
+        assert is_ready_to_finish(self._state("samsung", ended_ago=gap), self.NOW)
+
+    def test_a_naive_end_time_is_read_as_utc(self) -> None:
+        state = self._state("apple", ended_ago=90)
+        state.end_time = state.end_time.replace(tzinfo=None)
+
+        assert is_ready_to_finish(state, self.NOW)
 
 
 class TestHandleSleepDataIntegration:

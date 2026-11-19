@@ -18,10 +18,13 @@ from app.schemas.providers.whoop import WhoopWorkoutCollectionJSON, WhoopWorkout
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+from app.services.providers.whoop.coverage import WORKOUT_ENERGY_SERIES
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.conversion import kilojoules_to_kcal
 from app.utils.dates import to_rfc3339
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class WhoopWorkouts(BaseWorkoutsTemplate):
@@ -79,23 +82,21 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                     break
 
             except Exception as e:
-                log_structured(
-                    self.logger,
-                    "error",
-                    f"Error fetching Whoop workout data: {e}",
+                logger.error(
+                    "Error fetching Whoop workout data",
                     provider="whoop",
                     task="get_workouts",
                     user_id=str(user_id),
+                    error=str(e),
                 )
                 # If we got some data, return what we have; otherwise re-raise
                 if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
-                        f"Returning partial workout data due to error: {e}",
+                    logger.warning(
+                        "Returning partial workout data due to error",
                         provider="whoop",
                         task="get_workouts",
                         user_id=str(user_id),
+                        error=str(e),
                     )
                     break
                 raise
@@ -133,76 +134,58 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         return self._make_api_request(db, user_id, f"/v2/activity/workout/{workout_id}")
 
     def load_single_workout(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
-        """Fetch a single workout by ID, normalize, and replace any stored version of it.
+        """Fetch a single workout by ID, normalize, and save it. Returns 1 on success.
 
-        This runs for ``workout.updated`` webhooks, which Whoop sends whenever the
-        user edits an activity in the app (sport, trimmed start/end, ...).  The
-        edited workout keeps its ``external_id`` but its time window changes, so it
-        no longer collides with the ``(data_source_id, start, end)`` unique index —
-        a plain insert would leave the stale version alongside the corrected one and
-        downstream consumers would see the same workout twice.  Deleting by
-        ``external_id`` first (child detail rows go with it via the FK's ON DELETE
-        CASCADE, same as the ``workout.deleted`` path) makes ingestion idempotent.
+        This runs for ``workout.updated`` webhooks, which Whoop sends whenever the user edits
+        an activity in the app (sport, trimmed start/end, ...). The edited workout keeps its
+        ``external_id``, and ``EventRecordRepository.create`` refreshes the stored row with
+        that ``external_id`` in place, so the workout keeps its id and is not stored twice.
 
-        The delete and the insert share one transaction (see
-        ``EventRecordRepository.replace_by_external_id``), so a failing insert rolls
-        the delete back and leaves the stored workout untouched.
-
-        Returns 1 on success.  A failure while fetching or normalizing the workout is
-        logged and reported as 0 records saved; a failure once we start writing is
-        re-raised so the delivery is retried instead of reporting a benign skip.
+        A failure while fetching or normalizing the workout is logged and reported as 0
+        records saved; a failure once we start writing is re-raised so the delivery is
+        retried instead of reporting a benign skip.
         """
+        raw = self.get_workout_detail_from_api(db, user_id, workout_id)
+        store_raw_payload(
+            source="api_response",
+            provider="whoop",
+            payload=raw,
+            user_id=str(user_id),
+            trace_id=f"/v2/activity/workout/{workout_id}",
+        )
+        if not isinstance(raw, dict) or not raw:
+            return 0
         try:
-            raw = self.get_workout_detail_from_api(db, user_id, workout_id)
-            store_raw_payload(
-                source="api_response",
-                provider="whoop",
-                payload=raw,
-                user_id=str(user_id),
-                trace_id=f"/v2/activity/workout/{workout_id}",
-            )
-            if not isinstance(raw, dict) or not raw:
-                return 0
             workout = WhoopWorkoutJSON(**raw)
             if workout.score_state != "SCORED" and workout.score is None:
                 return 0
             record, detail, health_score = self._normalize_workout(workout, user_id)
         except Exception as e:
-            log_structured(
-                self.logger,
-                "warning",
-                f"Failed to save workout record {workout_id}: {e}",
+            logger.warning(
+                "Failed to save workout record",
                 provider="whoop",
                 task="load_single_workout",
+                workout_id=workout_id,
+                error=str(e),
             )
             return 0
 
-        # Swallowing a failure from here on would report a benign skip while the
-        # workout is either missing its details or stuck on the pre-edit version, so
-        # failures propagate: the webhook delivery fails, Celery retries it, and the
-        # retry replaces the workout again from scratch.
+        # Swallowing a failure from here on would report a benign skip while the workout is
+        # missing its details or stuck on the pre-edit version, so failures propagate: the
+        # webhook delivery fails, Celery retries it, and the retry refreshes the workout again.
         try:
-            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
-            if created is None:
-                log_structured(
-                    self.logger,
-                    "warning",
-                    f"Skipped workout record {workout_id}: an unrelated workout already occupies its time window",
-                    provider="whoop",
-                    task="load_single_workout",
-                )
-                return 0
+            created = event_record_service.create(db, record)
             detail_for_record = detail.model_copy(update={"record_id": created.id})
             event_record_service.create_detail(db, detail_for_record)
             if health_score:
-                health_score_service.create(db, health_score)
+                health_score_service.create(db, health_score.model_copy(update={"event_record_id": created.id}))
         except Exception as e:
-            log_structured(
-                self.logger,
-                "error",
-                f"Failed to store workout record {workout_id}: {e}",
+            logger.error(
+                "Failed to store workout record",
                 provider="whoop",
                 task="load_single_workout",
+                workout_id=workout_id,
+                error_type=type(e).__name__,
             )
             raise
         return 1
@@ -262,6 +245,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         # Energy: Convert kilojoule to kcal
         if score.kilojoule is not None:
             metrics["energy_burned"] = kilojoules_to_kcal(score.kilojoule)
+            metrics["energy_series"] = WORKOUT_ENERGY_SERIES
 
         # Distance: Keep in meters (or convert to km if schema expects km)
         # Based on schema, distance is Decimal, so we'll keep in meters
@@ -324,7 +308,7 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
         self,
         raw_workout: WhoopWorkoutJSON,
         user_id: UUID,
-    ) -> tuple[EventRecordCreate, EventRecordDetailCreate, HealthScoreCreate | None]:  # ty:ignore[invalid-method-override]
+    ) -> tuple[EventRecordCreate, EventRecordDetailCreate, HealthScoreCreate | None]:  # ty:ignore[incompatible-method-override]
         """Normalize Whoop workout to EventRecordCreate, EventRecordDetailCreate, and strain HealthScoreCreate."""
         workout_id = uuid4()
 
@@ -456,23 +440,21 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
                     break
 
             except Exception as e:
-                log_structured(
-                    self.logger,
-                    "error",
-                    f"Error fetching Whoop workout data: {e}",
+                logger.error(
+                    "Error fetching Whoop workout data",
                     provider="whoop",
                     task="load_data",
                     user_id=str(user_id),
+                    error=str(e),
                 )
                 # If we got some data, continue processing; otherwise re-raise
                 if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
-                        f"Processing partial workout data due to error: {e}",
+                    logger.warning(
+                        "Processing partial workout data due to error",
                         provider="whoop",
                         task="load_data",
                         user_id=str(user_id),
+                        error=str(e),
                     )
                     break
                 raise

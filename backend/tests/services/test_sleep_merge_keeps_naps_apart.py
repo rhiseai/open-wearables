@@ -2,7 +2,6 @@
 
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from logging import getLogger
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -78,7 +77,7 @@ def test_a_whoop_nap_an_hour_and_a_half_after_waking_stays_a_nap(db: Session) ->
     assert _stored(db, source) == [("23:00", "07:00", False), ("08:30", "09:30", True)]
     start = _at("2026-11-16T00:00:00")
     (summary,) = (
-        SummariesService(log=getLogger(__name__))
+        SummariesService()
         .get_sleep_summaries(db, source.user_id, start, start + timedelta(days=1), cursor=None, limit=10)
         .data
     )
@@ -134,3 +133,16 @@ def test_the_same_sleep_sent_twice_with_another_flag_still_merges(db: Session) -
     _write(db, source, "2026-11-16T13:05:00", "2026-11-16T14:10:00", is_nap=False)
 
     assert _stored(db, source) == [("13:00", "14:10", False)]
+
+
+def test_a_nap_we_flagged_still_joins_the_night_that_follows_it(db: Session) -> None:
+    """Withings sends no nap flag, so a stored one is ours: an evening sleep flagged a nap joins the night
+    that starts within the merge gap, as upstream merges it, and the day is flagged again."""
+    source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
+    _write(db, source, "2026-11-15T23:00:00", "2026-11-16T07:00:00", is_nap=False)
+    _write(db, source, "2026-11-16T17:00:00", "2026-11-16T18:00:00", is_nap=False)
+    assert _stored(db, source)[-1] == ("17:00", "18:00", True)
+
+    _write(db, source, "2026-11-16T19:30:00", "2026-11-17T07:00:00", is_nap=False)
+
+    assert _stored(db, source) == [("23:00", "07:00", False), ("17:00", "07:00", False)]

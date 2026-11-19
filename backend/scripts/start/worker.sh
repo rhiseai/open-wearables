@@ -49,7 +49,10 @@ uv run celery -A app.main:celery_app worker --loglevel=info --pool=threads --con
 worker_pids+=("$!")
 
 echo "Starting CPU worker..."
-uv run celery -A app.main:celery_app worker --loglevel=info --pool=prefork --concurrency=2 -Q xml_sync -n cpu@%h &
+# XML imports are long and a direct upload carries the whole file in its message. With early
+# acks a prefetch multiplier of 1 still reserves one extra message per busy process, so
+# prefetch is disabled: the worker fetches a task only when a process is free.
+uv run celery -A app.main:celery_app worker --loglevel=info --pool=prefork --concurrency=2 --prefetch-multiplier=1 --disable-prefetch -Q xml_sync -n cpu@%h &
 worker_pids+=("$!")
 
 # Every worker is required for a healthy container. If one exits (including

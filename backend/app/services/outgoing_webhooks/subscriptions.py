@@ -11,7 +11,6 @@ that window.
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 
@@ -19,9 +18,9 @@ from app.config import settings
 from app.constants.webhooks.events import SERIES_TYPE_TO_GROUP_EVENT
 from app.schemas.webhooks.event_types import WebhookEventType
 from app.services.outgoing_webhooks import svix as svix_service
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # body_composition.created is rare and consumed as a product event, so it is never gated.
 GATED_TIMESERIES_EVENT_TYPES: frozenset[str] = frozenset(
@@ -48,9 +47,7 @@ class _SubscriptionCache:
             try:
                 self._value = svix_service.subscribed_event_types()
             except Exception as exc:
-                log_structured(
-                    logger,
-                    "warning",
+                logger.warning(
                     "Could not read webhook endpoint subscriptions; keeping the previous view",
                     action="webhook_subscriptions_refresh_failed",
                     error=str(exc),

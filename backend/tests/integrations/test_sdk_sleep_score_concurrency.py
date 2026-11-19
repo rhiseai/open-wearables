@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 from app.integrations.celery.tasks import fill_missing_sleep_scores_task as filler_module
 from app.integrations.celery.tasks import process_sdk_upload_task as sdk_module
-from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, SleepDetails, User, UserConnection
+from app.models import DataSource, EventRecord, HealthScore, SeriesSample, SleepDetails, User, UserConnection
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.sync_status import SyncStage, SyncStatus
 from app.services.sdk.sleep_service import load_source_sleep_states
@@ -236,9 +236,9 @@ def _filler() -> dict[str, int]:
 
 def _sample_count(db: Session, seed: SleepScenario) -> int:
     return (
-        db.query(DataPointSeries)
+        db.query(SeriesSample)
         .join(DataSource)
-        .filter(DataSource.user_id == seed.user_id, DataPointSeries.recorded_at == seed.start + timedelta(hours=15))
+        .filter(DataSource.user_id == seed.user_id, SeriesSample.recorded_at == seed.start + timedelta(hours=15))
         .count()
     )
 
@@ -279,11 +279,11 @@ def _assert_complete(session_factory: SessionFactory, seed: SleepScenario) -> No
         assert all(score.value is not None and score.value > 1 and score.components for score in scores)
         assert _sample_count(db, seed) == 1
         sample = db.scalar(
-            select(DataPointSeries)
+            select(SeriesSample)
             .join(DataSource)
             .where(
                 DataSource.user_id == seed.user_id,
-                DataPointSeries.recorded_at == seed.start + timedelta(hours=15),
+                SeriesSample.recorded_at == seed.start + timedelta(hours=15),
             )
         )
         assert sample is not None

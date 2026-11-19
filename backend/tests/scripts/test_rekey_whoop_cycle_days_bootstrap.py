@@ -21,7 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataSource, HealthScore, SeriesTypeDefinition
+from app.models import DataSource, HealthScore, SeriesSample, SeriesTypeDefinition
 from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, get_series_type_id
 from tests.factories import (
     DataPointSeriesFactory,
@@ -48,10 +48,10 @@ def script() -> ModuleType:
     return module
 
 
-def _daily_point(source: DataSource, metric: SeriesTypeDefinition | None, recorded_at: datetime) -> DataPointSeries:
+def _daily_point(source: DataSource, metric: SeriesTypeDefinition | None, recorded_at: datetime) -> SeriesSample:
     assert metric is not None
     return cast(
-        DataPointSeries,
+        SeriesSample,
         DataPointSeriesFactory(data_source=source, series_type=metric, recorded_at=recorded_at, is_daily_total=True),
     )
 
@@ -80,7 +80,7 @@ def test_rekey_moves_only_uncontested_whoop_cycle_values(db: Session, script: Mo
     later = _daily_point(whoop, steps, earlier.recorded_at + timedelta(hours=1))
     conflict = _daily_point(whoop, energy, start)
     occupied = cast(
-        DataPointSeries,
+        SeriesSample,
         DataPointSeriesFactory(data_source=whoop, series_type=energy, recorded_at=target, is_daily_total=False),
     )
     unrelated = _daily_point(apple, steps, start)
@@ -101,18 +101,18 @@ def test_rekey_moves_only_uncontested_whoop_cycle_values(db: Session, script: Mo
     expected_series = {row.id: row.recorded_at for row in (winner, earlier, later, conflict, occupied, unrelated)}
     expected_scores = {strain.id: start, workout_strain.id: workout_strain.recorded_at}
 
-    def timestamps(model: type[DataPointSeries] | type[HealthScore]) -> dict[UUID, datetime]:
+    def timestamps(model: type[SeriesSample] | type[HealthScore]) -> dict[UUID, datetime]:
         return dict(db.execute(select(model.id, model.recorded_at)).tuples().all())
 
     assert script.rekey_whoop_cycle_days(db, dry_run=True) == 0
-    assert timestamps(DataPointSeries) == expected_series
+    assert timestamps(SeriesSample) == expected_series
     assert timestamps(HealthScore) == expected_scores
 
     assert script.rekey_whoop_cycle_days(db, dry_run=False) == 3
     expected_series[winner.id] = target
     expected_series[later.id] = target + timedelta(days=2)
     expected_scores[strain.id] = target
-    assert timestamps(DataPointSeries) == expected_series
+    assert timestamps(SeriesSample) == expected_series
     assert timestamps(HealthScore) == expected_scores
     assert script.rekey_whoop_cycle_days(db, dry_run=False) == 0
 
@@ -182,7 +182,7 @@ def test_timeout_in_second_table_rolls_back_and_a_later_attempt_can_commit(
     failed.commit.assert_not_called()
     failed.__exit__.assert_called_once()
     assert "UPDATE health_score" in str(failed.execute.call_args_list[1].args[0])
-    assert "FROM data_point_series" in str(failed.execute.call_args_list[2].args[0])
+    assert "FROM series_sample" in str(failed.execute.call_args_list[2].args[0])
     assert all(event.get("outcome") != "committed" for event in _events(capsys))
 
     script.main(dry_run=False)

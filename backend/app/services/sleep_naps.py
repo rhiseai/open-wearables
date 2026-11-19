@@ -1,72 +1,159 @@
-"""Which of one source's sleep sessions on one day are naps -- pure, no I/O.
+"""Flag the naps of providers that don't report them (#938).
 
-Apple Health has no nap flag: every session the SDK writes is stored as main
-sleep, so the daily summary sums an afternoon nap, or the second half of a
-night broken by a long wake, into the night's duration, stages, efficiency
-and heart rate window (RHISE-7780).
-
-The rule: sessions less than :data:`MAX_SPLIT_GAP` apart are one sleep. The
-chain with the most sleep is the day's main sleep; every other chain is a nap.
-The summary then keeps naps out of the night's numbers and reports them as
-``nap_count`` / ``nap_duration_minutes``.
+A nap is a sleep of 15 min to under 3 h that starts between 06:00 and 20:00 local time and is more than the
+merge gap away from the main sleep (the longest) of its day and of the next day. Days are local wake dates,
+as in the sleep summary. Sleep without a zone offset has no known start hour, so it has to be more than 4 h
+from those main sleeps instead.
 """
 
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from uuid import UUID
 
 from app.config import settings
+from app.constants.sdk_providers import SDK_PROVIDERS
+from app.database import DbSession
+from app.models import DataSource, EventRecord, SleepDetails
+from app.repositories.data_source_repository import DataSourceRepository
+from app.repositories.event_record_repository import EventRecordRepository
+from app.repositories.local_day import utc_midnight
 from app.schemas.enums import ProviderName
+from app.utils.dates import iso_to_timezone, local_date
 
-# An hour and a half awake still belongs to the same sleep: people can lie
-# awake that long trying to fall asleep again. A longer gap starts a separate
-# sleep (product decision on RHISE-7667, as WHOOP splits them).
-MAX_SPLIT_GAP = timedelta(minutes=90)
-
-
-def sleep_gap_minutes(provider: str | None) -> int:
-    """Minutes without sleep data after which a source's raw samples start a new sleep.
-
-    Apple's samples end a sleep after :data:`MAX_SPLIT_GAP`, the same gap that
-    splits a day into its main sleep and naps; with the general
-    ``sleep_end_gap_minutes`` (120) a 90-120 minute wake was stored inside the
-    night and could never become a nap. Other sources keep the general gap.
-    """
-    if provider == ProviderName.APPLE:
-        return int(MAX_SPLIT_GAP.total_seconds() // 60)
-    return settings.sleep_end_gap_minutes
+# Their sleep comes without a nap flag (the mobile SDK has none); other providers' flag is kept as they send it.
+# Apple sends none either, but its naps follow app.services.apple_sleep_naps, applied on every Apple write
+# (RHISE-7780): neither the re-flag after a write nor the classify_sleep_naps backfill may overwrite them.
+NAP_INFERRED_PROVIDERS: frozenset[ProviderName] = frozenset(
+    {
+        *(ProviderName(provider) for provider in SDK_PROVIDERS if provider != ProviderName.APPLE),
+        ProviderName.SENSORBIO,
+        ProviderName.ULTRAHUMAN,
+        ProviderName.WITHINGS,
+    }
+)
+# Less sleep than this hardly makes a nap; Oura's minimum too
+NAP_MIN_SLEEP = timedelta(minutes=15)
+# 3 h of sleep or more is never a nap: Oura and Garmin draw the line here, and Apple stages sleep from here on
+NAP_MAX_SLEEP = timedelta(hours=3)
+# Sleep that starts at night belongs to a night, even when it's short
+NAP_START_HOURS = range(6, 20)
+# Without a zone offset the start hour isn't known, so a nap has to be further from the night than a night-time
+# awakening lasts (insomnia, segmented sleep)
+NAP_GAP_WITHOUT_ZONE = timedelta(hours=4)
 
 
 @dataclass(frozen=True)
-class SleepBlock:
-    """One stored sleep session: its window and minutes of sleep."""
-
+class SleepWindow:
     id: UUID
     start: datetime
     end: datetime
-    sleep_minutes: float
+    zone_offset: str | None
+    asleep: timedelta
+
+    @property
+    def wake_date(self) -> date:
+        return local_date(self.end, self.zone_offset)
+
+    @property
+    def could_be_nap(self) -> bool:
+        """Its sleep fits a nap and, when its zone offset gives the start hour, it starts in the daytime."""
+        if not NAP_MIN_SLEEP <= self.asleep < NAP_MAX_SLEEP:
+            return False
+        if self.zone_offset is None:
+            # No start hour to check; find_naps asks it for NAP_GAP_WITHOUT_ZONE instead
+            return True
+        return self.start.astimezone(iso_to_timezone(self.zone_offset)).hour in NAP_START_HOURS
 
 
-def nap_ids(blocks: Sequence[SleepBlock]) -> set[UUID]:
-    """The sessions outside the day's main sleep.
+def _gap(a: SleepWindow, b: SleepWindow) -> timedelta:
+    return max(a.start - b.end, b.start - a.end, timedelta(0))
 
-    Sessions are chained in start order while each starts less than
-    :data:`MAX_SPLIT_GAP` after the chain's latest end. The chain with the
-    most sleep is the main sleep (the earlier one on a tie); the sessions of
-    every other chain are naps.
+
+def find_naps(sessions: Sequence[SleepWindow]) -> set[UUID]:
+    """The naps among one data source's sessions."""
+    by_day: dict[date, list[SleepWindow]] = defaultdict(list)
+    for session in sessions:
+        by_day[session.wake_date].append(session)
+    # A day's main sleep is its longest, the earlier one on a tie
+    mains = {day: min(group, key=lambda s: (-s.asleep, s.start)) for day, group in by_day.items()}
+    merge_gap = timedelta(minutes=settings.sleep_end_gap_minutes)
+    naps: set[UUID] = set()
+    for day, group in by_day.items():
+        # Sleep within the merge gap of a night belongs to it, an early start of the next night included
+        nights = [main for main in (mains[day], mains.get(day + timedelta(days=1))) if main is not None]
+        for session in group:
+            limit = merge_gap if session.zone_offset is not None else max(merge_gap, NAP_GAP_WITHOUT_ZONE)
+            if (
+                session is not mains[day]
+                and session.could_be_nap
+                and all(_gap(session, night) > limit for night in nights)
+            ):
+                naps.add(session.id)
+    return naps
+
+
+_data_sources = DataSourceRepository(DataSource)
+_event_records = EventRecordRepository(EventRecord)
+
+
+@dataclass(frozen=True)
+class NapChange:
+    record_id: UUID
+    is_nap: bool
+    wake_date: date
+
+
+def _window(record: EventRecord, details: SleepDetails | None) -> SleepWindow:
+    """The session with its time asleep, else its length, as the sleep summary reads it."""
+    minutes = details.sleep_total_duration_minutes if details is not None else None
+    asleep = timedelta(minutes=minutes) if minutes is not None else timedelta(seconds=record.duration_seconds or 0)
+    return SleepWindow(record.id, record.start_datetime, record.end_datetime, record.zone_offset, asleep)
+
+
+def reclassify_naps(
+    db_session: DbSession,
+    data_source_id: UUID,
+    wake_dates: set[date] | None,
+    *,
+    dry_run: bool = False,
+) -> list[NapChange]:
+    """Re-flag a data source's naps around the given local wake dates.
+
+    None re-flags the whole history and an empty set nothing. A day's naps depend on its own and the next day's
+    main sleep, so a write on day D re-flags D-1 to D+1. Returns the flags that changed (not written in a dry
+    run); a provider that flags naps keeps its flags. Flushes first, so the caller's pending sessions count.
     """
-    if len(blocks) < 2:
-        return set()
-    ordered = sorted(blocks, key=lambda block: (block.start, block.end, str(block.id)))
-    chains: list[list[SleepBlock]] = [[ordered[0]]]
-    chain_end = ordered[0].end
-    for block in ordered[1:]:
-        if block.start - chain_end >= MAX_SPLIT_GAP:
-            chains.append([block])
-            chain_end = block.end
+    data_source = _data_sources.get(db_session, data_source_id)
+    if data_source is None or data_source.provider not in NAP_INFERRED_PROVIDERS:
+        return []
+    if wake_dates is None:
+        first = last = None
+        rows = _event_records.get_source_sleep_records(db_session, data_source_id)
+    elif not wake_dates:
+        return []
+    else:
+        first, last = min(wake_dates) - timedelta(days=1), max(wake_dates) + timedelta(days=1)
+        # The day after `last` gives its main sleep; a day either side covers any zone offset
+        rows = _event_records.get_source_sleep_records(
+            db_session, data_source_id, utc_midnight(first - timedelta(days=1)), utc_midnight(last + timedelta(days=3))
+        )
+    windows = {record.id: _window(record, details) for record, details in rows}
+    naps = find_naps(list(windows.values()))
+
+    changes: list[NapChange] = []
+    flags: list[tuple[SleepDetails, bool]] = []
+    for record, details in rows:
+        if details is None:
             continue
-        chains[-1].append(block)
-        chain_end = max(chain_end, block.end)
-    main = max(chains, key=lambda chain: sum(block.sleep_minutes for block in chain))
-    return {block.id for chain in chains if chain is not main for block in chain}
+        window = windows[record.id]
+        if first is not None and last is not None and not first <= window.wake_date <= last:
+            continue
+        is_nap = record.id in naps
+        if bool(details.is_nap) != is_nap:
+            changes.append(NapChange(record.id, is_nap, window.wake_date))
+            flags.append((details, is_nap))
+    if flags and not dry_run:
+        _event_records.set_nap_flags(db_session, flags)
+    return changes

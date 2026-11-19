@@ -6,6 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from app.schemas.model_crud.activities import EventRecordDetailCreate, SleepStage
+from app.utils.sleep_stages import measured_stages
 
 SleepPart = tuple[datetime, datetime, EventRecordDetailCreate]
 
@@ -86,8 +87,12 @@ def merge_sleep_parts(parts: Sequence[SleepPart]) -> SleepPart:
             seconds: dict[str, float] = defaultdict(float)
             for stage in stages:
                 seconds[str(stage.stage)] += (stage.end_time - stage.start_time).total_seconds()
+            # A merged hypnogram of only sleeping segments still measures no phases, and one
+            # without awake segments or phases no awake time: those stay unreported (#1953).
+            has_phases, has_awake = measured_stages(stages)
             for stage_name, field in _STAGE_FIELDS.items():
-                fields[field] = int(seconds[stage_name] // 60)
+                measured = has_awake if stage_name == "awake" else has_phases
+                fields[field] = int(seconds[stage_name] // 60) if measured else None
             fields["sleep_total_duration_minutes"] = int(
                 sum(seconds[stage_name] for stage_name in _ASLEEP_STAGES) // 60
             )
@@ -95,7 +100,7 @@ def merge_sleep_parts(parts: Sequence[SleepPart]) -> SleepPart:
             # Being inside the outer window does not mean a batch is a replay:
             # an out-of-order fragment may fill a previously empty split-night
             # gap. The known asleep+awake coverage must fit in time in bed.
-            in_bed = max(in_bed, fields["sleep_total_duration_minutes"] + fields["sleep_awake_minutes"])
+            in_bed = max(in_bed, fields["sleep_total_duration_minutes"] + (fields["sleep_awake_minutes"] or 0))
             fields["sleep_time_in_bed_minutes"] = in_bed
 
         cumulative_replay = (

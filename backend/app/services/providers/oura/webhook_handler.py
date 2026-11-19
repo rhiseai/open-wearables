@@ -37,13 +37,12 @@ See: https://cloud.ouraring.com/v2/docs#tag/Webhook-Subscription-Routes
 """
 
 import json
-import logging
 from collections.abc import Sequence
 from typing import Any
 from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
-from fastapi import HTTPException, Request
+from fastapi import Request
 from pydantic import ValidationError
 
 from app.config import settings
@@ -56,9 +55,15 @@ from app.services.providers.oura.data_247 import Oura247Data
 from app.services.providers.oura.workouts import OuraWorkouts
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.raw_payload_storage import store_raw_payload
-from app.utils.structured_logging import LogContext, log_structured
+from app.utils.exceptions import (
+    InvalidInputError,
+    ProviderConnectionError,
+    ProviderError,
+    WebhookVerificationError,
+)
+from app.utils.structured_logging import LogContext, get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Upstream statuses that condemn one profile's token rather than the object
 # itself, so the fetch is worth retrying with another linked profile's token.
@@ -99,9 +104,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         """Verify x-oura-signature using HMAC-SHA256 + hex (upper-case)."""
         secret_setting = settings.oura_client_secret
         if not secret_setting:
-            log_structured(
-                logger,
-                "error",
+            logger.error(
                 "OURA_CLIENT_SECRET not configured; rejecting webhook",
                 provider="oura",
                 action="webhook_signature_missing_secret",
@@ -112,9 +115,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         timestamp = request.headers.get("x-oura-timestamp")
 
         if not signature or not timestamp:
-            log_structured(
-                logger,
-                "warning",
+            logger.warning(
                 "Missing Oura webhook signature headers",
                 provider="oura",
                 action="webhook_signature_missing",
@@ -136,7 +137,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         try:
             return json.loads(body)
         except (json.JSONDecodeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+            raise InvalidInputError("Invalid JSON body") from exc
 
     def dispatch(self, db: DbSession, payload: dict[str, Any]) -> dict[str, Any]:
         """Store the raw payload and enqueue async processing. Returns immediately."""
@@ -145,9 +146,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         data_type = payload.get("data_type", "unknown")
         provider_user_id = payload.get("user_id", "unknown")
 
-        log_structured(
-            logger,
-            "info",
+        logger.info(
             "Received Oura webhook",
             provider="oura",
             trace_id=request_trace_id,
@@ -161,9 +160,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         task = celery_app.send_task(
             CeleryTask.PROCESS_WEBHOOK_PUSH, args=["oura", payload, request_trace_id], queue=CeleryQueue.WEBHOOK_SYNC
         )
-        log_structured(
-            logger,
-            "info",
+        logger.info(
             "Enqueued Oura webhook processing task",
             provider="oura",
             trace_id=request_trace_id,
@@ -179,13 +176,13 @@ class OuraWebhookHandler(BaseWebhookHandler):
         Oura sends ``?verification_token=...&challenge=...`` when a subscription
         is created. We verify the token and echo the challenge back.
         """
-        expected = settings.oura_webhook_verification_token.get_secret_value()  # ty:ignore[unresolved-attribute]
+        expected = settings.oura_webhook_verification_token.get_secret_value()  # ty:ignore[missing-union-attribute]
 
         verification_token = request.query_params.get("verification_token")
         challenge = request.query_params.get("challenge", "")
 
         if not verification_token or not self._verify_token(expected, verification_token):
-            raise HTTPException(status_code=401, detail="Invalid verification token")
+            raise WebhookVerificationError("Invalid verification token")
 
         return {"challenge": challenge}
 
@@ -204,9 +201,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         try:
             notification = OuraWebhookNotification(**payload)
         except (ValidationError, TypeError) as exc:
-            log_structured(
-                logger,
-                "warning",
+            logger.warning(
                 "Invalid Oura webhook payload",
                 provider="oura",
                 trace_id=trace_id,
@@ -217,9 +212,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
             return {"status": "error", "error": f"Invalid payload: {exc}"}
 
         if notification.event_type == "delete":
-            log_structured(
-                logger,
-                "info",
+            logger.info(
                 "Ignoring Oura delete event",
                 provider="oura",
                 trace_id=trace_id,
@@ -230,9 +223,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
 
         connections = self.connection_repo.get_all_by_provider_user_id(db, "oura", notification.user_id)
         if not connections:
-            log_structured(
-                logger,
-                "warning",
+            logger.warning(
                 "No connection found for Oura user",
                 provider="oura",
                 trace_id=trace_id,
@@ -253,9 +244,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         user_id: UUID = connections[0].user_id
         linked_user_ids: list[UUID] = [connection.user_id for connection in connections[1:]]
 
-        log_structured(
-            logger,
-            "info",
+        logger.info(
             "Processing Oura webhook notification",
             provider="oura",
             trace_id=trace_id,
@@ -267,8 +256,17 @@ class OuraWebhookHandler(BaseWebhookHandler):
             object_id=notification.object_id,
         )
 
-        for connection in connections:
-            self.connection_repo.update_last_synced_at(db, connection)
+        if not notification.object_id:
+            logger.warning(
+                "Oura webhook missing object_id; skipping fetch",
+                provider="oura",
+                trace_id=trace_id,
+                user_id=str(user_id),
+                provider_user_id=notification.user_id,
+                data_type=notification.data_type,
+                event_type=notification.event_type,
+            )
+            return {"status": "ignored", "reason": "missing_object_id", "user_id": str(user_id)}
 
         raw = self._fetch_object_for_connections(db, notification, connections, trace_id)
 
@@ -279,9 +277,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
                 if count is None:
                     # Unhandled data types are a property of the payload, not of
                     # the profile, so the first verdict settles it for all.
-                    log_structured(
-                        logger,
-                        "info",
+                    logger.info(
                         "Unhandled Oura data type",
                         provider="oura",
                         trace_id=trace_id,
@@ -301,9 +297,11 @@ class OuraWebhookHandler(BaseWebhookHandler):
         # single night of sleep twice in the sync log.
         primary_count: Any = saved.get(user_id, 0)
 
-        log_structured(
-            logger,
-            "info",
+        # Only reached after a completed fetch: fetch errors propagate out of it.
+        for connection in connections:
+            self.connection_repo.update_last_synced_at(db, connection)
+
+        logger.info(
             "Oura webhook notification processed",
             provider="oura",
             action="oura_webhook_complete",
@@ -363,24 +361,23 @@ class OuraWebhookHandler(BaseWebhookHandler):
         dead token on the oldest profile from starving all the others — the bug
         this fan-out exists to fix, one step removed.
         """
-        auth_error: HTTPException | None = None
+        auth_error: ProviderConnectionError | ProviderError | None = None
         for connection in connections:
             try:
                 return self._fetch_object(db, notification, connection.user_id, trace_id)
-            except HTTPException as exc:
-                if exc.status_code not in _TOKEN_FAILURE_STATUSES:
+            except (ProviderConnectionError, ProviderError) as exc:
+                # A dead or missing grant on this profile, or a token Oura refused
+                if isinstance(exc, ProviderError) and exc.upstream_status not in _TOKEN_FAILURE_STATUSES:
                     raise
                 auth_error = exc
-                log_structured(
-                    logger,
-                    "warning",
+                logger.warning(
                     "Oura rejected this profile's token; trying the next linked profile",
                     provider="oura",
                     trace_id=trace_id,
                     user_id=str(connection.user_id),
                     provider_user_id=notification.user_id,
                     data_type=notification.data_type,
-                    status_code=exc.status_code,
+                    error_code=exc.code,
                 )
         if auth_error is not None:
             raise auth_error
@@ -400,19 +397,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
         """
         data_type = notification.data_type
         object_id = notification.object_id
-
         if not object_id:
-            log_structured(
-                logger,
-                "warning",
-                "Oura webhook missing object_id; skipping fetch",
-                provider="oura",
-                trace_id=trace_id,
-                user_id=str(user_id),
-                provider_user_id=notification.user_id,
-                data_type=data_type,
-                event_type=notification.event_type,
-            )
             return None
 
         if data_type == "workout":
@@ -422,9 +407,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
             raw = self.data_247._make_api_request(db, user_id, f"/v2/usercollection/{collection}/{object_id}")
 
         if not raw or not isinstance(raw, dict):
-            log_structured(
-                logger,
-                "warning",
+            logger.warning(
                 "Oura object fetch returned no data",
                 provider="oura",
                 trace_id=trace_id,
@@ -494,9 +477,7 @@ class OuraWebhookHandler(BaseWebhookHandler):
             case "vo2_max":
                 return self.data_247.save_vo2_data(db, user_id, docs, log_ctx)
             case _:
-                log_structured(
-                    logger,
-                    "warning",
+                logger.warning(
                     "Unhandled Oura data type",
                     provider="oura",
                     trace_id=trace_id,
