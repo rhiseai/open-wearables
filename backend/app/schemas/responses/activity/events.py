@@ -57,6 +57,9 @@ class Workout(BaseModel):
     average_cadence: float | None = None
     average_watts: float | None = None
     max_watts: float | None = None
+    average_met: float | None = Field(
+        None, description="The workout's average metabolic equivalent (MET), from its physical_effort series."
+    )
     moving_time_seconds: int | None = None
     elev_high: float | None = None
     elev_low: float | None = None
@@ -121,13 +124,37 @@ class SleepSession(BaseModel):
     end_time: datetime
     zone_offset: str | None = None
     source: SourceMetadata
-    duration_seconds: int
-    sleep_duration_seconds: int | None = None
-    time_in_bed_seconds: int | None = None
+    duration_seconds: int = Field(
+        ...,
+        description=(
+            "Time from start_time to end_time, awake time included; for a night merged from several "
+            "sessions, the gaps between them too"
+        ),
+        example=28800,
+    )
+    sleep_duration_seconds: int | None = Field(
+        None, description="Time asleep, awake time excluded; whole minutes, so a multiple of 60", example=25800
+    )
+    time_in_bed_seconds: int | None = Field(
+        None, description="Time in bed, awake time included; whole minutes, so a multiple of 60", example=28200
+    )
     efficiency_percent: float | None = None
     stages: SleepStagesSummary | None = None
     sleep_stage_intervals: list[SleepStage] | None = None
-    is_nap: bool = False
+    is_nap: bool = Field(
+        False,
+        description=(
+            "Whether the session is a nap rather than its day's main sleep: set by the provider when it flags "
+            "naps and by Open Wearables' nap rule (see Data types). It can change when the same upload or a later "
+            "one of that source changes the day's main sleep, or, for a source that doesn't flag naps, when a "
+            "session of that day is deleted"
+        ),
+    )
+    is_final: bool = Field(
+        ...,
+        description="Whether no more data is expected for this session; until then the provider may still extend it",
+        example=True,
+    )
 
 
 class MenstrualCycleRecord(BaseModel):

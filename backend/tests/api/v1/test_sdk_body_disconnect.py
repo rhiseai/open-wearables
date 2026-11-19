@@ -6,9 +6,11 @@ TCP delivery and cannot prove an already disconnected client received that respo
 
 import asyncio
 import json
+import logging
 from collections import deque
 from collections.abc import Iterator
 from functools import wraps
+from http import HTTPStatus
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -45,7 +47,7 @@ def request_guards(db: Session) -> Iterator[dict[str, MagicMock]]:
     api.dependency_overrides[get_sdk_auth] = observed_auth
     try:
         with (
-            patch("app.middlewares.log_structured") as access_log,
+            patch("app.middlewares.logger.log") as access_log,
             patch("fastapi.routing.run_endpoint_function", handler),
             patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as task,
             patch("app.api.routes.v1.sdk_sync.store_raw_payload") as sync_store,
@@ -137,6 +139,10 @@ def _body(attempted: list[Message]) -> dict:
     return json.loads(content)
 
 
+def _problem(status: int, detail: str, code: str) -> dict:
+    return {"title": HTTPStatus(status).phrase, "status": status, "detail": detail, "code": code}
+
+
 def _assert_no_handler_side_effects(guards: dict[str, MagicMock]) -> None:
     guards["handler"].assert_not_called()
     guards["task"].delay.assert_not_called()
@@ -148,7 +154,7 @@ def _assert_no_handler_side_effects(guards: dict[str, MagicMock]) -> None:
 def _access_fields(guards: dict[str, MagicMock], status: int) -> dict:
     guards["access_log"].assert_called_once()
     call = guards["access_log"].call_args
-    assert call.args[1:] == ("error", "http_request")
+    assert call.args == (logging.ERROR, "http_request")
     assert call.kwargs["status"] == status
     assert call.kwargs["method"] == "POST"
     return call.kwargs
@@ -165,7 +171,7 @@ async def test_partial_sdk_body_disconnect_attempts_400_before_auth_or_handler(
 
     assert received[:2] == ["http.request", "http.disconnect"]
     assert _status(attempted) == 400
-    assert _body(attempted) == {"detail": "There was an error parsing the body"}
+    assert _body(attempted) == _problem(400, "There was an error parsing the body", "BAD_REQUEST")
     fields = _access_fields(request_guards, 400)
     assert fields["error_cause_type"] == "ClientDisconnect"
     assert fields["error_cause_msg"] == ""
@@ -185,9 +191,12 @@ async def test_complete_invalid_json_is_validation_not_client_disconnect(
     attempted, received = await _exchange(path, b'{"provider":')
 
     assert received == ["http.request"]
-    assert _status(attempted) == 400
-    assert "JSON decode error" in _body(attempted)["detail"]
-    fields = _access_fields(request_guards, 400)
+    # A complete body that is not JSON is a validation failure: 422, never the transport 400.
+    assert _status(attempted) == 422
+    body = _body(attempted)
+    assert body["code"] == "VALIDATION_ERROR"
+    assert [(error["msg"], error["type"]) for error in body["errors"]] == [("JSON decode error", "json_invalid")]
+    fields = _access_fields(request_guards, 422)
     assert fields["error_cause_type"] == "RequestValidationError"
     assert "error_type" not in fields
     request_guards["auth"].assert_not_called()
@@ -204,9 +213,11 @@ async def test_complete_empty_json_reaches_real_auth_and_returns_401(
 
     assert received == ["http.request"]
     assert _status(attempted) == 401
-    assert _body(attempted) == {"detail": "Authentication required: provide SDK token or API key"}
+    assert _body(attempted) == _problem(401, "Authentication required: provide SDK token or API key", "UNAUTHORIZED")
     fields = _access_fields(request_guards, 401)
-    assert "error_cause_type" not in fields
+    # The cause is the auth rejection itself, not a body-parse failure.
+    assert fields["error_cause_type"] == "SDKAuthenticationError"
+    assert fields["auth_reason"] == "credentials_missing"
     assert "error_type" not in fields
     request_guards["auth"].assert_awaited_once()
     _assert_no_handler_side_effects(request_guards)

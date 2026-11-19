@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from logging import getLogger
+import logging
 
 from celery import shared_task
 
@@ -10,9 +10,9 @@ from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.integrations.redis_client import get_redis_client
 from app.services.outgoing_webhooks.routing import WEBHOOK_QUEUES
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @shared_task(name=CeleryTask.REPORT_WEBHOOK_QUEUE_DEPTH, ignore_result=True)
@@ -27,9 +27,8 @@ def report_webhook_queue_depth() -> dict[str, int]:
         depth = int(client.llen(queue))
         depths[queue] = depth
         over = depth > settings.webhook_queue_depth_warn_threshold
-        log_structured(
-            logger,
-            "warning" if over else "info",
+        logger.log(
+            logging.WARNING if over else logging.INFO,
             "Outgoing webhook queue depth",
             action="webhook_queue_depth",
             queue=queue,

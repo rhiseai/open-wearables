@@ -9,16 +9,22 @@ as recommended in gap-analysis card t_38e552b2 finding #8.
 t_5912f22f adds: ACTIVITY + SLEEP HealthScore extraction from /v1/scores (parity with Oura).
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
+from app.models import EventRecord, SleepDetails
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType
+from app.schemas.model_crud.activities import CalendarPeriod
+from app.services.event_record_service import event_record_service
 from app.services.providers.sensorbio.data_247 import SensorBio247Data
+from tests.factories import UserFactory
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -63,7 +69,7 @@ class TestSensorBio247SleepNormalization:
         assert result is not None
         assert result["start_time"] == datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
         assert result["end_time"] == datetime.fromtimestamp(1_700_028_800, tz=timezone.utc)
-        assert result["duration_seconds"] == 420 * 60
+        assert result["duration_seconds"] == 28_800  # the start-to-end window, not total_sleep_mins
         assert result["efficiency_percent"] == 88
         assert result["stages"]["deep_seconds"] == 90 * 60
         assert result["stages"]["rem_seconds"] == 120 * 60
@@ -71,6 +77,22 @@ class TestSensorBio247SleepNormalization:
         assert result["average_hrv"] == 45.0
         assert result["average_spo2"] == 97.0
         assert result["resting_heart_rate"] == 52.0
+
+    def test_unreported_stages_stay_none_and_zero_stays_zero(self, data_247: SensorBio247Data) -> None:
+        raw = {
+            "start_timestamp": 1_700_000_000,
+            "end_timestamp": 1_700_028_800,
+            "total_sleep_mins": 420.0,
+            "rem_sleep_mins": 0.0,
+        }
+        result = data_247.normalize_sleep(raw, USER_ID)
+        assert result is not None
+        assert result["stages"] == {
+            "deep_seconds": None,
+            "light_seconds": None,
+            "rem_seconds": 0,
+            "awake_seconds": None,
+        }
 
     def test_is_nap_always_false_without_api_flag(self, data_247: SensorBio247Data) -> None:
         """Sensor Bio has no nap flag; short sessions stay is_nap=False."""
@@ -128,7 +150,7 @@ class TestSensorBio247SleepNormalization:
 
 
 class TestSensorBio247SaveSleepData:
-    """save_sleep_data() — skips records with missing start/end; persists valid ones."""
+    """save_sleep_data() — skips records with a missing or reversed window; persists valid ones."""
 
     def test_skips_missing_start_time(self, data_247: SensorBio247Data) -> None:
         db = MagicMock()
@@ -150,6 +172,19 @@ class TestSensorBio247SaveSleepData:
         result = data_247.save_sleep_data(db, USER_ID, normalized)
         assert result is False
 
+    def test_skips_window_that_ends_before_it_starts(self, data_247: SensorBio247Data) -> None:
+        db = MagicMock()
+        normalized = {
+            "id": uuid4(),
+            "start_time": datetime(2024, 1, 15, 8, 0, 0, tzinfo=timezone.utc),
+            "end_time": datetime(2024, 1, 15, 0, 0, 0, tzinfo=timezone.utc),
+            "duration_seconds": -28800,
+        }
+        with patch("app.services.providers.sensorbio.data_247.event_record_service") as mock_svc:
+            result = data_247.save_sleep_data(db, USER_ID, normalized)
+        assert result is False
+        mock_svc.create.assert_not_called()
+
     def test_persists_valid_record(self, data_247: SensorBio247Data) -> None:
         db = MagicMock()
         normalized = {
@@ -168,6 +203,131 @@ class TestSensorBio247SaveSleepData:
         assert result is True
         mock_svc.create.assert_called_once()
         mock_svc.create_detail.assert_called_once()
+
+    def test_persists_unreported_stages_as_none(self, data_247: SensorBio247Data) -> None:
+        normalized = {
+            "id": uuid4(),
+            "start_time": datetime(2024, 1, 15, 0, 0, 0, tzinfo=timezone.utc),
+            "end_time": datetime(2024, 1, 15, 8, 0, 0, tzinfo=timezone.utc),
+            "duration_seconds": 28800,
+            "stages": {"deep_seconds": None, "light_seconds": None, "rem_seconds": 0, "awake_seconds": None},
+        }
+        with patch("app.services.providers.sensorbio.data_247.event_record_service") as mock_svc:
+            mock_svc.create.return_value = MagicMock(id=normalized["id"])
+            data_247.save_sleep_data(MagicMock(), USER_ID, normalized)
+
+        detail = mock_svc.create_detail.call_args[0][1]
+        assert detail.sleep_deep_minutes is None
+        assert detail.sleep_light_minutes is None
+        assert detail.sleep_awake_minutes is None
+        assert detail.sleep_rem_minutes == 0
+        assert detail.sleep_total_duration_minutes == 0
+
+
+class TestSensorBio247SleepNaps:
+    def test_a_nap_is_flagged_once_it_is_saved(self, data_247: SensorBio247Data, db: Session) -> None:
+        user = UserFactory()
+        night = {
+            "id": uuid4(),
+            "start_time": datetime(2026, 3, 20, 22, tzinfo=timezone.utc),
+            "end_time": datetime(2026, 3, 21, 6, tzinfo=timezone.utc),
+            "duration_seconds": 28800,
+            "stages": {"deep_seconds": 5400, "light_seconds": 14400, "rem_seconds": 7200, "awake_seconds": 1800},
+        }
+        nap = {
+            "id": uuid4(),
+            "start_time": datetime(2026, 3, 21, 13, tzinfo=timezone.utc),
+            "end_time": datetime(2026, 3, 21, 14, 30, tzinfo=timezone.utc),
+            "duration_seconds": 5400,
+            "stages": {"deep_seconds": 0, "light_seconds": 3600, "rem_seconds": 1200, "awake_seconds": 600},
+        }
+
+        assert data_247.save_sleep_data(db, user.id, night)
+        assert data_247.save_sleep_data(db, user.id, nap)
+
+        db.expire_all()
+        assert db.get(SleepDetails, nap["id"]).is_nap is True
+        assert db.get(SleepDetails, night["id"]).is_nap is False
+
+    @staticmethod
+    def _night(day: int) -> dict[str, Any]:
+        return {
+            "id": uuid4(),
+            "start_time": datetime(2026, 3, day, 22, tzinfo=timezone.utc),
+            "end_time": datetime(2026, 3, day + 1, 6, tzinfo=timezone.utc),
+            "duration_seconds": 28800,
+            "stages": {"deep_seconds": 5400, "light_seconds": 14400, "rem_seconds": 7200, "awake_seconds": 1800},
+        }
+
+    def test_a_nap_is_main_sleep_again_once_the_sleep_after_it_outweighs_the_night(
+        self, data_247: SensorBio247Data, db: Session
+    ) -> None:
+        """Sensor Bio sends no nap flag, so the rule marks its sessions both ways."""
+
+        def session(start: datetime, end: datetime, deep: int, light: int, rem: int) -> dict[str, Any]:
+            stages = {"deep_seconds": deep * 60, "light_seconds": light * 60, "rem_seconds": rem * 60}
+            seconds = int((end - start).total_seconds())
+            return {"id": uuid4(), "start_time": start, "end_time": end, "duration_seconds": seconds, "stages": stages}
+
+        user = UserFactory()
+        early = session(
+            datetime(2026, 3, 21, 0, tzinfo=timezone.utc), datetime(2026, 3, 21, 3, tzinfo=timezone.utc), 30, 100, 40
+        )
+        dawn = session(
+            datetime(2026, 3, 21, 5, tzinfo=timezone.utc), datetime(2026, 3, 21, 6, 30, tzinfo=timezone.utc), 0, 60, 20
+        )
+        assert data_247.save_sleep_data(db, user.id, early)
+        assert data_247.save_sleep_data(db, user.id, dawn)
+        # Rolled back first, so only what the write committed is read
+        db.rollback()
+        db.expire_all()
+        assert db.get(SleepDetails, dawn["id"]).is_nap is True
+
+        # Half an hour after the dawn sleep: one sleep with it, with more sleep than the early one.
+        morning = session(
+            datetime(2026, 3, 21, 7, tzinfo=timezone.utc), datetime(2026, 3, 21, 14, tzinfo=timezone.utc), 60, 240, 80
+        )
+        assert data_247.save_sleep_data(db, user.id, morning)
+
+        db.rollback()
+        db.expire_all()
+        assert db.get(SleepDetails, early["id"]).is_nap is True
+        assert db.get(SleepDetails, dawn["id"]).is_nap is False
+        assert db.get(SleepDetails, morning["id"]).is_nap is False
+
+    def test_marking_naps_takes_the_sleep_writer_lock(self, data_247: SensorBio247Data, db: Session) -> None:
+        user = UserFactory()
+        lock = event_record_service.crud.lock_sleep_user
+
+        with patch.object(event_record_service.crud, "lock_sleep_user", wraps=lock) as locked:
+            assert data_247.save_sleep_data(db, user.id, self._night(20))
+
+        locked.assert_called_once_with(db, user.id)
+
+    def test_a_failing_nap_step_keeps_the_session_and_the_next_one(
+        self, data_247: SensorBio247Data, db: Session
+    ) -> None:
+        """A database error while marking naps undoes only the marking: the session stays stored, and the
+        next session of the same sync is stored in the same database session."""
+        user = UserFactory()
+        first, second = self._night(20), self._night(22)
+        mark_naps = event_record_service._mark_naps
+
+        def failing(session: Session, *args: Any, **kwargs: Any) -> set[UUID]:
+            session.execute(text("SELECT 1 / 0"))
+            return mark_naps(session, *args, **kwargs)
+
+        with (
+            patch.object(event_record_service, "_mark_naps", side_effect=failing),
+            patch("app.services.event_record_service.logger") as logger,
+        ):
+            assert data_247.save_sleep_data(db, user.id, first) is True
+        assert data_247.save_sleep_data(db, user.id, second) is True
+
+        assert logger.error.call_args.args == ("Nap marking failed after sleep write",)
+        db.rollback()
+        assert db.get(EventRecord, first["id"]) is not None
+        assert db.get(EventRecord, second["id"]) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +403,9 @@ class TestSensorBio247SaveRecoveryData:
         assert counts == 4  # 3 metrics + 1 score
         assert counts.inserted == 4
         mock_ts.bulk_create_samples.assert_called_once()
+        assert {s.period for s in mock_ts.bulk_create_samples.call_args[0][1]} == {
+            CalendarPeriod.of_date(date(2024, 1, 15))
+        }
         mock_hs.bulk_create.assert_called_once()
         scores = mock_hs.bulk_create.call_args[0][1]
         from app.schemas.enums import HealthScoreCategory

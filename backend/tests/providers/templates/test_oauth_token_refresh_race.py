@@ -9,7 +9,7 @@ Tests cover:
 - Refresh failure with a rotated stored token does not revoke the connection
 - Refresh failure with a genuinely dead token still revokes and notifies
 - The refresh lock lets a late caller reuse the token another worker stored
-- Redis being unavailable does not block the refresh
+- An expiring token is refreshed while the lock is held
 """
 
 from datetime import datetime, timedelta, timezone
@@ -17,10 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import HTTPException
 from redis.exceptions import RedisError
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.integrations.redis_client import get_redis_client
 from app.models import User, UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
@@ -29,6 +30,7 @@ from app.schemas.model_crud.credentials import OAuthTokenResponse
 from app.services.providers.api_client import get_valid_token
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.whoop.oauth import WhoopOAuth
+from app.utils.exceptions import ReauthRequiredError
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -91,7 +93,7 @@ class TestRefreshTokenRotationGuard:
         whoop_oauth: WhoopOAuth,
         db: Session,
     ) -> None:
-        """Should revoke, notify, and raise 401 when the stored token is the rejected one."""
+        """Should revoke, notify, and require reconnection when the stored token is the rejected one."""
         # Arrange
         user = UserFactory()
         connection = UserConnectionFactory(
@@ -104,11 +106,11 @@ class TestRefreshTokenRotationGuard:
         mock_post.return_value.raise_for_status.side_effect = _http_error(400)
 
         # Act
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(ReauthRequiredError) as exc_info:
             whoop_oauth.refresh_access_token(db, user.id, "dead_refresh_token")
 
         # Assert
-        assert exc_info.value.status_code == 401
+        assert exc_info.value.status_code == 409
         assert connection.status == ConnectionStatus.REVOKED
         mock_on_revoked.assert_called_once()
         assert mock_on_revoked.call_args.kwargs["reason"] == "refresh_failed"
@@ -181,11 +183,11 @@ class TestRefreshTokenRotationGuard:
         mock_post.return_value.raise_for_status.side_effect = _http_error(401)
 
         # Act
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(ReauthRequiredError) as exc_info:
             whoop_oauth.refresh_access_token(db, user.id, "dead_refresh_token")
 
         # Assert
-        assert exc_info.value.status_code == 401
+        assert exc_info.value.status_code == 409
         mock_on_revoked.assert_not_called()
 
 
@@ -215,17 +217,21 @@ class TestGetValidTokenLocking:
         db: Session,
     ) -> None:
         """Should skip the HTTP refresh when the lock holder already stored a fresh token."""
-        # Arrange - acquiring the lock stands in for waiting on the worker that refreshes
+        # Arrange - entering the lock stands in for waiting on the worker that refreshes. Raw SQL
+        # stores its token like that worker's session would, so this session's instance stays stale.
         oauth = MagicMock(spec=BaseOAuthTemplate)
+        lock = MagicMock()
 
         def refresh_while_blocked() -> bool:
-            expiring_connection.access_token = "winner_access_token"
-            expiring_connection.token_expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-            db.add(expiring_connection)
-            db.commit()
+            db.execute(
+                text(
+                    "UPDATE user_connection SET access_token = 'winner_access_token', token_expires_at = :expires_at "
+                    "WHERE id = :id"
+                ),
+                {"expires_at": datetime.now(timezone.utc) + timedelta(hours=1), "id": expiring_connection.id},
+            )
             return True
 
-        lock = MagicMock()
         lock.acquire.side_effect = refresh_while_blocked
         redis_client = MagicMock()
         redis_client.lock.return_value = lock
@@ -238,16 +244,26 @@ class TestGetValidTokenLocking:
         assert access_token == "winner_access_token"
         oauth.refresh_access_token.assert_not_called()
         redis_client.lock.assert_called_once()
-        assert redis_client.lock.call_args.args[0] == f"oauth:token_refresh:{expiring_connection.user_id}:whoop"
+        assert redis_client.lock.call_args.args[0] == f"token_refresh_lock:whoop:{expiring_connection.user_id}"
         lock.release.assert_called_once()
 
-    def test_expiring_token_is_refreshed_under_the_lock(
+    @pytest.mark.parametrize(
+        "redis_client",
+        [
+            pytest.param(MagicMock(**{"lock.side_effect": RedisError("connection refused")}), id="redis-down"),
+            pytest.param(MagicMock(**{"lock.return_value.acquire.return_value": False}), id="lock-still-held"),
+        ],
+    )
+    def test_refresh_proceeds_unlocked_when_the_lock_cannot_be_taken(
         self,
+        redis_client: MagicMock,
         connection_repo: UserConnectionRepository,
         expiring_connection: UserConnection,
         db: Session,
     ) -> None:
-        """Should refresh with the stored refresh token and release the lock afterwards."""
+        """A missing lock must not stop the refresh: provider deregistration on account deletion
+        runs through here during a Redis outage, and Garmin's deregistration check reads any error
+        as a dead grant. The rotation guard in BaseOAuthTemplate catches a race lost without it."""
         # Arrange
         oauth = MagicMock(spec=BaseOAuthTemplate)
         oauth.refresh_access_token.return_value = OAuthTokenResponse(
@@ -256,14 +272,41 @@ class TestGetValidTokenLocking:
             refresh_token="new_refresh_token",
             expires_in=3600,
         )
-        lock = MagicMock()
-        lock.acquire.return_value = True
-        redis_client = MagicMock()
-        redis_client.lock.return_value = lock
 
         # Act
         with patch("app.services.providers.api_client.get_redis_client", return_value=redis_client):
             access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
+
+        # Assert
+        assert access_token == "new_access_token"
+        oauth.refresh_access_token.assert_called_once()
+        redis_client.lock.return_value.release.assert_not_called()
+
+    def test_expiring_token_is_refreshed_under_the_lock(
+        self,
+        connection_repo: UserConnectionRepository,
+        expiring_connection: UserConnection,
+        db: Session,
+    ) -> None:
+        """Should refresh with the stored refresh token while holding the lock, and release it afterwards."""
+        # Arrange - the real lock in Redis, checked from inside the refresh
+        lock_key = f"token_refresh_lock:whoop:{expiring_connection.user_id}"
+        lock_held_during_refresh: list[int] = []
+
+        def refresh(*_: object, **__: object) -> OAuthTokenResponse:
+            lock_held_during_refresh.append(get_redis_client().exists(lock_key))
+            return OAuthTokenResponse(
+                access_token="new_access_token",
+                token_type="Bearer",
+                refresh_token="new_refresh_token",
+                expires_in=3600,
+            )
+
+        oauth = MagicMock(spec=BaseOAuthTemplate)
+        oauth.refresh_access_token.side_effect = refresh
+
+        # Act
+        access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
 
         # Assert
         assert access_token == "new_access_token"
@@ -273,34 +316,8 @@ class TestGetValidTokenLocking:
             "stored_refresh_token",
             revoke_on_failure=True,
         )
-        lock.release.assert_called_once()
-
-    def test_refresh_proceeds_when_redis_is_unavailable(
-        self,
-        connection_repo: UserConnectionRepository,
-        expiring_connection: UserConnection,
-        db: Session,
-    ) -> None:
-        """Should degrade gracefully and still refresh when the lock cannot be taken."""
-        # Arrange
-        oauth = MagicMock(spec=BaseOAuthTemplate)
-        oauth.refresh_access_token.return_value = OAuthTokenResponse(
-            access_token="new_access_token",
-            token_type="Bearer",
-            refresh_token="new_refresh_token",
-            expires_in=3600,
-        )
-
-        # Act
-        with patch(
-            "app.services.providers.api_client.get_redis_client",
-            side_effect=RedisError("connection refused"),
-        ):
-            access_token = get_valid_token(db, expiring_connection.user_id, "whoop", connection_repo, oauth)
-
-        # Assert
-        assert access_token == "new_access_token"
-        oauth.refresh_access_token.assert_called_once()
+        assert lock_held_during_refresh == [1]
+        assert not get_redis_client().exists(lock_key)
 
     def test_valid_token_skips_the_lock_entirely(
         self,

@@ -8,7 +8,6 @@ happens in the worker process.
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 from typing import Any
 from uuid import UUID
@@ -23,8 +22,9 @@ from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
 from app.services.outgoing_webhooks.payloads import split_samples_by_payload_bytes, validate_webhook_payload
 from app.services.outgoing_webhooks.subscriptions import timeseries_event_enabled
+from app.utils.structured_logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Svix eventId must match [a-zA-Z0-9\-_.] — colons, plus-signs, and other
 # characters in ISO 8601 timestamps are not allowed.
@@ -54,7 +54,7 @@ def _enqueue_dispatch(
     try:
         validate_webhook_payload(event_type, payload)
     except ValueError as exc:
-        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        logger.warning("Dropping invalid webhook event", event_type=event_type, error=str(exc))
         return False
     try:
         celery_app.send_task(
@@ -64,7 +64,7 @@ def _enqueue_dispatch(
         )
         return True
     except Exception:
-        logger.warning("Could not enqueue webhook event %s", event_type, exc_info=True)
+        logger.warning("Could not enqueue webhook event", event_type=event_type, exc_info=True)
         return False
 
 
@@ -87,7 +87,7 @@ def _dispatch(
     try:
         validate_webhook_payload(event_type, payload)
     except ValueError as exc:
-        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        logger.warning("Dropping invalid webhook event", event_type=event_type, error=str(exc))
         return
     batch = current_sdk_webhook_batch()
     if batch is not None:
@@ -394,7 +394,7 @@ def _emit_timeseries_batch_now(
     try:
         chunks = split_samples_by_payload_bytes(event_type, base_data, samples)
     except ValueError as exc:
-        logger.warning("Dropping oversized/invalid timeseries webhook %s: %s", series_type, exc)
+        logger.warning("Dropping oversized/invalid timeseries webhook", series_type=series_type, error=str(exc))
         return 0
 
     # Two runs can write the same window with different provenance. Without the run in

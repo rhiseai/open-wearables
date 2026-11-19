@@ -1,6 +1,6 @@
 """Tests for Garmin OAuth implementation."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
 
 import httpx
@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import AuthenticationMethod
+from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import OAuthTokenResponse, ProviderCredentials, ProviderEndpoints
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.utils.exceptions import InvalidInputError, ProviderError, ReauthRequiredError
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -360,3 +361,80 @@ class TestGarminOAuth:
         # Act & Assert
         with pytest.raises(httpx.HTTPStatusError):
             garmin_oauth.deregister_user("expired_token")
+
+
+class TestOAuthTokenErrors:
+    """How the shared OAuth template turns a failed token request into a domain error."""
+
+    TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
+
+    @pytest.fixture
+    def garmin_oauth(self) -> GarminOAuth:
+        return GarminOAuth(
+            user_repo=MagicMock(),
+            connection_repo=MagicMock(),
+            provider_name="garmin",
+            api_base_url="https://apis.garmin.com",
+        )
+
+    def _response(self, status_code: int, text: str = "") -> httpx.Response:
+        return httpx.Response(status_code, text=text, request=httpx.Request("POST", self.TOKEN_URL))
+
+    @pytest.mark.parametrize("status_code", [400, 401])
+    @patch("httpx.post")
+    def test_rejected_refresh_token_revokes_and_requires_reconnection(
+        self, mock_post: MagicMock, garmin_oauth: GarminOAuth, status_code: int
+    ) -> None:
+        mock_post.return_value = self._response(status_code, '{"error": "invalid_grant"}')
+        # No concurrent refresh rotated it: the rejected token is still the stored one
+        garmin_oauth.connection_repo.get_by_user_and_provider_fresh.return_value = MagicMock(
+            status=ConnectionStatus.ACTIVE, access_token="stale-access-token", refresh_token="dead-refresh-token"
+        )
+        user_id = uuid4()
+
+        with (
+            patch.object(garmin_oauth, "_revoke_connection", return_value=True) as mock_revoke,
+            pytest.raises(ReauthRequiredError),
+        ):
+            garmin_oauth.refresh_access_token(MagicMock(), user_id, "dead-refresh-token")
+
+        mock_revoke.assert_called_once_with(ANY, user_id, refresh_token="dead-refresh-token", reason="refresh_failed")
+
+    @patch("httpx.post")
+    def test_refresh_during_a_provider_outage_keeps_the_connection(
+        self, mock_post: MagicMock, garmin_oauth: GarminOAuth
+    ) -> None:
+        mock_post.return_value = self._response(503, "maintenance")
+
+        with patch.object(garmin_oauth, "_revoke_connection") as mock_revoke, pytest.raises(ProviderError) as exc_info:
+            garmin_oauth.refresh_access_token(MagicMock(), uuid4(), "refresh-token")
+
+        assert (exc_info.value.status_code, exc_info.value.upstream_status) == (502, 503)
+        mock_revoke.assert_not_called()
+
+    @patch("httpx.post", side_effect=httpx.ConnectError("connection refused"))
+    def test_refresh_without_a_response(self, mock_post: MagicMock, garmin_oauth: GarminOAuth) -> None:
+        with pytest.raises(ProviderError) as exc_info:
+            garmin_oauth.refresh_access_token(MagicMock(), uuid4(), "refresh-token")
+
+        assert exc_info.value.detail == "Garmin token refresh failed"
+
+    @patch("httpx.post")
+    def test_rejected_authorization_code_is_a_client_error(
+        self, mock_post: MagicMock, garmin_oauth: GarminOAuth
+    ) -> None:
+        mock_post.return_value = self._response(400, '{"error": "invalid_grant", "code": "abc"}')
+
+        with pytest.raises(InvalidInputError) as exc_info:
+            garmin_oauth._exchange_token("expired-code", "verifier")
+
+        assert exc_info.value.detail == "Failed to exchange authorization code"
+
+    @patch("httpx.post")
+    def test_code_exchange_during_a_provider_outage(self, mock_post: MagicMock, garmin_oauth: GarminOAuth) -> None:
+        mock_post.return_value = self._response(500, "oops")
+
+        with pytest.raises(ProviderError) as exc_info:
+            garmin_oauth._exchange_token("code", "verifier")
+
+        assert exc_info.value.upstream_status == 500

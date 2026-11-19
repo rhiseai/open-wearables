@@ -20,7 +20,9 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.dates import offset_to_iso
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class OuraWorkouts(BaseWorkoutsTemplate):
@@ -70,18 +72,14 @@ class OuraWorkouts(BaseWorkoutsTemplate):
                     break
 
             except Exception as e:
-                log_structured(
-                    self.logger,
-                    "error",
+                logger.error(
                     "Error fetching Oura workout data",
                     action="oura_workout_fetch_error",
                     error=str(e),
                     user_id=str(user_id),
                 )
                 if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
+                    logger.warning(
                         "Returning partial workout data due to error",
                         action="oura_workout_partial_data",
                         error=str(e),
@@ -115,14 +113,12 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         workout_id: str,
         trace_id: str | None = None,
     ) -> int:
-        """Fetch a single workout by ID and save it, replacing any stored version of it.
+        """Fetch a single workout by ID and save it.
 
         Called for Oura ``workout`` webhooks, including ``update`` events. An edited
-        workout keeps its ``external_id`` but may shift its time window, so it no
-        longer collides with the ``(data_source_id, start, end)`` unique index; the
-        replace keeps re-ingestion idempotent instead of appending a second copy of
-        the same workout. Its delete and insert share one transaction, so a failing
-        insert leaves the stored workout untouched.
+        workout keeps its ``external_id``, and ``EventRecordRepository.create_and_flush``
+        refreshes the stored row with that ``external_id`` in place instead of appending a
+        second copy (see ``save_from_raw``).
         """
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
@@ -151,23 +147,31 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         secondary profile must not re-fetch: it would spend a second API call on
         an identical object, and its own token may be expired even while the
         data is perfectly deliverable.
+
+        The workout and its detail commit together, so a failure rolls both back
+        and never leaves the workout half-refreshed (the edit's times on the old
+        detail). When another workout already holds the delivered time window,
+        nothing is written for it: the edit is not grafted onto that workout, nor
+        its detail onto the stored copy left at its old times.
         """
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
-            created = self.workout_repo.replace_by_external_id(db, user_id, record, source=self.provider_name)
-            if created is None:
-                log_structured(
-                    self.logger,
-                    "warning",
-                    "Skipped Oura workout: an unrelated workout already occupies its time window",
-                    action="oura_workout_slot_taken",
-                    trace_id=trace_id,
-                    user_id=str(user_id),
-                    workout_id=workout_id,
-                )
-                continue
-            detail = details.model_copy(update={"record_id": created.id})
-            event_record_service.create_detail(db, detail)
+            try:
+                stored = self.workout_repo.create_and_flush(db, record)
+                if not self.workout_repo.holds_delivery(stored, record):
+                    logger.warning(
+                        "Skipped Oura workout: another workout already holds its time window",
+                        action="oura_workout_slot_taken",
+                        trace_id=trace_id,
+                        user_id=str(user_id),
+                        workout_id=workout_id,
+                    )
+                    continue
+                event_record_service.bulk_create_details(db, [details.model_copy(update={"record_id": stored.id})])
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
             count += 1
         return count
 

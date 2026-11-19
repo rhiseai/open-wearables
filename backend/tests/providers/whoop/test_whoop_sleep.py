@@ -1,7 +1,7 @@
-"""Tests for Whoop sleep ingestion: the night's local offset and the date it is summarised under."""
+"""Tests for Whoop sleep ingestion: the night's local offset, the date it is summarised under and a nap sent
+again."""
 
 from datetime import date, datetime
-from logging import getLogger
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -169,7 +169,7 @@ class TestWhoopNightsSummarisedByLocalWakeUpDate:
         _load(data_247, db, user.id, FIRST_NIGHT)
         _load(data_247, db, user.id, SECOND_NIGHT)
 
-        result = SummariesService(log=getLogger(__name__)).get_sleep_summaries(
+        result = SummariesService().get_sleep_summaries(
             db,
             user.id,
             datetime.fromisoformat("2026-10-13T00:00:00+00:00"),
@@ -189,3 +189,100 @@ class TestWhoopNightsSummarisedByLocalWakeUpDate:
         assert second.start_time == datetime.fromisoformat("2026-10-14T18:20:00+00:00")
         assert second.end_time == datetime.fromisoformat("2026-10-14T23:02:00+00:00")
         assert second.zone_offset == "+07:00"
+
+
+EARLY_SLEEP_ID = "0b6d3f21-8e4a-4c57-b912-5a7e3c9d1f08"
+NIGHT_ID = "c3a91e5f-27d4-4b8e-8f60-1e2d9b7a4c35"
+# A staging WHOOP night (Nov 3): WHOOP sends the short sleep before a long wake as an ordinary sleep and shows it
+# as a nap in its own app; the nap rule makes it one once the night arrives.
+EARLY_SLEEP = _whoop_sleep_payload(
+    EARLY_SLEEP_ID,
+    "2026-11-02T23:24:00.000Z",
+    "2026-11-03T00:54:00.000Z",
+    in_bed_minutes=90,
+    light_minutes=45,
+    deep_minutes=15,
+    rem_minutes=15,
+    timezone_offset="+00:00",
+)
+NIGHT = _whoop_sleep_payload(
+    NIGHT_ID,
+    "2026-11-03T05:05:00.000Z",
+    "2026-11-03T09:26:00.000Z",
+    in_bed_minutes=261,
+    light_minutes=150,
+    deep_minutes=50,
+    rem_minutes=48,
+    timezone_offset="+00:00",
+)
+
+
+def _naps(db: Session, user_id: UUID) -> dict[str, bool]:
+    db.expire_all()
+    return {record.external_id: bool(record.sleep_detail.is_nap) for record in _sleep_records(db, user_id)}
+
+
+class TestWhoopNapSentAgain:
+    """WHOOP sends a sleep again on every sync, a nap the rule made as an ordinary sleep."""
+
+    def test_an_unchanged_nap_sent_again_is_not_announced(self, db: Session, data_247: Whoop247Data) -> None:
+        user = UserFactory()
+        _load(data_247, db, user.id, EARLY_SLEEP)
+        _load(data_247, db, user.id, NIGHT)
+        assert _naps(db, user.id) == {EARLY_SLEEP_ID: True, NIGHT_ID: False}
+
+        with (
+            patch("app.services.event_record_service.on_sleep_created") as created,
+            patch("app.services.event_record_service.on_sleep_updated") as updated,
+        ):
+            _load(data_247, db, user.id, EARLY_SLEEP)
+
+        created.assert_not_called()
+        updated.assert_not_called()
+        assert _naps(db, user.id) == {EARLY_SLEEP_ID: True, NIGHT_ID: False}
+
+    def test_a_nap_sent_again_with_a_new_end_is_announced(self, db: Session, data_247: Whoop247Data) -> None:
+        user = UserFactory()
+        _load(data_247, db, user.id, EARLY_SLEEP)
+        _load(data_247, db, user.id, NIGHT)
+
+        with (
+            patch("app.services.event_record_service.on_sleep_created") as created,
+            patch("app.services.event_record_service.on_sleep_updated") as updated,
+        ):
+            _load(data_247, db, user.id, {**EARLY_SLEEP, "end": "2026-11-03T01:04:00.000Z"})
+
+        created.assert_not_called()
+        updated.assert_called_once()
+        assert updated.call_args.kwargs["end_time"] == "2026-11-03T01:04:00+00:00"
+        assert updated.call_args.kwargs["is_nap"] is True
+        assert _naps(db, user.id) == {EARLY_SLEEP_ID: True, NIGHT_ID: False}
+
+    def test_a_nap_sent_again_with_new_stages_in_its_window_is_announced(
+        self, db: Session, data_247: Whoop247Data
+    ) -> None:
+        # The common real update: WHOOP rescoring a sleep keeps its window and changes its stages.
+        user = UserFactory()
+        _load(data_247, db, user.id, EARLY_SLEEP)
+        _load(data_247, db, user.id, NIGHT)
+        rescored = _whoop_sleep_payload(
+            EARLY_SLEEP_ID,
+            "2026-11-02T23:24:00.000Z",
+            "2026-11-03T00:54:00.000Z",
+            in_bed_minutes=90,
+            light_minutes=40,
+            deep_minutes=20,
+            rem_minutes=15,
+            timezone_offset="+00:00",
+        )
+
+        with (
+            patch("app.services.event_record_service.on_sleep_created") as created,
+            patch("app.services.event_record_service.on_sleep_updated") as updated,
+        ):
+            _load(data_247, db, user.id, rescored)
+
+        created.assert_not_called()
+        updated.assert_called_once()
+        assert updated.call_args.kwargs["is_nap"] is True
+        assert _naps(db, user.id) == {EARLY_SLEEP_ID: True, NIGHT_ID: False}

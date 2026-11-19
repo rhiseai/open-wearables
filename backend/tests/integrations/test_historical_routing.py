@@ -1,7 +1,6 @@
 """Publish-time routing must protect live work across every historical caller."""
 
 from datetime import datetime, timezone
-from logging import getLogger
 from typing import Any
 from unittest.mock import patch
 
@@ -103,7 +102,7 @@ def test_deferred_sleep_publisher_separates_scheduling_from_webhook_suppression(
         }
     )
     with collect_sdk_webhooks("sleep-batch", historical=suppressed), patch.object(celery_app, "send_task") as publish:
-        ImportService(getLogger(__name__))._defer_sleep(request, "user", "sleep-batch")
+        ImportService()._defer_sleep(request, "user", "sleep-batch")
     options = publish.call_args.kwargs
     assert options["args"][3] is suppressed
     route = celery_app.amqp.router.route(options, CeleryTask.PROCESS_SDK_SLEEP, options["args"], {})

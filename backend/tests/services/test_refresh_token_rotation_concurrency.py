@@ -13,7 +13,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import delete, or_
 from sqlalchemy.orm import Session
 
@@ -21,6 +20,7 @@ from app.models import Developer, RefreshToken, User
 from app.repositories.refresh_token_repository import refresh_token_repository
 from app.schemas.auth import SDKTokenOrigin, TokenResponse, TokenType
 from app.services.refresh_token_service import refresh_token_service
+from app.utils.exceptions import AuthenticationError
 
 CONCURRENT_REQUESTS = 8
 
@@ -76,7 +76,7 @@ def _run_concurrently(session_factory: Any, call: Callable[[Session], object]) -
             barrier.wait()
             try:
                 return call(session)
-            except HTTPException as exc:
+            except AuthenticationError as exc:
                 return exc
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_REQUESTS) as pool:

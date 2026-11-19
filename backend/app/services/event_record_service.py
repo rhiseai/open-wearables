@@ -1,40 +1,50 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from logging import Logger, getLogger
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query, Session, SessionTransaction
 
 from app.config import settings
 from app.database import DbSession
+from app.integrations.rollup_queue import mark_dirty_days
 from app.models import (
-    DataPointSeries,
     DataSource,
     DetailType,
     EventRecord,
+    EventRecordAggregate,
     EventRecordDetail,
     HealthScore,
     MealDetails,
     MenstrualCycleDetails,
-    ProviderPriority,
+    SeriesSample,
     SleepDetails,
     WorkoutDetails,
 )
 from app.repositories import (
+    AggregateRepository,
     DataPointSeriesRepository,
     DataSourceRepository,
     EventRecordDetailRepository,
     EventRecordRepository,
     HealthScoreRepository,
-    ProviderPriorityRepository,
 )
 from app.repositories.data_point_series_repository import WorkoutWindow
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
-from app.repositories.device_type_priority_repository import DeviceTypePriorityRepository
-from app.schemas.enums import EventCategory, HealthScoreCategory, ProviderName, SeriesType, get_series_type_unit
+from app.repositories.event_record_repository import local_days
+from app.schemas.data_type_coverage import CoverageSpan
+from app.schemas.enums import (
+    EventCategory,
+    HealthScoreCategory,
+    ProviderName,
+    SeriesType,
+    SourceSelection,
+    get_series_type_unit,
+)
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -58,6 +68,7 @@ from app.schemas.responses.activity import (
     Workout,
     WorkoutTotals,
 )
+from app.schemas.sync_status import DataTypeKind
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -74,15 +85,19 @@ from app.services.outgoing_webhooks.events import (
     on_sleep_updated,
     on_workout_created,
 )
+from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
-from app.services.sleep_naps import SleepBlock, nap_ids
+from app.services.sleep_finality import final_record_ids
+from app.services.sleep_nap_marking import SleepBlock, flags_own_naps, nap_ids
 from app.services.sleep_reconciliation import merge_sleep_parts
 from app.utils.context import current_sync_payload
-from app.utils.conversion import as_dict_list, as_float, as_model, minutes_to_seconds
-from app.utils.exceptions import handle_exceptions
+from app.utils.conversion import as_dict_list, as_float, as_int, as_model, minutes_to_seconds
+from app.utils.dates import local_date
 from app.utils.pagination import encode_cursor
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -159,12 +174,17 @@ def _nutrient_values(nutrients: dict[SeriesType, float]) -> dict[str, NutrientVa
 def pace_sec_per_km(distance_meters: float | None, seconds: int | None) -> float | None:
     """Average pace in seconds per kilometre.
 
-    Derived from distance and time rather than ``average_speed``, whose unit is not
-    consistent across providers (Suunto stores km/h, Garmin/Strava/Google m/s).
+    Derived from distance and time rather than ``average_speed``: every provider stores m/s now,
+    but a pace from the workout's own distance and time needs no speed at all.
     """
     if distance_meters is None or seconds is None or distance_meters <= 0 or seconds <= 0:
         return None
     return round(seconds / (distance_meters / 1000), 1)
+
+
+def _first_number(*values: Decimal | None) -> float | None:
+    """The first value that is set, so a provider's 0 kcal is kept rather than skipped."""
+    return next((float(value) for value in values if value is not None), None)
 
 
 class EventRecordService(
@@ -172,33 +192,34 @@ class EventRecordService(
 ):
     """Service coordinating CRUD access for unified health records."""
 
-    def __init__(self, log: Logger, **kwargs):
-        super().__init__(crud_model=EventRecordRepository, model=EventRecord, log=log, **kwargs)
+    def __init__(self, **kwargs):
+        super().__init__(crud_model=EventRecordRepository, model=EventRecord, **kwargs)
         self.event_record_detail_repo = EventRecordDetailRepository(EventRecordDetail)
+        self.aggregate_repo = AggregateRepository(EventRecordAggregate)
         self.data_source_repo = DataSourceRepository()
-        self.data_point_series_repo = DataPointSeriesRepository(DataPointSeries)
+        self.data_point_series_repo = DataPointSeriesRepository(SeriesSample)
         self.health_score_repo = HealthScoreRepository(HealthScore)
-        self.provider_priority_repo = ProviderPriorityRepository(ProviderPriority)
-        self.device_type_priority_repo = DeviceTypePriorityRepository()
 
     def _resolve_avg_hr(
         self,
         db_session: DbSession,
         records: list[EventRecord],
+        statistics: dict[UUID, dict[str, Decimal | None]],
     ) -> dict[UUID, int | None]:
         """Return avg HR for each workout record.
 
-        Uses stored heart_rate_avg where available, falls back to a single batch query
-        against data_point_series for records that don't have it: the workout's own source
-        first, then the other sources of the same writer.
+        Uses the workout's heart rate aggregate (the provider's, else ours from its own samples) where
+        available, falls back to a single batch query against series_sample of the other sources of the
+        same writer.
         """
         result: dict[UUID, int | None] = {}
         missing = []
 
         for r in records:
-            details = r.workout_detail
-            if details and details.heart_rate_avg is not None:
-                result[r.id] = round(details.heart_rate_avg)
+            average = statistics.get(r.id, {}).get("heart_rate_avg")
+            if average is not None:
+                # Half up, as the SQL fallback below rounds: 72.5 is 73 either way.
+                result[r.id] = int(Decimal(average).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
             else:
                 result[r.id] = None
                 missing.append(r)
@@ -290,11 +311,11 @@ class EventRecordService(
         later, longer session. Days are keyed by the local date a session ends,
         as the daily sleep summary is. Returns the ids marked as naps.
 
-        Apple has no nap flag of its own, so its sessions are marked both ways.
-        With ``keep_source_naps`` a nap the source flagged stays a nap and takes
-        no part in choosing the main sleep, and the rule only adds naps: WHOOP,
-        for one, sends a short sleep before the night as an ordinary sleep and
-        shows it as a nap in its own app.
+        A source with no nap flag of its own (``flags_own_naps`` is False) is
+        marked both ways. With ``keep_source_naps`` a nap the source flagged
+        stays a nap and takes no part in choosing the main sleep, and the rule
+        only adds naps: WHOOP, for one, sends a short sleep before the night as
+        an ordinary sleep and shows it as a nap in its own app.
         """
         if not wake_dates:
             return set()
@@ -335,16 +356,43 @@ class EventRecordService(
         db_session.flush()
         return naps
 
+    def _widen_sleep_coverage(self, db_session: DbSession, session: EventRecord) -> None:
+        """Widen the provider's sleep coverage to a session re-sent over a longer window.
+
+        A shorter one is not narrowed here: that recount takes the global coverage lock, too much for every webhook.
+        """
+        data_source = self.data_source_repo.get(db_session, session.data_source_id)
+        if data_source is None:
+            return
+        span = CoverageSpan(
+            data_source.user_id,
+            data_source.provider,
+            EventCategory.SLEEP.value,
+            DataTypeKind.EVENT,
+            session.start_datetime,
+            session.end_datetime,
+        )
+        data_type_coverage_repository.record(db_session, [span])
+
+    @staticmethod
+    def _source_flags_own_naps(db_session: DbSession, data_source_id: UUID) -> bool:
+        """Whether the data source's provider sends a nap flag of its own (``flags_own_naps``).
+
+        The source a record is filed under decides, not the provider a payload names: Whoop's and Sensor Bio's
+        records name none.
+        """
+        return flags_own_naps(db_session.get_one(DataSource, data_source_id).provider)
+
     def _with_marked_naps(
         self,
         db_session: DbSession,
-        record: EventRecordCreate,
         survivor: EventRecord,
         detail: EventRecordDetailCreate,
         wake_dates: set[date],
+        *,
+        keep_source_naps: bool,
     ) -> EventRecordDetailCreate:
         """Mark the source's naps on the written dates; the returned detail carries the survivor's flag."""
-        keep_source_naps = record.provider != ProviderName.APPLE
         naps = self._mark_naps(db_session, survivor.data_source_id, wake_dates, keep_source_naps=keep_source_naps)
         is_nap = survivor.id in naps or (keep_source_naps and bool(detail.is_nap))
         return detail.model_copy(update={"is_nap": is_nap})
@@ -407,6 +455,29 @@ class EventRecordService(
         if creators:
             self.health_score_repo.bulk_create(db_session, creators)
 
+    def mark_sleep_naps_after_write(self, db_session: DbSession, user_id: UUID, record: EventRecord) -> None:
+        """Mark the naps of a stored session's wake date and rescore it, then commit.
+
+        For Sensor Bio, whose sleep is stored by ``create`` and ``create_detail`` rather than by
+        ``create_or_merge_sleep`` (which marks naps inside its own write). The sleep is already committed: on a
+        database error only the marking and the rescore are undone, and the database session stays usable for
+        the caller's next write. The day is marked and rescored again by the next write of a session of that
+        source that ends on it.
+        """
+        record_id, data_source_id = record.id, record.data_source_id
+        wake_date = local_date(record.end_datetime, record.zone_offset)
+        try:
+            with db_session.begin_nested():
+                self.lock_sleep_user(db_session, user_id)
+                keep_source_naps = self._source_flags_own_naps(db_session, data_source_id)
+                self._mark_naps(db_session, data_source_id, {wake_date}, keep_source_naps=keep_source_naps)
+                self._recompute_sleep_scores(db_session, user_id, {wake_date})
+        except SQLAlchemyError as e:
+            logger.error(
+                "Nap marking failed after sleep write", exc_info=e, record_id=str(record_id), user_id=str(user_id)
+            )
+        db_session.commit()
+
     def find_adjacent_sleep_record(
         self,
         db_session: DbSession,
@@ -416,10 +487,18 @@ class EventRecordService(
         threshold_minutes: int,
         source: str | None = None,
         provider: str | None = None,
+        source_app_id: str | None = None,
     ) -> EventRecord | None:
         """Find an existing sleep session adjacent to [start_time, end_time]."""
         return self.crud.find_adjacent_sleep_record(
-            db_session, user_id, start_time, end_time, threshold_minutes, source=source, provider=provider
+            db_session,
+            user_id,
+            start_time,
+            end_time,
+            threshold_minutes,
+            source=source,
+            provider=provider,
+            source_app_id=source_app_id,
         )
 
     def upsert_meals(
@@ -463,6 +542,7 @@ class EventRecordService(
                     "sleep_awake_minutes",
                     "is_nap",
                     "sleep_stages",
+                    "provider_state",
                 )
             }
             if detail
@@ -523,8 +603,10 @@ class EventRecordService(
             data_source = self.data_source_repo.get(db_session, result.data_source_id)
             if data_source is not None:
                 device_type = data_source.device_type
+        # Null only when no stage is reported: a measured 0 is a stage (#1953)
         has_stages = any(
-            (
+            minutes is not None
+            for minutes in (
                 detail.sleep_awake_minutes,
                 detail.sleep_light_minutes,
                 detail.sleep_deep_minutes,
@@ -630,6 +712,7 @@ class EventRecordService(
         data_source_id = self.crud.resolve_sleep_data_source(db_session, record)
         record = record.model_copy(update={"data_source_id": data_source_id})
         authoritative = record.provider != ProviderName.APPLE and record.external_id is not None
+        own_nap_flag = self._source_flags_own_naps(db_session, data_source_id)
         candidates = self.crud.find_sleep_merge_candidates(
             db_session,
             data_source_id,
@@ -638,8 +721,9 @@ class EventRecordService(
             threshold_minutes,
             record.external_id,
             replace_own_window=authoritative,
-            # Apple has no nap flag of its own: every SDK session arrives as main sleep.
-            is_nap=bool(detail.is_nap) if record.provider != ProviderName.APPLE else None,
+            # A source with no nap flag of its own sends every session as main sleep, and a stored nap flag of
+            # its is the rule's, decided again after this write: it keeps no session from joining another.
+            is_nap=bool(detail.is_nap) if own_nap_flag else None,
         )
         own = [
             candidate
@@ -659,6 +743,8 @@ class EventRecordService(
         ]
         parts.append((record.start_datetime, record.end_datetime, detail))
         start, end, final_detail = merge_sleep_parts(parts)
+        # The state the provider sent last stands (#2036), as it would in a replaced detail.
+        final_detail = final_detail.model_copy(update={"provider_state": detail.provider_state})
         if survivor is None:
             creation = record.model_copy(
                 update={
@@ -674,42 +760,65 @@ class EventRecordService(
             self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
             dates = {self._to_local(boundary, record.zone_offset).date() for boundary in (start, end)}
             db_session.expire(survivor, ["sleep_detail"])
-            final_detail = self._with_marked_naps(db_session, record, survivor, final_detail, dates)
+            final_detail = self._with_marked_naps(
+                db_session, survivor, final_detail, dates, keep_source_naps=own_nap_flag
+            )
             self._recompute_sleep_scores(db_session, user_id, dates)
             return survivor, "created", final_detail
 
         final_detail = final_detail.model_copy(update={"record_id": survivor.id})
+        if not own_nap_flag and survivor.sleep_detail is not None:
+            # The incoming session says nothing about naps: keep the stored flag until the day is
+            # re-flagged, so a nap sent again unchanged is not rewritten and announced as updated.
+            final_detail = final_detail.model_copy(update={"is_nap": survivor.sleep_detail.is_nap})
         duplicates = [candidate for candidate in candidates if candidate.id != survivor.id]
         zone_offset = record.zone_offset if record.zone_offset is not None else survivor.zone_offset
-        unchanged = (
-            not duplicates
-            and survivor.start_datetime == start
-            and survivor.end_datetime == end
-            and survivor.zone_offset == zone_offset
-            and self._sleep_detail_snapshot(survivor) == final_detail
-        )
-        if unchanged:
+        old_start, old_end, old_zone = survivor.start_datetime, survivor.end_datetime, survivor.zone_offset
+        stored = (old_start, old_end, old_zone, self._sleep_detail_snapshot(survivor))
+        if not duplicates and (start, end, zone_offset, final_detail) == stored:
             return survivor, None, final_detail
 
         # Free any target slot before the surviving row is expanded. Everything
         # stays in the same transaction so a later error restores every old row.
         self.crud.preserve_sleep_provider_scores(db_session, survivor, duplicates)
+        for duplicate in duplicates:
+            # An absorbed row's session values (the provider's lowest heart rate, our rollup) would go with
+            # it; they move to the surviving night, where they combine with its own.
+            self.aggregate_repo.move_record(db_session, duplicate.id, survivor.id)
         self.crud.delete_sleep_candidates(db_session, duplicates)
         survivor.start_datetime = start
         survivor.end_datetime = end
         survivor.zone_offset = zone_offset
         survivor.duration_seconds = int((end - start).total_seconds())
+        if authoritative and survivor in own and end != old_end:
+            # Its provider score sits at the old end, which the re-sent night moved (#2034).
+            self.health_score_repo.drop_provider_sleep_score(db_session, survivor.data_source_id, old_end)
         db_session.flush()
+        if (start, end, zone_offset) != (old_start, old_end, old_zone):
+            self._widen_sleep_coverage(db_session, survivor)
+            # Its session rows are rolled up over the window it has now, on the days it left and joined.
+            mark_dirty_days(
+                db_session,
+                [
+                    *local_days(survivor.data_source_id, old_start, old_end, old_zone),
+                    *local_days(survivor.data_source_id, start, end, zone_offset),
+                ],
+            )
         self.event_record_detail_repo.delete_by_record_id(db_session, survivor.id, EventCategory.SLEEP)
         self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
         db_session.expire(survivor, ["sleep_detail"])
         old_dates.update(self._to_local(boundary, zone_offset).date() for boundary in (start, end))
-        final_detail = self._with_marked_naps(db_session, record, survivor, final_detail, old_dates)
+        final_detail = self._with_marked_naps(
+            db_session, survivor, final_detail, old_dates, keep_source_naps=own_nap_flag
+        )
         self._recompute_sleep_scores(db_session, user_id, old_dates)
-        log_structured(
-            self.logger,
-            "info",
+        if not duplicates and (start, end, zone_offset, final_detail) == stored:
+            # A source with a nap flag of its own sends a nap the rule made as main sleep, and the rule has
+            # made it a nap again: the session's values are stored as they were, so nothing is announced.
+            return survivor, None, final_detail
+        logger.info(
             "Reconciled adjacent sleep records",
+            provider=record.provider,
             action="sleep_records_reconciled",
             user_id=str(user_id),
             record_id=str(survivor.id),
@@ -743,12 +852,13 @@ class EventRecordService(
             case EventCategory.SLEEP:
                 eff = detail.sleep_efficiency_score
                 has_stages = any(
-                    [
+                    minutes is not None
+                    for minutes in (
                         detail.sleep_awake_minutes,
                         detail.sleep_light_minutes,
                         detail.sleep_deep_minutes,
                         detail.sleep_rem_minutes,
-                    ]
+                    )
                 )
                 on_sleep_created(
                     record_id=record.id,
@@ -848,7 +958,7 @@ class EventRecordService(
         self,
         db_session: DbSession,
         records: list[EventRecordCreate],
-    ) -> list[UUID]:
+    ) -> dict[UUID, UUID]:
         """Bulk create event records with batch data source resolution."""
         # Webhooks are not emitted for bulk-created records; they fire from
         # bulk_create_details() when the matching details are inserted.
@@ -859,10 +969,18 @@ class EventRecordService(
         db_session: DbSession,
         details: list[EventRecordDetailCreate],
         detail_type: DetailType = EventCategory.WORKOUT,
+        created: set[UUID] | None = None,
     ) -> None:
-        """Bulk create event record details and fire one webhook per detail on commit."""
+        """Bulk create event record details and fire one webhook per detail on commit.
+
+        With created given, only those records fire it; the rest are refreshes of stored records.
+        """
+        # Several deliveries of one workout in a batch resolve to one record; the last one's detail stands
+        details = list({d.record_id: d for d in details}.values())
         self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)
 
+        if created is not None:
+            details = [d for d in details if d.record_id in created]
         if not details or not svix_service.is_enabled():
             return
 
@@ -908,7 +1026,6 @@ class EventRecordService(
             for record_snap, data_source_snap, detail in dispatches:
                 self._emit_event_record_webhook(record_snap, data_source_snap, detail, sync)
 
-    @handle_exceptions
     def _get_records_with_filters(
         self,
         db_session: DbSession,
@@ -916,17 +1033,16 @@ class EventRecordService(
         user_id: str,
         restrict_to_record_ids: Query | None = None,
     ) -> tuple[list[tuple[EventRecord, DataSource]], int]:
-        self.logger.debug(f"Fetching event records with filters: {query_params.model_dump()}")
+        logger.debug("Fetching event records", user_id=user_id, filters=query_params.model_dump(mode="json"))
 
         records, total_count = self.crud.get_records_with_filters(
             db_session, query_params, user_id, restrict_to_record_ids=restrict_to_record_ids
         )
 
-        self.logger.debug(f"Retrieved {len(records)} event records out of {total_count} total")
+        logger.debug("Retrieved event records", user_id=user_id, count=len(records), total_count=total_count)
 
         return records, total_count
 
-    @handle_exceptions
     def get_records_response(
         self,
         db_session: DbSession,
@@ -937,7 +1053,6 @@ class EventRecordService(
 
         return [self._build_response(record, data_source) for record, data_source in records]
 
-    @handle_exceptions
     def get_workout_types(self, db_session: DbSession, user_id: UUID) -> list[str]:
         """Workout types this user actually has, so a client can filter on real options only."""
         return self.crud.get_distinct_workout_types(db_session, user_id)
@@ -955,9 +1070,17 @@ class EventRecordService(
             device_id=data_source.device_id,
         )
 
-    @handle_exceptions
-    def get_workout_totals(self, db_session: DbSession, user_id: UUID, params: EventRecordQueryParams) -> WorkoutTotals:
-        count, seconds, energy, distance = self.crud.get_workout_totals(db_session, params, str(user_id))
+    def get_workout_totals(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        params: EventRecordQueryParams,
+        source_selection: SourceSelection = SourceSelection.ALL,
+    ) -> WorkoutTotals:
+        restrict = self._winning_session_ids(db_session, user_id, params, EventCategory.WORKOUT, source_selection)
+        count, seconds, energy, distance = self.crud.get_workout_totals(
+            db_session, params, str(user_id), restrict_to_record_ids=restrict
+        )
         return WorkoutTotals(
             count=count,
             duration_seconds=seconds,
@@ -965,18 +1088,21 @@ class EventRecordService(
             distance_meters=float(distance) if distance is not None else None,
         )
 
-    @handle_exceptions
     def get_workouts(
         self,
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
         include: Sequence[WorkoutInclude] = (),
+        source_selection: SourceSelection = SourceSelection.ALL,
     ) -> PaginatedResponse[Workout]:
         params.category = EventCategory.WORKOUT
         with_zones = WorkoutInclude.ZONES in include
         with_segments = WorkoutInclude.SEGMENTS in include
-        records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
+        restrict = self._winning_session_ids(db_session, user_id, params, EventCategory.WORKOUT, source_selection)
+        records, total_count = self._get_records_with_filters(
+            db_session, params, str(user_id), restrict_to_record_ids=restrict
+        )
         # Ensure total_count is always an int (not None)
         total_count = total_count if total_count is not None else 0
 
@@ -1014,11 +1140,16 @@ class EventRecordService(
                     first_record, _ = records[0]
                     previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
 
-        computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records])
+        statistics = self.crud.get_workout_statistics(db_session, [r.id for r, _ in records])
+        computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records], statistics)
 
         data = []
         for record, data_source in records:
             details: WorkoutDetails | None = record.workout_detail
+            stats = statistics.get(record.id, {})
+            calories = _first_number(
+                stats.get("provider_energy"), details.energy_burned if details else None, stats.get("own_energy")
+            )
             moving_seconds = (
                 details.moving_time_seconds
                 if details and details.moving_time_seconds is not None
@@ -1035,24 +1166,23 @@ class EventRecordService(
                 source=self._map_source(data_source),
                 entry_source=details.entry_source if details else None,
                 intensity=details.intensity if details else None,
-                calories_kcal=float(details.energy_burned) if details and details.energy_burned else None,
-                distance_meters=float(details.distance) if details and details.distance else None,
+                calories_kcal=calories,
+                distance_meters=as_float(stats.get("distance")),
                 avg_heart_rate_bpm=computed_hr.get(record.id),
-                max_heart_rate_bpm=details.heart_rate_max if details else None,
-                avg_pace_sec_per_km=pace_sec_per_km(as_float(details.distance) if details else None, moving_seconds),
-                elevation_gain_meters=float(details.total_elevation_gain)
-                if details and details.total_elevation_gain
-                else None,
-                heart_rate_min=details.heart_rate_min if details else None,
-                steps_count=details.steps_count if details else None,
-                average_speed=as_float(details.average_speed) if details else None,
-                max_speed=as_float(details.max_speed) if details else None,
-                average_cadence=as_float(details.average_cadence) if details else None,
-                average_watts=as_float(details.average_watts) if details else None,
-                max_watts=as_float(details.max_watts) if details else None,
+                max_heart_rate_bpm=as_int(stats.get("heart_rate_max")),
+                avg_pace_sec_per_km=pace_sec_per_km(as_float(stats.get("distance")), moving_seconds),
+                elevation_gain_meters=as_float(stats.get("total_elevation_gain")),
+                heart_rate_min=as_int(stats.get("heart_rate_min")),
+                steps_count=as_int(stats.get("steps_count")),
+                average_speed=as_float(stats.get("average_speed")),
+                max_speed=as_float(stats.get("max_speed")),
+                average_cadence=as_float(stats.get("average_cadence")),
+                average_watts=as_float(stats.get("average_watts")),
+                max_watts=as_float(stats.get("max_watts")),
+                average_met=as_float(stats.get("average_met")),
                 moving_time_seconds=details.moving_time_seconds if details else None,
-                elev_high=as_float(details.elev_high) if details else None,
-                elev_low=as_float(details.elev_low) if details else None,
+                elev_high=as_float(stats.get("elev_high")),
+                elev_low=as_float(stats.get("elev_low")),
                 hr_zones=as_model(HRZones, details.hr_zones) if details and with_zones else None,
                 power_zones=as_model(PowerZones, details.power_zones) if details and with_zones else None,
                 segments=as_dict_list(details.segments) if details and with_segments else None,
@@ -1074,21 +1204,31 @@ class EventRecordService(
             ),
         )
 
-    def _winning_sleep_ids(self, db_session: DbSession, user_id: UUID, params: EventRecordQueryParams) -> Query:
-        """An inline subquery of the top-priority source's sessions per night."""
-        provider_order = self.provider_priority_repo.get_priority_order(db_session)
-        device_type_order = self.device_type_priority_repo.get_priority_order(db_session)
-        return self.crud.winning_sleep_record_ids(db_session, str(user_id), params, provider_order, device_type_order)
+    def _winning_session_ids(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        params: EventRecordQueryParams,
+        category: EventCategory,
+        source_selection: SourceSelection,
+    ) -> Query | None:
+        """An inline subquery of the sessions no better-ranked source also recorded, None when every source shows."""
+        # By value: a caller passing the plain string "per_session" takes this path too.
+        if source_selection != SourceSelection.PER_SESSION:
+            return None
+        params = params.model_copy(update={"category": category})
+        return self.crud.winning_session_record_ids(
+            db_session, str(user_id), params, priority_service.get_source_ranking(db_session)
+        )
 
-    @handle_exceptions
     def get_sleep_totals(
         self,
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
-        filter_by_priority: bool = False,
+        source_selection: SourceSelection = SourceSelection.ALL,
     ) -> SleepTotals:
-        restrict = self._winning_sleep_ids(db_session, user_id, params) if filter_by_priority else None
+        restrict = self._winning_session_ids(db_session, user_id, params, EventCategory.SLEEP, source_selection)
         count, naps, asleep, in_bed, efficiency = self.crud.get_sleep_totals(
             db_session, params, str(user_id), restrict_to_record_ids=restrict
         )
@@ -1100,18 +1240,19 @@ class EventRecordService(
             avg_efficiency_percent=float(efficiency) if efficiency is not None else None,
         )
 
-    @handle_exceptions
     def get_sleep_sessions(
         self,
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
-        filter_by_priority: bool = False,
+        source_selection: SourceSelection = SourceSelection.ALL,
         include: Sequence[SleepInclude] = (),
     ) -> PaginatedResponse[SleepSession]:
         params.category = EventCategory.SLEEP
         with_stages = SleepInclude.STAGES in include
-        restrict_to_record_ids = self._winning_sleep_ids(db_session, user_id, params) if filter_by_priority else None
+        restrict_to_record_ids = self._winning_session_ids(
+            db_session, user_id, params, EventCategory.SLEEP, source_selection
+        )
 
         records, total_count = self._get_records_with_filters(
             db_session, params, str(user_id), restrict_to_record_ids=restrict_to_record_ids
@@ -1153,6 +1294,7 @@ class EventRecordService(
                     first_record, _ = records[0]
                     previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
 
+        final_ids = final_record_ids(db_session, user_id, records, datetime.now(timezone.utc))
         data = []
         for record, data_source in records:
             details: SleepDetails | None = record.sleep_detail
@@ -1170,6 +1312,7 @@ class EventRecordService(
                 time_in_bed_seconds=time_in_bed_seconds,
                 efficiency_percent=as_float(details.sleep_efficiency_score) if details else None,
                 is_nap=details.is_nap if (details and details.is_nap is not None) else False,
+                is_final=record.id in final_ids,
                 sleep_stage_intervals=details.sleep_stages if details and with_stages else None,
                 stages=SleepStagesSummary(
                     deep_minutes=details.sleep_deep_minutes,
@@ -1197,7 +1340,6 @@ class EventRecordService(
             ),
         )
 
-    @handle_exceptions
     def get_menstrual_cycles(
         self,
         db_session: DbSession,
@@ -1277,7 +1419,6 @@ class EventRecordService(
             ),
         )
 
-    @handle_exceptions
     def get_meals(
         self,
         db_session: DbSession,
@@ -1356,18 +1497,31 @@ class EventRecordService(
         category: EventCategory,
     ) -> bool:
         """Delete an event record by id and category. Returns False if not found or not owned by user."""
+        if category == EventCategory.SLEEP:
+            # The shared sleep writer lock, taken before the user's sessions are read, as create_or_merge_sleep
+            # and the writers of Open Wearables' own sleep scores do: the delete changes the day's scores, and
+            # maybe its naps, below
+            self.lock_sleep_user(db_session, user_id)
         record = self.crud.get_record_with_details(db_session, record_id, category)
         if not record:
             return False
         data_source = self.data_source_repo.get(db_session, record.data_source_id)
         if not data_source or data_source.user_id != user_id:
             return False
+        # Read before the delete: the day is rescored, and without the night a nap of that day may be its main sleep
+        source_id, wake_date = record.data_source_id, local_date(record.end_datetime, record.zone_offset)
         self.crud.delete_flush(db_session, record)
         data_type_coverage_repository.refresh_events(
             db_session, [(data_source.user_id, data_source.provider, record.category)]
         )
+        if category == EventCategory.SLEEP:
+            if not flags_own_naps(data_source.provider):
+                # Its nap flags are all the rule's (sleep_nap_marking): the day is marked again both ways. A source
+                # with a flag of its own keeps its flags as they are, as upstream does.
+                self._mark_naps(db_session, source_id, {wake_date}, keep_source_naps=False)
+            self._recompute_sleep_scores(db_session, user_id, {wake_date})
         db_session.commit()
         return True
 
 
-event_record_service = EventRecordService(log=getLogger(__name__))
+event_record_service = EventRecordService()

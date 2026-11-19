@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from uuid import UUID
 
 from app.integrations.redis_client import get_redis_client
+from app.utils.structured_logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 HISTORICAL_SYNC_TTL_SECONDS = 6 * 60 * 60
 _EMPTY_SYNC_SENTINEL = "__sync__"
 

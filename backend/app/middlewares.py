@@ -17,9 +17,10 @@ from app.services.endpoint_usage import caller_type, endpoint_usage, route_key
 from app.utils.auth_diagnostics import AuthReason
 from app.utils.config_utils import AccessLogLevel
 from app.utils.sdk_request_metadata import sdk_request_metadata
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
+from app.utils.webhook_callback import redact_callback_url
 
-logger = logging.getLogger("app.access")
+logger = get_logger("app.access")
 
 # Query keys whose value authenticates a request and must never reach the logs.
 # Providers that sign inbound webhooks use a header instead; these three carry the
@@ -32,17 +33,21 @@ _REDACTED = "REDACTED"  # plain word: urlencode would percent-encode brackets
 
 
 def _log_path(request: Request) -> str:
-    """The request path with any secret-bearing query values masked."""
+    """The request path with any secret-bearing query values and webhook callback token masked."""
+    path = redact_callback_url(request.url.path)
     query = request.url.query
     if not query:
-        return request.url.path
+        return path
     try:
         pairs = parse_qsl(query, keep_blank_values=True)
     except ValueError:
         # Unparseable query: drop it wholesale rather than risk logging a secret.
-        return f"{request.url.path}?{_REDACTED}"
-    masked = [(key, _REDACTED if key.lower() in _REDACTED_QUERY_KEYS else value) for key, value in pairs]
-    return f"{request.url.path}?{urlencode(masked)}"
+        return f"{path}?{_REDACTED}"
+    # A value can itself be a callback URL (?callback_url= of the subscription endpoints).
+    masked = [
+        (key, _REDACTED if key.lower() in _REDACTED_QUERY_KEYS else redact_callback_url(value)) for key, value in pairs
+    ]
+    return f"{path}?{urlencode(masked)}"
 
 
 def add_cors_middleware(app: FastAPI) -> None:
@@ -103,10 +108,10 @@ def add_access_log_middleware(app: FastAPI) -> None:
         auth_reason = getattr(request.state, "sdk_auth_failure_reason", None)
         if isinstance(auth_reason, AuthReason):
             attributes["auth_reason"] = auth_reason.value
-        severity = "error" if status >= 400 else "info"
+        severity = logging.ERROR if status >= 400 else logging.INFO
         if status == 401 and auth_reason is AuthReason.SDK_TOKEN_EXPIRED:
             # An expired access token is a refresh challenge, not a failed refresh.
-            severity = "warning"
+            severity = logging.WARNING
 
         content_length = request.headers.get("content-length")
         if content_length is not None:
@@ -146,7 +151,7 @@ def add_access_log_middleware(app: FastAPI) -> None:
             attributes["traceback"] = formatted_traceback
         # a logging failure must never break request handling
         with contextlib.suppress(Exception):
-            log_structured(logger, severity, "http_request", **attributes)
+            logger.log(severity, "http_request", **attributes)
 
     @app.middleware("http")
     async def access_log(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:

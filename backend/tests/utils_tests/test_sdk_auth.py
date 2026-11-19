@@ -5,6 +5,7 @@ from fastapi import HTTPException
 
 from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_current_developer, get_sdk_auth
+from app.utils.exceptions import AuthenticationError
 from tests.factories import ApiKeyFactory, DeveloperFactory
 
 pytestmark = pytest.mark.usefixtures("auth_sessions")
@@ -38,7 +39,7 @@ class TestGetSDKAuth:
     @pytest.mark.asyncio
     async def test_no_auth_raises_401(self) -> None:
         """Missing auth should raise 401."""
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(AuthenticationError) as exc_info:
             await get_sdk_auth(token=None, x_open_wearables_api_key=None)
 
         assert exc_info.value.status_code == 401
