@@ -68,15 +68,17 @@ def test_refresh_classifies_provider_statuses(
     mock_post.return_value = _envelope(withings_status)
     oauth = _oauth()
 
-    with patch.object(oauth, "revoke_connection") as mock_revoke, pytest.raises(AppError) as exc_info:
+    with patch.object(oauth, "_revoke_connection") as mock_revoke, pytest.raises(AppError) as exc_info:
         oauth.refresh_access_token(MagicMock(), uuid4(), "old-rt")
 
     assert type(exc_info.value) is error_class
     assert exc_info.value.status_code == http_status
     # a refresh refused as bad input (247) is a request we built wrong, so it reaches Sentry
     assert getattr(exc_info.value, "request_rejected", False) is (withings_status == 247)
-    # Only a spent grant is terminal; the others are worth retrying with the same token.
-    assert mock_revoke.called is invalid_grant
+    # Only a spent grant is terminal, and only while the rejected token is still the stored one (a
+    # concurrent refresh may have rotated it); the others are worth retrying with the same token.
+    revoked_for = [revoke.kwargs["refresh_token"] for revoke in mock_revoke.call_args_list]
+    assert revoked_for == (["old-rt"] if invalid_grant else [])
 
 
 @pytest.mark.parametrize(("http_status", "request_rejected"), [(403, True), (404, True), (503, False)])
@@ -86,7 +88,7 @@ def test_refresh_http_4xx_is_a_refused_request(mock_post: MagicMock, http_status
     mock_post.return_value = httpx.Response(http_status, text="error", request=request)
     oauth = _oauth()
 
-    with patch.object(oauth, "revoke_connection") as mock_revoke, pytest.raises(ProviderError) as exc_info:
+    with patch.object(oauth, "_revoke_connection") as mock_revoke, pytest.raises(ProviderError) as exc_info:
         oauth.refresh_access_token(MagicMock(), uuid4(), "old-rt")
 
     assert type(exc_info.value) is ProviderError

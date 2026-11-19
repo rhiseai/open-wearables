@@ -138,12 +138,17 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
 
         This runs for ``workout.updated`` webhooks, which Whoop sends whenever the user edits
         an activity in the app (sport, trimmed start/end, ...). The edited workout keeps its
-        ``external_id``, and ``EventRecordRepository.create`` refreshes the stored row with
-        that ``external_id`` in place, so the workout keeps its id and is not stored twice.
+        ``external_id``, and ``EventRecordRepository.create_and_flush`` refreshes the stored row
+        with that ``external_id`` in place, so the workout keeps its id and is not stored twice.
+        The workout, its detail and its strain score commit together.
 
-        A failure while fetching or normalizing the workout is logged and reported as 0
-        records saved; a failure once we start writing is re-raised so the delivery is
-        retried instead of reporting a benign skip.
+        When another workout already holds the delivered time window, nothing is written and
+        0 is returned: the edit is not grafted onto that workout, nor its detail onto the
+        stored copy left at its old times.
+
+        A failure while fetching the workout propagates. A workout that cannot be normalized is
+        logged and reported as 0 records saved; a failure once we start writing rolls the write
+        back and is re-raised so the delivery is retried instead of reporting a benign skip.
         """
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         store_raw_payload(
@@ -170,16 +175,26 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             )
             return 0
 
-        # Swallowing a failure from here on would report a benign skip while the workout is
-        # missing its details or stuck on the pre-edit version, so failures propagate: the
-        # webhook delivery fails, Celery retries it, and the retry refreshes the workout again.
+        # One transaction, so a failure never leaves the workout half-refreshed (the edit's times
+        # on the old detail). Swallowing it would report a benign skip while the workout is stuck
+        # on the pre-edit version, so it propagates: the webhook delivery fails, Celery retries it,
+        # and the retry refreshes the workout again.
         try:
-            created = event_record_service.create(db, record)
-            detail_for_record = detail.model_copy(update={"record_id": created.id})
-            event_record_service.create_detail(db, detail_for_record)
+            stored = self.workout_repo.create_and_flush(db, record)
+            if not self.workout_repo.holds_delivery(stored, record):
+                logger.warning(
+                    "Skipped workout record: another workout already holds its time window",
+                    provider="whoop",
+                    task="load_single_workout",
+                    workout_id=workout_id,
+                )
+                return 0
             if health_score:
-                health_score_service.create(db, health_score.model_copy(update={"event_record_id": created.id}))
+                health_score_service.bulk_create(db, [health_score.model_copy(update={"event_record_id": stored.id})])
+            event_record_service.bulk_create_details(db, [detail.model_copy(update={"record_id": stored.id})])
+            db.commit()
         except Exception as e:
+            db.rollback()
             logger.error(
                 "Failed to store workout record",
                 provider="whoop",

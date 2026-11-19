@@ -913,8 +913,11 @@ class TestConnectionAdoptionEndpoint:
         # Act
         response = client.get("/api/v1/connections/stats?since_days=-1", headers=api_key_headers(api_key.plain_key))
 
-        # Assert: this app renders validation failures as 400, not FastAPI's 422.
-        assert response.status_code == 400
+        # Assert: a validation failure on the window itself (Problem Details, 422).
+        assert response.status_code == 422
+        body = response.json()
+        assert body["code"] == "VALIDATION_ERROR"
+        assert [error["loc"] for error in body["errors"]] == [["query", "since_days"]]
 
     def test_empty_database_is_an_empty_list_not_an_error(self, client: TestClient, db: Session) -> None:
         # Arrange

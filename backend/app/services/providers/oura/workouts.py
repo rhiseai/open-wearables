@@ -116,8 +116,9 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         """Fetch a single workout by ID and save it.
 
         Called for Oura ``workout`` webhooks, including ``update`` events. An edited
-        workout keeps its ``external_id``, and ``EventRecordRepository.create`` refreshes
-        the stored row with that ``external_id`` in place instead of appending a second copy.
+        workout keeps its ``external_id``, and ``EventRecordRepository.create_and_flush``
+        refreshes the stored row with that ``external_id`` in place instead of appending a
+        second copy (see ``save_from_raw``).
         """
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
@@ -146,12 +147,31 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         secondary profile must not re-fetch: it would spend a second API call on
         an identical object, and its own token may be expired even while the
         data is perfectly deliverable.
+
+        The workout and its detail commit together, so a failure rolls both back
+        and never leaves the workout half-refreshed (the edit's times on the old
+        detail). When another workout already holds the delivered time window,
+        nothing is written for it: the edit is not grafted onto that workout, nor
+        its detail onto the stored copy left at its old times.
         """
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
-            created = event_record_service.create(db, record)
-            detail = details.model_copy(update={"record_id": created.id})
-            event_record_service.create_detail(db, detail)
+            try:
+                stored = self.workout_repo.create_and_flush(db, record)
+                if not self.workout_repo.holds_delivery(stored, record):
+                    logger.warning(
+                        "Skipped Oura workout: another workout already holds its time window",
+                        action="oura_workout_slot_taken",
+                        trace_id=trace_id,
+                        user_id=str(user_id),
+                        workout_id=workout_id,
+                    )
+                    continue
+                event_record_service.bulk_create_details(db, [details.model_copy(update={"record_id": stored.id})])
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
             count += 1
         return count
 

@@ -1,11 +1,14 @@
 """Simple API client for making authenticated requests to provider APIs."""
 
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
 import httpx
+from redis.exceptions import RedisError
 
 from app.config import settings
 from app.database import DbSession
@@ -179,11 +182,47 @@ def _note_auth_failure(
     )
 
 
-def _refresh_lock(provider_name: str, user_id: UUID) -> Any:
-    """Per user and provider, so concurrent refreshes can't race each other."""
-    return get_redis_client().lock(
-        f"token_refresh_lock:{provider_name}:{user_id}", timeout=60, blocking_timeout=10, sleep=0.2
-    )
+@contextmanager
+def _refresh_lock(provider_name: str, user_id: UUID) -> Generator[None]:
+    """Per user and provider, so concurrent refreshes can't race each other.
+
+    The wait outlasts one refresh round-trip (its HTTP timeout is 30 s), so a caller behind a
+    refresh in flight sees its token. Redis being down, or a lock still held after the wait, does
+    not stop the caller: the body runs unlocked, and a lost race is caught after the fact by
+    ``BaseOAuthTemplate``'s rotation guard. Failing instead would break provider deregistration on
+    account deletion during a Redis outage, and would count a busy lock as a dead grant where a
+    caller treats any error so (Garmin's deregistration check).
+    """
+    lock = None
+    acquired = False
+    try:
+        lock = get_redis_client().lock(
+            f"token_refresh_lock:{provider_name}:{user_id}", timeout=60, blocking_timeout=40, sleep=0.2
+        )
+        acquired = bool(lock.acquire())
+    except RedisError as e:
+        logger.warning(
+            "Redis unavailable for token refresh lock, proceeding unlocked",
+            provider=provider_name,
+            user_id=str(user_id),
+            error_type=type(e).__name__,
+        )
+    else:
+        if not acquired:
+            logger.warning(
+                "Could not acquire token refresh lock, proceeding unlocked",
+                provider=provider_name,
+                user_id=str(user_id),
+            )
+    try:
+        yield
+    finally:
+        if acquired and lock is not None:
+            try:
+                lock.release()
+            except RedisError:
+                # Expired (LockNotOwnedError) or Redis went away; the TTL reclaims it
+                logger.warning("Failed to release token refresh lock", provider=provider_name, user_id=str(user_id))
 
 
 def _reload_token_after_401(

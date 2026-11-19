@@ -1,5 +1,8 @@
 """Single-use credentials stay single-use when the same one is sent concurrently.
 
+A refresh token is rotated once: concurrent replays of it within the replay window get that one
+successor, never a second one.
+
 The regular `db` fixture keeps a test on one connection, so it cannot show a race.
 These tests commit their data and redeem it from separate sessions in parallel threads.
 """
@@ -10,15 +13,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, or_
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import Developer, RefreshToken, User
 from app.models.user_invitation_code import UserInvitationCode
-from app.schemas.auth import SDKTokenOrigin
+from app.schemas.auth import SDKTokenOrigin, TokenResponse
 from app.services.refresh_token_service import refresh_token_service
 from app.services.user_invitation_code_service import user_invitation_code_service
 from app.utils.exceptions import AppError
@@ -100,7 +105,38 @@ def test_concurrent_redeems_of_one_invitation_code_issue_tokens_once(session_fac
     assert issued == 1
 
 
-def test_concurrent_refreshes_of_one_refresh_token_rotate_it_once(session_factory: Any, owners: Owners) -> None:
+def _refresh_concurrently(session_factory: Any, old_token: str, *, replay: bool) -> list[object]:
+    """Refresh `old_token` from CONCURRENT_REQUESTS sessions at once; `replay=False` turns replays off."""
+    window = settings.refresh_token_replay_window_seconds if replay else 0
+    with patch.object(settings, "refresh_token_replay_window_seconds", window):
+        return _run_concurrently(session_factory, lambda s: refresh_token_service.refresh_token(s, old_token))
+
+
+def _assert_rotated_once(session_factory: Any, old_token: str, results: list[object], *, replay: bool) -> None:
+    """One refresh rotated `old_token` into a single successor, and no refresh got any other token.
+
+    A refresh that loses the claim waits on the row until the winner commits the revocation together
+    with the successor, then replays the just-rotated token and gets that same successor. With
+    replays off it is refused instead.
+    """
+    with session_factory() as session:
+        successors = [t.id for t in session.query(RefreshToken).filter(RefreshToken.replaces_id == old_token)]
+    assert len(successors) == 1
+
+    issued = [r.refresh_token for r in results if isinstance(r, TokenResponse)]
+    failures = [r for r in results if isinstance(r, AppError)]
+    if replay:
+        assert issued == successors * CONCURRENT_REQUESTS
+    else:
+        assert issued == successors
+        assert len(failures) == CONCURRENT_REQUESTS - 1
+        assert all(f.status_code == 401 for f in failures)
+
+
+@pytest.mark.parametrize("replay", [True, False], ids=["replay", "replay-off"])
+def test_concurrent_refreshes_of_one_refresh_token_rotate_it_once(
+    session_factory: Any, owners: Owners, replay: bool
+) -> None:
     with session_factory() as session:
         old_token = refresh_token_service.create_sdk_refresh_token(
             session,
@@ -109,11 +145,9 @@ def test_concurrent_refreshes_of_one_refresh_token_rotate_it_once(session_factor
             issued_by_developer_id=owners.developer_id,
         )
 
-    results = _run_concurrently(session_factory, lambda s: refresh_token_service.refresh_token(s, old_token))
+    results = _refresh_concurrently(session_factory, old_token, replay=replay)
 
-    failures = [r for r in results if isinstance(r, AppError)]
-    assert len(results) - len(failures) == 1
-    assert all(f.status_code == 401 for f in failures)
+    _assert_rotated_once(session_factory, old_token, results, replay=replay)
     with session_factory() as session:
         live = session.query(RefreshToken).filter(
             RefreshToken.user_id == owners.user_id, RefreshToken.revoked_at.is_(None)
@@ -121,17 +155,16 @@ def test_concurrent_refreshes_of_one_refresh_token_rotate_it_once(session_factor
         assert live.count() == 1
 
 
+@pytest.mark.parametrize("replay", [True, False], ids=["replay", "replay-off"])
 def test_concurrent_refreshes_of_one_developer_refresh_token_rotate_it_once(
-    session_factory: Any, owners: Owners
+    session_factory: Any, owners: Owners, replay: bool
 ) -> None:
     with session_factory() as session:
         old_token = refresh_token_service.create_developer_refresh_token(session, developer_id=owners.developer_id)
 
-    results = _run_concurrently(session_factory, lambda s: refresh_token_service.refresh_token(s, old_token))
+    results = _refresh_concurrently(session_factory, old_token, replay=replay)
 
-    failures = [r for r in results if isinstance(r, AppError)]
-    assert len(results) - len(failures) == 1
-    assert all(f.status_code == 401 for f in failures)
+    _assert_rotated_once(session_factory, old_token, results, replay=replay)
     with session_factory() as session:
         live = session.query(RefreshToken).filter(
             RefreshToken.developer_id == owners.developer_id, RefreshToken.revoked_at.is_(None)

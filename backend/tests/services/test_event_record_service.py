@@ -706,15 +706,11 @@ class TestCreateOrMergeSleep:
         event_record_service.create_or_merge_sleep(
             db, data_source.user_id, nap, self._nap_detail(nap.id), self.THRESHOLD
         )
-        # Scored as the day's main sleep, as fill_missing_sleep_scores would
-        HealthScoreFactory(
-            user_id=data_source.user_id,
-            data_source_id=data_source.id,
-            provider=ProviderName.INTERNAL,
-            category=HealthScoreCategory.SLEEP,
-            recorded_at=self._dt(14, 30),
-            event_record_id=nap.id,
-        )
+        # Alone on its day, the write scores it as the day's main sleep, at its wake time
+        nap_scores = db.query(HealthScore).filter(HealthScore.event_record_id == nap.id)
+        assert [(s.provider, s.category, s.recorded_at) for s in nap_scores] == [
+            (ProviderName.INTERNAL, HealthScoreCategory.SLEEP, self._dt(14, 30))
+        ]
 
         night = self._record(data_source, self._dt(22, day=20), self._dt(6))
         event_record_service.create_or_merge_sleep(

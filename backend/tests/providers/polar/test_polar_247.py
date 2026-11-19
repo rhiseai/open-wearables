@@ -433,8 +433,10 @@ class TestPolar247LateSleep:
             "sleep_start_time": "2024-01-12T08:30:00+02:00",
             "sleep_end_time": "2024-01-12T12:00:00+02:00",
         }
-        with patch.object(data_247, "get_sleep_data", return_value=[late, next_night]):
-            data_247._save_sleep(db, user.id, *self.WINDOW)
+        # The next night is stored first; the late one merges into it, and the stored row keeps its id.
+        for night in (next_night, late):
+            with patch.object(data_247, "get_sleep_data", return_value=[night]):
+                data_247._save_sleep(db, user.id, *self.WINDOW)
         [merged] = TestPolar247SleepSave._sleep_records(db, user.id)
         assert merged.external_id == "sleep-2024-01-13"
 

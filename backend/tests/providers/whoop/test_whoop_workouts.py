@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.models import DataSource, EventRecord, WorkoutDetails
 from app.schemas.enums import WorkoutType
 from app.schemas.providers.whoop import WhoopWebhookNotificationType
+from app.services.event_record_service import event_record_service
 from app.services.providers.whoop.strategy import WhoopStrategy
 from app.services.providers.whoop.workouts import WhoopWorkouts
 from tests.factories import UserFactory
@@ -142,8 +143,8 @@ class TestWhoopLoadSingleWorkout:
         details = _user_workout_details(db, user.id)
         assert len(records) == 1
         assert len(details) == 1
-        # The surviving detail row belongs to the surviving record, and deleting
-        # the stale record took its detail row with it (FK ON DELETE CASCADE).
+        # The edit refreshed the stored record in place, and its one detail row was
+        # updated with it rather than left behind for a second record.
         assert details[0].record_id == records[0].id
         assert details[0].moving_time_seconds == 34 * 60
         assert _orphaned_workout_details(db) == 0
@@ -164,8 +165,8 @@ class TestWhoopLoadSingleWorkout:
         assert len(_user_workout_details(db, user.id)) == 1
         assert _orphaned_workout_details(db) == 0
 
-    def test_insert_failure_keeps_original_record(self, db: Session, workouts: WhoopWorkouts) -> None:
-        """The stale record must only disappear once the replacement is persisted."""
+    def test_write_failure_keeps_original_record(self, db: Session, workouts: WhoopWorkouts) -> None:
+        """A failure after the workout's refresh rolls the refresh back: never the edit's times on the old detail."""
         user = UserFactory()
 
         original = _whoop_workout_payload(
@@ -185,12 +186,16 @@ class TestWhoopLoadSingleWorkout:
 
         with (
             patch.object(workouts, "get_workout_detail_from_api", return_value=edited),
-            patch.object(workouts.workout_repo, "create_and_flush", side_effect=RuntimeError("insert exploded")),
+            patch.object(
+                event_record_service.event_record_detail_repo,
+                "_upsert",
+                side_effect=RuntimeError("detail write exploded"),
+            ),
             pytest.raises(RuntimeError),
         ):
             workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID)
 
-        # The delete shared the failed insert's transaction, so it rolled back too.
+        # The refresh shared the failed detail write's transaction, so it rolled back too.
         records = _user_records(db, user.id)
         assert len(records) == 1
         assert records[0].id == original_record_id
@@ -200,14 +205,16 @@ class TestWhoopLoadSingleWorkout:
         details = _user_workout_details(db, user.id)
         assert len(details) == 1
         assert details[0].record_id == original_record_id
+        assert details[0].moving_time_seconds == 52 * 60
 
     def test_time_window_taken_by_another_workout_keeps_both(self, db: Session, workouts: WhoopWorkouts) -> None:
-        """An insert absorbed by an unrelated workout must not consume the edited one.
+        """An edit moved onto an unrelated workout's time window is skipped, not half-applied.
 
         Two distinct workouts can end up sharing a time window, which the
-        ``(data_source_id, start, end)`` unique index rejects. Rather than grafting
-        this workout's details onto the unrelated record, the replace is abandoned and
-        both stored workouts are left as they were.
+        ``(data_source_id, start, end)`` unique index rejects, so the stored copy
+        cannot move there. Rather than grafting the edit's details onto that copy
+        left at its old times, or onto the unrelated record, the delivery is
+        skipped and both stored workouts are left as they were.
         """
         user = UserFactory()
 
@@ -239,10 +246,40 @@ class TestWhoopLoadSingleWorkout:
 
         records = {r.external_id: r for r in _user_records(db, user.id)}
         assert set(records) == {WHOOP_WORKOUT_ID, OTHER_WHOOP_WORKOUT_ID}
+        assert records[WHOOP_WORKOUT_ID].type == WorkoutType.GENERIC.value
         assert records[WHOOP_WORKOUT_ID].duration_seconds == 52 * 60
         assert records[OTHER_WHOOP_WORKOUT_ID].type == WorkoutType.CYCLING.value
-        assert len(_user_workout_details(db, user.id)) == 2
+        details = {d.record_id: d for d in _user_workout_details(db, user.id)}
+        assert set(details) == {records[WHOOP_WORKOUT_ID].id, records[OTHER_WHOOP_WORKOUT_ID].id}
+        assert details[records[WHOOP_WORKOUT_ID].id].moving_time_seconds == 52 * 60
         assert _orphaned_workout_details(db) == 0
+
+    def test_new_workout_on_another_workouts_time_window_is_skipped(self, db: Session, workouts: WhoopWorkouts) -> None:
+        """A first delivery whose time window an unrelated workout holds is not grafted onto that workout."""
+        user = UserFactory()
+        unrelated = _whoop_workout_payload(
+            "Cycling",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T08:46:00.000Z",
+            workout_id=OTHER_WHOOP_WORKOUT_ID,
+        )
+        payload = _whoop_workout_payload(
+            "Dog Walking",
+            "2026-06-30T08:12:00.000Z",
+            "2026-06-30T08:46:00.000Z",
+        )
+        payload["score"]["distance_meter"] = 900.0
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=unrelated):
+            assert workouts.load_single_workout(db, user.id, OTHER_WHOOP_WORKOUT_ID) == 1
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=payload):
+            assert workouts.load_single_workout(db, user.id, WHOOP_WORKOUT_ID) == 0
+
+        records = _user_records(db, user.id)
+        assert [(r.external_id, r.type) for r in records] == [(OTHER_WHOOP_WORKOUT_ID, WorkoutType.CYCLING.value)]
+        details = _user_workout_details(db, user.id)
+        assert len(details) == 1
+        assert details[0].distance == 2600
 
     def test_workout_updated_webhook_replaces_existing_record(self, db: Session) -> None:
         """End-to-end through the webhook handler's update branch."""

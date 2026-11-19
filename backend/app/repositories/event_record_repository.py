@@ -406,8 +406,10 @@ class EventRecordRepository(
         """Like create() but flushes instead of committing; caller is responsible for the commit.
 
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
-        the INSERT and leaves the outer transaction intact.
+        the INSERT (or a workout's refresh) and leaves the outer transaction intact.
         """
+        if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(creator.id):
+            return self._refresh_from(db_session, existing, creator)
         data_source_id, provider, creation = self._build_creation(db_session, creator)
         nested = db_session.begin_nested()
         try:
@@ -424,6 +426,19 @@ class EventRecordRepository(
             db_session, local_days(data_source_id, creator.start_datetime, creator.end_datetime, creator.zone_offset)
         )
         return creation
+
+    @staticmethod
+    def holds_delivery(record: EventRecord, creator: EventRecordCreate) -> bool:
+        """Whether a record create() or create_and_flush() returned stores this delivery: its external_id at its times.
+
+        It does not when another record already holds those times: an insert then resolves to that record, and a
+        workout's refresh leaves the stored copy at its old times.
+        """
+        return (record.external_id, record.start_datetime, record.end_datetime) == (
+            creator.external_id,
+            creator.start_datetime,
+            creator.end_datetime,
+        )
 
     def resolve_sleep_data_source(self, db_session: DbSession, creator: EventRecordCreate) -> UUID:
         """Resolve a sleep writer without committing the caller's transaction."""

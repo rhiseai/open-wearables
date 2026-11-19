@@ -61,11 +61,11 @@ class TestSendTelemetryPingTask:
         error = httpx.ConnectError("connection refused")
         mock_service.send_ping.side_effect = error
 
-        with patch("app.integrations.celery.tasks.telemetry_task.log_and_capture_error") as report_failure:
+        with patch("app.integrations.celery.tasks.telemetry_task.logger") as logger:
             result = send_telemetry_ping(event="daily")
 
         assert result == "failed"
-        report_failure.assert_called_once()
-        assert report_failure.call_args.args[0] is error
-        assert report_failure.call_args.args[2] == "Telemetry ping delivery failed"
-        assert report_failure.call_args.kwargs == {"level": "warning", "extra": {"event": "daily"}}
+        # A warning line that still reaches Sentry, with the event as context.
+        logger.warning.assert_called_once_with(
+            "Telemetry ping delivery failed", event="daily", exc_info=error, alert=True
+        )

@@ -26,5 +26,6 @@ def send_telemetry_ping(event: str = "daily") -> str:
         try:
             return telemetry_service.send_ping(db, event=event)
         except Exception as e:
-            logger.warning("Telemetry ping delivery failed", event=event, exc_info=e)
+            # Swallowed, so the warning line alone would keep it out of Sentry.
+            logger.warning("Telemetry ping delivery failed", event=event, exc_info=e, alert=True)
             return "failed"

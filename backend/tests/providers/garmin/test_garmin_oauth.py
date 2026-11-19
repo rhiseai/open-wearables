@@ -1,6 +1,6 @@
 """Tests for Garmin OAuth implementation."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 from uuid import uuid4
 
 import httpx
@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import AuthenticationMethod
+from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import OAuthTokenResponse, ProviderCredentials, ProviderEndpoints
 from app.services.providers.garmin.oauth import GarminOAuth
 from app.utils.exceptions import InvalidInputError, ProviderError, ReauthRequiredError
@@ -386,14 +386,19 @@ class TestOAuthTokenErrors:
         self, mock_post: MagicMock, garmin_oauth: GarminOAuth, status_code: int
     ) -> None:
         mock_post.return_value = self._response(status_code, '{"error": "invalid_grant"}')
+        # No concurrent refresh rotated it: the rejected token is still the stored one
+        garmin_oauth.connection_repo.get_by_user_and_provider_fresh.return_value = MagicMock(
+            status=ConnectionStatus.ACTIVE, access_token="stale-access-token", refresh_token="dead-refresh-token"
+        )
+        user_id = uuid4()
 
         with (
-            patch.object(garmin_oauth, "revoke_connection") as mock_revoke,
+            patch.object(garmin_oauth, "_revoke_connection", return_value=True) as mock_revoke,
             pytest.raises(ReauthRequiredError),
         ):
-            garmin_oauth.refresh_access_token(MagicMock(), uuid4(), "dead-refresh-token")
+            garmin_oauth.refresh_access_token(MagicMock(), user_id, "dead-refresh-token")
 
-        mock_revoke.assert_called_once()
+        mock_revoke.assert_called_once_with(ANY, user_id, refresh_token="dead-refresh-token", reason="refresh_failed")
 
     @patch("httpx.post")
     def test_refresh_during_a_provider_outage_keeps_the_connection(
@@ -401,7 +406,7 @@ class TestOAuthTokenErrors:
     ) -> None:
         mock_post.return_value = self._response(503, "maintenance")
 
-        with patch.object(garmin_oauth, "revoke_connection") as mock_revoke, pytest.raises(ProviderError) as exc_info:
+        with patch.object(garmin_oauth, "_revoke_connection") as mock_revoke, pytest.raises(ProviderError) as exc_info:
             garmin_oauth.refresh_access_token(MagicMock(), uuid4(), "refresh-token")
 
         assert (exc_info.value.status_code, exc_info.value.upstream_status) == (502, 503)
