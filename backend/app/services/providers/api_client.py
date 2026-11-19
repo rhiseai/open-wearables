@@ -2,7 +2,7 @@
 
 import logging
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -42,7 +42,7 @@ def _needs_refresh(connection: UserConnection) -> bool:
 
 
 @contextmanager
-def _token_refresh_lock(user_id: UUID, provider_name: str) -> Iterator[None]:
+def _token_refresh_lock(user_id: UUID, provider_name: str) -> Generator[None]:
     """Serialize token refreshes for one user+provider across workers.
 
     Providers that rotate refresh tokens on every refresh (Whoop) invalidate the
