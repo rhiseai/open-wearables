@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections import OrderedDict
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any
 from uuid import UUID
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,7 @@ def current_sdk_webhook_batch() -> SDKWebhookBatch | None:
 
 
 @contextmanager
-def collect_sdk_webhooks(batch_id: str, *, historical: bool) -> Iterator[SDKWebhookBatch]:
+def collect_sdk_webhooks(batch_id: str, *, historical: bool) -> Generator[SDKWebhookBatch]:
     batch = SDKWebhookBatch(batch_id, historical=historical)
     token = _CURRENT_SDK_BATCH.set(batch)
     try:
