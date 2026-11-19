@@ -1918,7 +1918,7 @@
           "External: Summaries"
         ],
         "summary": "Get Recovery Summary",
-        "description": "Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).\n\nOne row per day from the highest-priority source, for every provider that supplies the\nunderlying data. The recovery score is set only where a recovery-score record exists.",
+        "description": "Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).\n\nOne row per day from the highest-priority source, for every provider that supplies the\nunderlying data. The recovery score is set only where a recovery-score record exists.\n\n`source_selection=per_provider` returns one row per day and provider instead, each from that\nprovider's own devices only.",
         "operationId": "get_recovery_summary_api_v1_users__user_id__summaries_recovery_get",
         "security": [
           {
@@ -1994,6 +1994,15 @@
               "minimum": 1,
               "default": 50,
               "title": "Limit"
+            }
+          },
+          {
+            "name": "source_selection",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/SummarySourceSelection",
+              "default": "priority"
             }
           },
           {
