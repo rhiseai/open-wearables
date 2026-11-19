@@ -3,7 +3,9 @@
 Apple Health has no nap flag: every session the SDK writes is stored as main
 sleep, so the daily summary sums an afternoon nap, or the second half of a
 night broken by a long wake, into the night's duration, stages, efficiency
-and heart rate window (RHISE-7780).
+and heart rate window (RHISE-7780). Cloud sources have the same gap: WHOOP
+sends a short sleep before the night as an ordinary sleep, though its own app
+shows it as a nap.
 
 The rule: sessions less than :data:`MAX_SPLIT_GAP` apart are one sleep. The
 chain with the most sleep is the day's main sleep; every other chain is a nap.
