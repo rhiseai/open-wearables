@@ -34,10 +34,10 @@ from app.schemas.providers.mobile_sdk import (
 from app.schemas.providers.mobile_sdk import (
     SyncRequest as SDKSyncRequest,
 )
-from app.services.apple_sleep_naps import sleep_gap_minutes
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
+from app.services.sleep_nap_marking import sleep_gap_minutes
 from app.services.sleep_reconciliation import merge_sleep_stages
 from app.utils.dates import as_utc
 from app.utils.sleep_stages import measured_stages

@@ -9,7 +9,7 @@ from app.models import DataSource, EventRecord
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.schemas.enums import EventCategory, ProviderName, SeriesType
 from app.schemas.sync_status import DataTypeKind
-from app.services.apple_sleep_naps import sleep_gap_minutes
+from app.services.sleep_nap_marking import sleep_gap_minutes
 
 # A night counts as final once its provider has sent data from this long after its end: a partial night ends at the
 # sync that sent it.

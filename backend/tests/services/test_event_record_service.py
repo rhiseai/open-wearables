@@ -685,21 +685,6 @@ class TestCreateOrMergeSleep:
         db.expire_all()
         assert db.get(SleepDetails, nap.id).is_nap is True
 
-    def test_a_provider_nap_flag_is_kept(self, db: Session) -> None:
-        data_source = DataSourceFactory(provider=ProviderName.GARMIN, source="garmin")
-        night = self._record(data_source, self._dt(22, day=20), self._dt(6))
-        nap = self._record(data_source, self._dt(13), self._dt(14, 30))
-
-        event_record_service.create_or_merge_sleep(
-            db, data_source.user_id, night, self._detail(night.id), self.THRESHOLD
-        )
-        event_record_service.create_or_merge_sleep(
-            db, data_source.user_id, nap, self._nap_detail(nap.id), self.THRESHOLD
-        )
-
-        db.expire_all()
-        assert db.get(SleepDetails, nap.id).is_nap is False
-
     def test_a_session_that_becomes_a_nap_loses_its_internal_sleep_score(self, db: Session) -> None:
         data_source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
         nap = self._record(data_source, self._dt(13), self._dt(14, 30))
@@ -751,23 +736,9 @@ class TestCreateOrMergeSleep:
         db.expire_all()
         assert db.get(SleepDetails, nap.id).is_nap is True
 
-    def test_a_failing_nap_step_keeps_the_session_and_its_webhook(self, db: Session) -> None:
-        data_source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
-        night = self._record(data_source, self._dt(22, day=20), self._dt(6))
-
-        with (
-            patch.object(event_record_service, "reclassify_sleep_naps", side_effect=RuntimeError("boom")),
-            patch("app.services.event_record_service.on_sleep_created") as mock_sleep,
-        ):
-            event_record_service.create_or_merge_sleep(
-                db, data_source.user_id, night, self._detail(night.id), self.THRESHOLD
-            )
-
-        assert db.get(EventRecord, night.id) is not None
-        mock_sleep.assert_called_once()
-
     def test_deleting_the_night_makes_the_nap_main_sleep(self, db: Session) -> None:
-        data_source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
+        # Apple: the nap rule decides both ways for a source with no nap flag of its own (sleep_nap_marking)
+        data_source = DataSourceFactory(provider=ProviderName.APPLE, source="apple_health_sdk")
         night = self._record(data_source, self._dt(22, day=20), self._dt(6))
         nap = self._record(data_source, self._dt(13), self._dt(14, 30))
         event_record_service.create_or_merge_sleep(

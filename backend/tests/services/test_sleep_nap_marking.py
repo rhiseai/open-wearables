@@ -1,8 +1,8 @@
-"""RHISE-7780: Apple sessions outside the day's main sleep are stored as naps.
+"""RHISE-7780: sessions outside the day's main sleep are stored as naps, for every source.
 
 Apple Health has no nap flag, so every session used to land as main sleep and
 the daily summary summed naps into the night. The first tests check the rule in
-app.services.apple_sleep_naps; the rest go through the write path the SDK uses
+app.services.sleep_nap_marking; the rest go through the write path the SDK uses
 (``create_or_merge_sleep``) and read the daily summary back.
 """
 
@@ -17,8 +17,8 @@ from app.models import DataSource, EventRecord
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate
 from app.schemas.responses.activity import SleepSummary
-from app.services.apple_sleep_naps import MAX_SPLIT_GAP, SleepBlock, nap_ids, sleep_gap_minutes
 from app.services.event_record_service import event_record_service
+from app.services.sleep_nap_marking import MAX_SPLIT_GAP, SleepBlock, nap_ids, sleep_gap_minutes
 from app.services.summaries_service import SummariesService
 from tests.factories import DataSourceFactory, UserFactory
 
@@ -92,14 +92,21 @@ def _at(iso: str) -> datetime:
 
 
 def _write(
-    db: Session, source: DataSource, start: str, end: str, sleep_minutes: int, external_id: str | None = None
+    db: Session,
+    source: DataSource,
+    start: str,
+    end: str,
+    sleep_minutes: int,
+    *,
+    is_nap: bool = False,
+    external_id: str | None = None,
 ) -> EventRecord:
-    """One SDK session, as the Apple path hands it to ``create_or_merge_sleep``."""
+    """One session, as a provider path hands it to ``create_or_merge_sleep``."""
     begin, finish = _at(start), _at(end)
     window = int((finish - begin).total_seconds() // 60)
     record = EventRecordCreate(
         id=uuid4(),
-        external_id=external_id or f"apple-{uuid4()}",
+        external_id=external_id or f"{source.provider}-{uuid4()}",
         user_id=source.user_id,
         data_source_id=source.id,
         provider=source.provider,
@@ -122,7 +129,7 @@ def _write(
         sleep_rem_minutes=30,
         sleep_awake_minutes=window - sleep_minutes,
         sleep_efficiency_score=Decimal(round(sleep_minutes / window * 100)),
-        is_nap=False,
+        is_nap=is_nap,
     )
     return event_record_service.create_or_merge_sleep(
         db,
@@ -252,9 +259,50 @@ def test_another_apple_device_is_marked_on_its_own(db: Session) -> None:
     assert _naps(db, phone) == {"14:00": False}
 
 
-def test_other_providers_keep_their_own_nap_flag(db: Session) -> None:
+def test_an_oura_afternoon_sleep_sent_as_sleep_becomes_a_nap(db: Session) -> None:
     source = DataSourceFactory(provider=ProviderName.OURA, source="oura")
     _write(db, source, "2026-11-15T23:00:00", "2026-11-16T07:00:00", 450)
     _write(db, source, "2026-11-16T14:00:00", "2026-11-16T15:00:00", 55)
 
-    assert _naps(db, source) == {"23:00": False, "14:00": False}
+    assert _naps(db, source) == {"23:00": False, "14:00": True}
+
+
+def test_whoop_sleep_before_a_long_wake_is_a_nap_as_whoop_shows_it(db: Session) -> None:
+    """A staging WHOOP night (Nov 3): the WHOOP app lists 23:24-00:54 as a nap, its API sends it as a sleep."""
+    source = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop")
+    _write(db, source, "2026-11-02T23:24:00", "2026-11-03T00:54:00", 75)
+    _write(db, source, "2026-11-03T05:05:00", "2026-11-03T09:26:00", 248)
+
+    assert _naps(db, source) == {"23:24": True, "05:05": False}
+    summary = _summary(db, source, "2026-11-03")
+    assert summary.duration_minutes == 248
+    assert summary.nap_count == 1
+    assert summary.total_duration_minutes == 248 + 90
+
+
+def test_whoop_night_that_syncs_after_its_nap(db: Session) -> None:
+    """A staging WHOOP night (Oct 24): the short sleep syncs first and was stored as the night."""
+    source = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop")
+    _write(db, source, "2026-10-23T23:27:00", "2026-10-24T00:34:00", 64)
+    assert _naps(db, source) == {"23:27": False}
+
+    _write(db, source, "2026-10-24T02:58:00", "2026-10-24T09:02:00", 341)
+
+    assert _naps(db, source) == {"23:27": True, "02:58": False}
+
+
+def test_a_nap_the_source_flagged_stays_a_nap_and_never_wins_the_night(db: Session) -> None:
+    source = DataSourceFactory(provider=ProviderName.OURA, source="oura")
+    _write(db, source, "2026-11-15T23:00:00", "2026-11-16T02:00:00", 170)
+    _write(db, source, "2026-11-16T12:00:00", "2026-11-16T16:00:00", 230, is_nap=True)
+
+    assert _naps(db, source) == {"23:00": False, "12:00": True}
+
+
+def test_a_resent_marked_nap_is_judged_again(db: Session) -> None:
+    source = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop")
+    _write(db, source, "2026-11-02T23:24:00", "2026-11-03T00:54:00", 75, external_id="whoop-early")
+    _write(db, source, "2026-11-03T05:05:00", "2026-11-03T09:26:00", 248)
+    _write(db, source, "2026-11-02T23:24:00", "2026-11-03T00:54:00", 75, external_id="whoop-early")
+
+    assert _naps(db, source) == {"23:24": True, "05:05": False}

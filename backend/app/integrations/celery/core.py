@@ -256,13 +256,6 @@ def create_celery() -> Celery:
             "kwargs": {},
         },
         # TODO: Remove after ~2027-05-01, with the task. Picks a lost run up again; a no-op once it is done.
-        "classify-sleep-naps": {
-            "task": CeleryTask.CLASSIFY_SLEEP_NAPS,
-            "schedule": crontab(minute="*/15"),
-            "args": (),
-            "kwargs": {},
-        },
-        # TODO: Remove after ~2027-05-01, with the task. Picks a lost run up again; a no-op once it is done.
         "repair-condensed-series": {
             "task": CeleryTask.REPAIR_CONDENSED_SERIES,
             "schedule": crontab(minute="*/15"),
