@@ -13,9 +13,11 @@ from app.constants.sleep import SleepStageType
 from app.models import EventRecord, EventRecordAggregate, SeriesAggregate
 from app.schemas.enums import SeriesType, get_series_type_id
 from app.schemas.providers.oura.imports import OuraMetJSON
+from app.services.event_record_service import event_record_service
 from app.services.providers.oura.coverage import ACTIVITY_SERIES
 from app.services.providers.oura.data_247 import Oura247Data
 from app.services.providers.oura.strategy import OuraStrategy
+from tests.factories import UserFactory
 
 
 class TestOura247SleepNormalization:
@@ -265,6 +267,56 @@ class TestOura247SleepNormalization:
         assert result["average_heart_rate"] == 55.0
         assert result["average_hrv"] == 45
         assert result["lowest_heart_rate"] == 48
+
+
+class TestOura247NapSentAgain:
+    """Oura sends a sleep again on every sync; a nap it flagged and sends unchanged is neither rewritten nor
+    announced."""
+
+    @pytest.fixture
+    def data_247(self) -> Oura247Data:
+        return OuraStrategy().data_247
+
+    def test_a_flagged_nap_sent_again_unchanged_is_not_announced(
+        self, db: Session, data_247: Oura247Data, sample_oura_sleep: dict
+    ) -> None:
+        user = UserFactory()
+        night = {
+            **sample_oura_sleep,
+            "id": "oura-night",
+            "bedtime_start": "2024-01-14T23:00:00+00:00",
+            "bedtime_end": "2024-01-15T07:00:00+00:00",
+        }
+        nap = {
+            **sample_oura_sleep,
+            "id": "oura-nap",
+            "type": "sleep",
+            "bedtime_start": "2024-01-15T13:00:00+00:00",
+            "bedtime_end": "2024-01-15T14:30:00+00:00",
+            "time_in_bed": 5400,
+            "total_sleep_duration": 4800,
+            "deep_sleep_duration": 600,
+            "light_sleep_duration": 3000,
+            "rem_sleep_duration": 1200,
+            "awake_time": 600,
+        }
+        for raw in (night, nap):
+            assert data_247.save_sleep_data(db, user.id, data_247.normalize_sleeps([raw], user.id)) == 1
+        details = event_record_service.event_record_detail_repo
+
+        with (
+            patch("app.services.event_record_service.on_sleep_created") as created,
+            patch("app.services.event_record_service.on_sleep_updated") as updated,
+            patch.object(details, "delete_by_record_id", wraps=details.delete_by_record_id) as rewritten,
+        ):
+            assert data_247.save_sleep_data(db, user.id, data_247.normalize_sleeps([nap], user.id)) == 1
+
+        created.assert_not_called()
+        updated.assert_not_called()
+        rewritten.assert_not_called()
+        db.expire_all()
+        stored = db.query(EventRecord).filter(EventRecord.external_id == "oura-nap").one()
+        assert stored.sleep_detail.is_nap is True
 
 
 class TestOura247RestingHeartRatePersistence:

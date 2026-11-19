@@ -144,8 +144,10 @@ class SleepSession(BaseModel):
     is_nap: bool = Field(
         False,
         description=(
-            "Whether the session is a nap: from the provider when it flags naps, else derived by Open Wearables "
-            "(see Data types)"
+            "Whether the session is a nap rather than its day's main sleep: set by the provider when it flags "
+            "naps and by Open Wearables' nap rule (see Data types). It can change when the same upload or a later "
+            "one of that source changes the day's main sleep, or, for a source that doesn't flag naps, when a "
+            "session of that day is deleted"
         ),
     )
     is_final: bool = Field(

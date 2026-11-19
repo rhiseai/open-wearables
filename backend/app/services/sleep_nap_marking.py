@@ -12,9 +12,18 @@ chain with the most sleep is the day's main sleep; every other chain is a nap.
 The summary then keeps naps out of the night's numbers and reports them as
 ``nap_count`` / ``nap_duration_minutes``.
 
-Every source follows this rule, on every sleep write; it replaces upstream's
-own nap rule (the 06:00-20:00 window and its startup backfill), so the fork
-has one nap rule only.
+It replaces upstream's own nap rule (the 06:00-20:00 window and its startup
+backfill), so the fork has one nap rule only. It runs on every sleep write that
+goes through ``EventRecordService.create_or_merge_sleep``, on Sensor Bio's
+writes and, for a source with no nap flag, on a sleep deleted through
+``EventRecordService.delete_event_record``; WHOOP's ``sleep.deleted`` webhook
+deletes through ``EventRecordRepository.delete_by_external_id`` without it.
+Garmin's sleep is stored without it, and its flags stay as Garmin sends them.
+
+A source in :data:`NO_NAP_FLAG_PROVIDERS` sends no nap flag, so the rule marks
+its sessions both ways: a nap it made stops being one when the day's main sleep
+changes. Any other source keeps the naps it flags; they take no part in choosing
+the main sleep, and the rule only adds naps to them (see :func:`flags_own_naps`).
 """
 
 from collections.abc import Sequence
@@ -23,12 +32,37 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 from app.config import settings
+from app.constants.sdk_providers import SDK_PROVIDERS
 from app.schemas.enums import ProviderName
 
 # An hour and a half awake still belongs to the same sleep: people can lie
 # awake that long trying to fall asleep again. A longer gap starts a separate
 # sleep (product decision on RHISE-7667, as WHOOP splits them).
 MAX_SPLIT_GAP = timedelta(minutes=90)
+
+# Their sleep comes without a nap flag: the mobile SDK (Apple, Samsung, Health
+# Connect) has none, and Sensor Bio, Ultrahuman and Withings send none. Polar,
+# which sends none either, is left out (see flags_own_naps).
+NO_NAP_FLAG_PROVIDERS: frozenset[str] = frozenset(
+    {
+        *SDK_PROVIDERS,
+        ProviderName.SENSORBIO.value,
+        ProviderName.ULTRAHUMAN.value,
+        ProviderName.WITHINGS.value,
+    }
+)
+
+
+def flags_own_naps(provider: str | None) -> bool:
+    """Whether a source's sleep arrives with a nap flag of its own.
+
+    A source in :data:`NO_NAP_FLAG_PROVIDERS` sends none, so every stored nap
+    flag of its is the rule's and is decided again both ways on each write. Any
+    other source keeps the naps it flags, and the rule only adds naps to them.
+    Polar sends no nap flag either but keeps one sleep per date, so the rule
+    never finds a nap among its sessions and it is left out of the set.
+    """
+    return provider not in NO_NAP_FLAG_PROVIDERS
 
 
 def sleep_gap_minutes(provider: str | None) -> int:

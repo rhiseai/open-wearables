@@ -217,8 +217,8 @@ class SensorBio247Data(Base247DataTemplate):
 
         Sensor Bio does not expose an explicit nap flag. Multiple sessions on the
         same day are returned as separate entries; they are stored with ``is_nap=False``
-        and ``save_sleep_data`` marks the day's naps after the write, by the rule every
-        other sleep write follows (``app.services.sleep_nap_marking``).
+        and ``save_sleep_data`` marks the day's naps after the write, by the rule of
+        ``app.services.sleep_nap_marking``.
         """
         parsed = self._parse(raw_sleep, SleepRecord, "sleep", user_id)
         if parsed is None:

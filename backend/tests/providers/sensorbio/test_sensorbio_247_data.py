@@ -15,12 +15,14 @@ from unittest.mock import MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.models import SleepDetails
+from app.models import EventRecord, SleepDetails
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import CalendarPeriod
+from app.services.event_record_service import event_record_service
 from app.services.providers.sensorbio.data_247 import SensorBio247Data
 from tests.factories import UserFactory
 
@@ -246,6 +248,86 @@ class TestSensorBio247SleepNaps:
         db.expire_all()
         assert db.get(SleepDetails, nap["id"]).is_nap is True
         assert db.get(SleepDetails, night["id"]).is_nap is False
+
+    @staticmethod
+    def _night(day: int) -> dict[str, Any]:
+        return {
+            "id": uuid4(),
+            "start_time": datetime(2026, 3, day, 22, tzinfo=timezone.utc),
+            "end_time": datetime(2026, 3, day + 1, 6, tzinfo=timezone.utc),
+            "duration_seconds": 28800,
+            "stages": {"deep_seconds": 5400, "light_seconds": 14400, "rem_seconds": 7200, "awake_seconds": 1800},
+        }
+
+    def test_a_nap_is_main_sleep_again_once_the_sleep_after_it_outweighs_the_night(
+        self, data_247: SensorBio247Data, db: Session
+    ) -> None:
+        """Sensor Bio sends no nap flag, so the rule marks its sessions both ways."""
+
+        def session(start: datetime, end: datetime, deep: int, light: int, rem: int) -> dict[str, Any]:
+            stages = {"deep_seconds": deep * 60, "light_seconds": light * 60, "rem_seconds": rem * 60}
+            seconds = int((end - start).total_seconds())
+            return {"id": uuid4(), "start_time": start, "end_time": end, "duration_seconds": seconds, "stages": stages}
+
+        user = UserFactory()
+        early = session(
+            datetime(2026, 3, 21, 0, tzinfo=timezone.utc), datetime(2026, 3, 21, 3, tzinfo=timezone.utc), 30, 100, 40
+        )
+        dawn = session(
+            datetime(2026, 3, 21, 5, tzinfo=timezone.utc), datetime(2026, 3, 21, 6, 30, tzinfo=timezone.utc), 0, 60, 20
+        )
+        assert data_247.save_sleep_data(db, user.id, early)
+        assert data_247.save_sleep_data(db, user.id, dawn)
+        # Rolled back first, so only what the write committed is read
+        db.rollback()
+        db.expire_all()
+        assert db.get(SleepDetails, dawn["id"]).is_nap is True
+
+        # Half an hour after the dawn sleep: one sleep with it, with more sleep than the early one.
+        morning = session(
+            datetime(2026, 3, 21, 7, tzinfo=timezone.utc), datetime(2026, 3, 21, 14, tzinfo=timezone.utc), 60, 240, 80
+        )
+        assert data_247.save_sleep_data(db, user.id, morning)
+
+        db.rollback()
+        db.expire_all()
+        assert db.get(SleepDetails, early["id"]).is_nap is True
+        assert db.get(SleepDetails, dawn["id"]).is_nap is False
+        assert db.get(SleepDetails, morning["id"]).is_nap is False
+
+    def test_marking_naps_takes_the_sleep_writer_lock(self, data_247: SensorBio247Data, db: Session) -> None:
+        user = UserFactory()
+        lock = event_record_service.crud.lock_sleep_user
+
+        with patch.object(event_record_service.crud, "lock_sleep_user", wraps=lock) as locked:
+            assert data_247.save_sleep_data(db, user.id, self._night(20))
+
+        locked.assert_called_once_with(db, user.id)
+
+    def test_a_failing_nap_step_keeps_the_session_and_the_next_one(
+        self, data_247: SensorBio247Data, db: Session
+    ) -> None:
+        """A database error while marking naps undoes only the marking: the session stays stored, and the
+        next session of the same sync is stored in the same database session."""
+        user = UserFactory()
+        first, second = self._night(20), self._night(22)
+        mark_naps = event_record_service._mark_naps
+
+        def failing(session: Session, *args: Any, **kwargs: Any) -> set[UUID]:
+            session.execute(text("SELECT 1 / 0"))
+            return mark_naps(session, *args, **kwargs)
+
+        with (
+            patch.object(event_record_service, "_mark_naps", side_effect=failing),
+            patch("app.services.event_record_service.logger") as logger,
+        ):
+            assert data_247.save_sleep_data(db, user.id, first) is True
+        assert data_247.save_sleep_data(db, user.id, second) is True
+
+        assert logger.error.call_args.args == ("Nap marking failed after sleep write",)
+        db.rollback()
+        assert db.get(EventRecord, first["id"]) is not None
+        assert db.get(EventRecord, second["id"]) is not None
 
 
 # ---------------------------------------------------------------------------

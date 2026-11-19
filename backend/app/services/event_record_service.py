@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import event as sa_event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Query, Session, SessionTransaction
 
 from app.config import settings
@@ -88,7 +89,7 @@ from app.services.priority_service import priority_service
 from app.services.scores.sleep_service import sleep_score_service
 from app.services.services import AppService
 from app.services.sleep_finality import final_record_ids
-from app.services.sleep_nap_marking import SleepBlock, nap_ids
+from app.services.sleep_nap_marking import SleepBlock, flags_own_naps, nap_ids
 from app.services.sleep_reconciliation import merge_sleep_parts
 from app.utils.context import current_sync_payload
 from app.utils.conversion import as_dict_list, as_float, as_int, as_model, minutes_to_seconds
@@ -97,15 +98,6 @@ from app.utils.pagination import encode_cursor
 from app.utils.structured_logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def _flags_own_naps(provider: str | None) -> bool:
-    """Whether a provider's sleep arrives with a nap flag of its own.
-
-    Apple sends none: its naps are set by app.services.sleep_nap_marking after the write, so an incoming
-    flag means nothing. Every other source keeps the flag it sends, and that rule only adds naps to it.
-    """
-    return provider != ProviderName.APPLE
 
 
 @dataclass(frozen=True)
@@ -319,11 +311,11 @@ class EventRecordService(
         later, longer session. Days are keyed by the local date a session ends,
         as the daily sleep summary is. Returns the ids marked as naps.
 
-        Apple has no nap flag of its own, so its sessions are marked both ways.
-        With ``keep_source_naps`` a nap the source flagged stays a nap and takes
-        no part in choosing the main sleep, and the rule only adds naps: WHOOP,
-        for one, sends a short sleep before the night as an ordinary sleep and
-        shows it as a nap in its own app.
+        A source with no nap flag of its own (``flags_own_naps`` is False) is
+        marked both ways. With ``keep_source_naps`` a nap the source flagged
+        stays a nap and takes no part in choosing the main sleep, and the rule
+        only adds naps: WHOOP, for one, sends a short sleep before the night as
+        an ordinary sleep and shows it as a nap in its own app.
         """
         if not wake_dates:
             return set()
@@ -382,16 +374,25 @@ class EventRecordService(
         )
         data_type_coverage_repository.record(db_session, [span])
 
+    @staticmethod
+    def _source_flags_own_naps(db_session: DbSession, data_source_id: UUID) -> bool:
+        """Whether the data source's provider sends a nap flag of its own (``flags_own_naps``).
+
+        The source a record is filed under decides, not the provider a payload names: Whoop's and Sensor Bio's
+        records name none.
+        """
+        return flags_own_naps(db_session.get_one(DataSource, data_source_id).provider)
+
     def _with_marked_naps(
         self,
         db_session: DbSession,
-        record: EventRecordCreate,
         survivor: EventRecord,
         detail: EventRecordDetailCreate,
         wake_dates: set[date],
+        *,
+        keep_source_naps: bool,
     ) -> EventRecordDetailCreate:
         """Mark the source's naps on the written dates; the returned detail carries the survivor's flag."""
-        keep_source_naps = record.provider != ProviderName.APPLE
         naps = self._mark_naps(db_session, survivor.data_source_id, wake_dates, keep_source_naps=keep_source_naps)
         is_nap = survivor.id in naps or (keep_source_naps and bool(detail.is_nap))
         return detail.model_copy(update={"is_nap": is_nap})
@@ -457,13 +458,24 @@ class EventRecordService(
     def mark_sleep_naps_after_write(self, db_session: DbSession, user_id: UUID, record: EventRecord) -> None:
         """Mark the naps of a stored session's wake date and rescore it, then commit.
 
-        For a source whose sleep is stored outside ``create_or_merge_sleep`` (Sensor Bio), which marks naps
-        inside its own write. The source sends no nap flag, so the rule only adds naps, as for every
-        source but Apple.
+        For Sensor Bio, whose sleep is stored by ``create`` and ``create_detail`` rather than by
+        ``create_or_merge_sleep`` (which marks naps inside its own write). The sleep is already committed: on a
+        database error only the marking and the rescore are undone, and the database session stays usable for
+        the caller's next write. The day is marked and rescored again by the next write of a session of that
+        source that ends on it.
         """
+        record_id, data_source_id = record.id, record.data_source_id
         wake_date = local_date(record.end_datetime, record.zone_offset)
-        self._mark_naps(db_session, record.data_source_id, {wake_date}, keep_source_naps=True)
-        self._recompute_sleep_scores(db_session, user_id, {wake_date})
+        try:
+            with db_session.begin_nested():
+                self.lock_sleep_user(db_session, user_id)
+                keep_source_naps = self._source_flags_own_naps(db_session, data_source_id)
+                self._mark_naps(db_session, data_source_id, {wake_date}, keep_source_naps=keep_source_naps)
+                self._recompute_sleep_scores(db_session, user_id, {wake_date})
+        except SQLAlchemyError as e:
+            logger.error(
+                "Nap marking failed after sleep write", exc_info=e, record_id=str(record_id), user_id=str(user_id)
+            )
         db_session.commit()
 
     def find_adjacent_sleep_record(
@@ -700,7 +712,7 @@ class EventRecordService(
         data_source_id = self.crud.resolve_sleep_data_source(db_session, record)
         record = record.model_copy(update={"data_source_id": data_source_id})
         authoritative = record.provider != ProviderName.APPLE and record.external_id is not None
-        own_nap_flag = _flags_own_naps(record.provider)
+        own_nap_flag = self._source_flags_own_naps(db_session, data_source_id)
         candidates = self.crud.find_sleep_merge_candidates(
             db_session,
             data_source_id,
@@ -709,8 +721,8 @@ class EventRecordService(
             threshold_minutes,
             record.external_id,
             replace_own_window=authoritative,
-            # Apple has no nap flag of its own: every SDK session arrives as main sleep, and a stored nap flag
-            # is ours, set again after this write.
+            # A source with no nap flag of its own sends every session as main sleep, and a stored nap flag of
+            # its is the rule's, decided again after this write: it keeps no session from joining another.
             is_nap=bool(detail.is_nap) if own_nap_flag else None,
         )
         own = [
@@ -748,7 +760,9 @@ class EventRecordService(
             self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
             dates = {self._to_local(boundary, record.zone_offset).date() for boundary in (start, end)}
             db_session.expire(survivor, ["sleep_detail"])
-            final_detail = self._with_marked_naps(db_session, record, survivor, final_detail, dates)
+            final_detail = self._with_marked_naps(
+                db_session, survivor, final_detail, dates, keep_source_naps=own_nap_flag
+            )
             self._recompute_sleep_scores(db_session, user_id, dates)
             return survivor, "created", final_detail
 
@@ -760,14 +774,8 @@ class EventRecordService(
         duplicates = [candidate for candidate in candidates if candidate.id != survivor.id]
         zone_offset = record.zone_offset if record.zone_offset is not None else survivor.zone_offset
         old_start, old_end, old_zone = survivor.start_datetime, survivor.end_datetime, survivor.zone_offset
-        unchanged = (
-            not duplicates
-            and old_start == start
-            and old_end == end
-            and old_zone == zone_offset
-            and self._sleep_detail_snapshot(survivor) == final_detail
-        )
-        if unchanged:
+        stored = (old_start, old_end, old_zone, self._sleep_detail_snapshot(survivor))
+        if not duplicates and (start, end, zone_offset, final_detail) == stored:
             return survivor, None, final_detail
 
         # Free any target slot before the surviving row is expanded. Everything
@@ -800,8 +808,14 @@ class EventRecordService(
         self.event_record_detail_repo.create_and_flush(db_session, final_detail, detail_type=EventCategory.SLEEP)
         db_session.expire(survivor, ["sleep_detail"])
         old_dates.update(self._to_local(boundary, zone_offset).date() for boundary in (start, end))
-        final_detail = self._with_marked_naps(db_session, record, survivor, final_detail, old_dates)
+        final_detail = self._with_marked_naps(
+            db_session, survivor, final_detail, old_dates, keep_source_naps=own_nap_flag
+        )
         self._recompute_sleep_scores(db_session, user_id, old_dates)
+        if not duplicates and (start, end, zone_offset, final_detail) == stored:
+            # A source with a nap flag of its own sends a nap the rule made as main sleep, and the rule has
+            # made it a nap again: the session's values are stored as they were, so nothing is announced.
+            return survivor, None, final_detail
         logger.info(
             "Reconciled adjacent sleep records",
             provider=record.provider,
@@ -1483,23 +1497,28 @@ class EventRecordService(
         category: EventCategory,
     ) -> bool:
         """Delete an event record by id and category. Returns False if not found or not owned by user."""
+        if category == EventCategory.SLEEP:
+            # The shared sleep writer lock, taken before the user's sessions are read, as create_or_merge_sleep
+            # and the writers of Open Wearables' own sleep scores do: the delete changes the day's scores, and
+            # maybe its naps, below
+            self.lock_sleep_user(db_session, user_id)
         record = self.crud.get_record_with_details(db_session, record_id, category)
         if not record:
             return False
         data_source = self.data_source_repo.get(db_session, record.data_source_id)
         if not data_source or data_source.user_id != user_id:
             return False
-        # Read before the delete: without the night, a nap of that day may be its main sleep now
+        # Read before the delete: the day is rescored, and without the night a nap of that day may be its main sleep
         source_id, wake_date = record.data_source_id, local_date(record.end_datetime, record.zone_offset)
         self.crud.delete_flush(db_session, record)
         data_type_coverage_repository.refresh_events(
             db_session, [(data_source.user_id, data_source.provider, record.category)]
         )
         if category == EventCategory.SLEEP:
-            # The day is judged again by the nap rule of the write path (sleep_nap_marking), then rescored
-            self._mark_naps(
-                db_session, source_id, {wake_date}, keep_source_naps=data_source.provider != ProviderName.APPLE
-            )
+            if not flags_own_naps(data_source.provider):
+                # Its nap flags are all the rule's (sleep_nap_marking): the day is marked again both ways. A source
+                # with a flag of its own keeps its flags as they are, as upstream does.
+                self._mark_naps(db_session, source_id, {wake_date}, keep_source_naps=False)
             self._recompute_sleep_scores(db_session, user_id, {wake_date})
         db_session.commit()
         return True

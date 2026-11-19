@@ -1,4 +1,5 @@
-"""RHISE-7780: sessions outside the day's main sleep are stored as naps, for every source.
+"""RHISE-7780: sessions outside the day's main sleep are stored as naps, for every source whose sleep goes
+through create_or_merge_sleep.
 
 Apple Health has no nap flag, so every session used to land as main sleep and
 the daily summary summed naps into the night. The first tests check the rule in
@@ -11,6 +12,7 @@ from decimal import Decimal
 from unittest.mock import patch
 from uuid import UUID, uuid4
 
+import pytest
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord
@@ -201,17 +203,21 @@ def test_the_main_sleep_moves_to_a_longer_session_that_arrives_later(db: Session
     assert summary.nap_count == 1
 
 
-def test_a_nap_sent_again_unchanged_is_not_announced(db: Session) -> None:
-    """Every SDK batch writes the open Apple sessions again: an unchanged nap is no sleep.updated."""
-    source = DataSourceFactory(provider=ProviderName.APPLE)
+@pytest.mark.parametrize(
+    ("provider", "source_name"), [(ProviderName.APPLE, "apple_health_sdk"), (ProviderName.WITHINGS, "withings")]
+)
+def test_a_nap_sent_again_unchanged_is_not_announced(db: Session, provider: ProviderName, source_name: str) -> None:
+    """Every SDK batch writes the open Apple sessions again, and Withings re-sends its sessions: a source
+    without a nap flag sends the nap the rule made as main sleep, and that unchanged nap is no sleep.updated."""
+    source = DataSourceFactory(provider=provider, source=source_name)
     _write(db, source, "2026-11-15T23:00:00", "2026-11-16T07:00:00", 450)
-    _write(db, source, "2026-11-16T14:00:00", "2026-11-16T15:00:00", 55, external_id="apple-nap")
+    _write(db, source, "2026-11-16T14:00:00", "2026-11-16T15:00:00", 55, external_id="resent-nap")
 
     with (
         patch("app.services.event_record_service.on_sleep_created") as created,
         patch("app.services.event_record_service.on_sleep_updated") as updated,
     ):
-        _write(db, source, "2026-11-16T14:00:00", "2026-11-16T15:00:00", 55, external_id="apple-nap")
+        _write(db, source, "2026-11-16T14:00:00", "2026-11-16T15:00:00", 55, external_id="resent-nap")
 
     assert _naps(db, source) == {"23:00": False, "14:00": True}
     created.assert_not_called()

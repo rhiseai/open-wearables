@@ -3,7 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from redis.exceptions import LockNotOwnedError
@@ -318,3 +318,50 @@ def test_an_hour_and_three_quarters_awake_ends_an_apple_sleep(
     stored = db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user.id).all()
     assert len(stored) == records
     assert sum(bool(record.sleep_detail and record.sleep_detail.is_nap) for record in stored) == naps
+
+
+def _sessions(db: Session, user_id: UUID) -> list[tuple[str, str, bool]]:
+    db.expire_all()
+    records = (
+        db.query(EventRecord)
+        .join(DataSource)
+        .filter(DataSource.user_id == user_id)
+        .order_by(EventRecord.start_datetime)
+        .all()
+    )
+    return [
+        (
+            record.start_datetime.strftime("%d %H:%M"),
+            record.end_datetime.strftime("%d %H:%M"),
+            bool(record.sleep_detail and record.sleep_detail.is_nap),
+        )
+        for record in records
+    ]
+
+
+@patch("app.services.sdk.sleep_service.celery_app")
+def test_a_samsung_evening_nap_is_its_own_session_and_joins_the_night_that_follows(
+    mock_finalize: MagicMock, db: Session
+) -> None:
+    """Samsung sends no nap flag: the rule makes a separate evening sleep a nap, and a night starting
+    90 minutes after it in a later upload joins it, as for Apple, Withings and Ultrahuman."""
+    user = UserFactory()
+    day = datetime(2026, 11, 15, tzinfo=timezone.utc)
+    handle_sleep_data(
+        db,
+        _request(
+            _sample(day - timedelta(hours=1), day + timedelta(hours=7)),
+            _sample(day + timedelta(hours=17), day + timedelta(hours=18)),
+            provider="samsung",
+        ),
+        str(user.id),
+    )
+    assert _sessions(db, user.id) == [("14 23:00", "15 07:00", False), ("15 17:00", "15 18:00", True)]
+
+    handle_sleep_data(
+        db,
+        _request(_sample(day + timedelta(hours=19, minutes=30), day + timedelta(days=1, hours=7)), provider="samsung"),
+        str(user.id),
+    )
+
+    assert _sessions(db, user.id) == [("14 23:00", "15 07:00", False), ("15 17:00", "16 07:00", False)]

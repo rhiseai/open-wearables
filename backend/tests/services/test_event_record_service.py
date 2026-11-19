@@ -736,9 +736,20 @@ class TestCreateOrMergeSleep:
         db.expire_all()
         assert db.get(SleepDetails, nap.id).is_nap is True
 
-    def test_deleting_the_night_makes_the_nap_main_sleep(self, db: Session) -> None:
-        # Apple: the nap rule decides both ways for a source with no nap flag of its own (sleep_nap_marking)
-        data_source = DataSourceFactory(provider=ProviderName.APPLE, source="apple_health_sdk")
+    @pytest.mark.parametrize(
+        ("provider", "source"),
+        [
+            (ProviderName.APPLE, "apple_health_sdk"),
+            (ProviderName.HEALTH_CONNECT, "com.google.android.apps.fitness"),
+            (ProviderName.ULTRAHUMAN, "ultrahuman"),
+            (ProviderName.WITHINGS, "withings"),
+        ],
+    )
+    def test_deleting_the_night_makes_the_nap_main_sleep(
+        self, db: Session, provider: ProviderName, source: str
+    ) -> None:
+        # A source with no nap flag of its own: the nap rule decides both ways (sleep_nap_marking)
+        data_source = DataSourceFactory(provider=provider, source=source)
         night = self._record(data_source, self._dt(22, day=20), self._dt(6))
         nap = self._record(data_source, self._dt(13), self._dt(14, 30))
         event_record_service.create_or_merge_sleep(
@@ -747,11 +758,112 @@ class TestCreateOrMergeSleep:
         event_record_service.create_or_merge_sleep(
             db, data_source.user_id, nap, self._nap_detail(nap.id), self.THRESHOLD
         )
+        db.expire_all()
+        assert db.get(SleepDetails, nap.id).is_nap is True
 
         assert event_record_service.delete_event_record(db, data_source.user_id, night.id, EventCategory.SLEEP)
 
         db.expire_all()
         assert db.get(SleepDetails, nap.id).is_nap is False
+
+    def test_a_night_resent_shorter_makes_the_longer_afternoon_sleep_main(self, db: Session) -> None:
+        # Withings sends no nap flag, so the nap the rule made is judged again when the night shrinks. The record
+        # names no provider, as Whoop's and Sensor Bio's don't: the source it is filed under decides.
+        data_source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
+        night = self._record(data_source, self._dt(22, day=20), self._dt(6)).model_copy(
+            update={"external_id": "withings-night"}
+        )
+        afternoon = self._record(data_source, self._dt(13), self._dt(14, 30))
+        event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, night, self._detail(night.id), self.THRESHOLD
+        )
+        event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, afternoon, self._nap_detail(afternoon.id), self.THRESHOLD
+        )
+        db.expire_all()
+        assert db.get(SleepDetails, afternoon.id).is_nap is True
+
+        shorter = self._record(data_source, self._dt(5), self._dt(5, 50)).model_copy(
+            update={"external_id": "withings-night"}
+        )
+        shorter_detail = self._detail(shorter.id, deep=10, light=20, rem=10, awake=10, in_bed=50)
+        event_record_service.create_or_merge_sleep(db, data_source.user_id, shorter, shorter_detail, self.THRESHOLD)
+
+        db.expire_all()
+        assert db.get(SleepDetails, night.id).is_nap is True
+        assert db.get(SleepDetails, afternoon.id).is_nap is False
+
+    def test_deleting_the_night_keeps_a_nap_the_source_flagged(self, db: Session) -> None:
+        data_source = DataSourceFactory(provider=ProviderName.WHOOP, source="whoop")
+        night = self._record(data_source, self._dt(22, day=20), self._dt(6))
+        nap = self._record(data_source, self._dt(13), self._dt(14, 30))
+        event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, night, self._detail(night.id), self.THRESHOLD
+        )
+        nap_detail = self._nap_detail(nap.id).model_copy(update={"is_nap": True})
+        event_record_service.create_or_merge_sleep(db, data_source.user_id, nap, nap_detail, self.THRESHOLD)
+
+        assert event_record_service.delete_event_record(db, data_source.user_id, night.id, EventCategory.SLEEP)
+
+        db.expire_all()
+        assert db.get(SleepDetails, nap.id).is_nap is True
+
+    @staticmethod
+    def _stored(
+        data_source: DataSource, start: datetime, end: datetime, *, asleep: int, is_nap: bool = False
+    ) -> EventRecord:
+        """A session stored with the flag its provider sent, as Garmin's batch write stores sleep."""
+        record = EventRecordFactory(
+            data_source=data_source,
+            category=EventCategory.SLEEP,
+            type="sleep_session",
+            start_datetime=start,
+            end_datetime=end,
+            duration_seconds=int((end - start).total_seconds()),
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=record, sleep_total_duration_minutes=asleep, is_nap=is_nap)
+        return record
+
+    @pytest.mark.parametrize(("provider", "source"), [(ProviderName.GARMIN, "garmin"), (ProviderName.WHOOP, "whoop")])
+    def test_deleting_a_sleep_of_a_source_that_flags_naps_rescores_and_keeps_every_flag(
+        self, db: Session, provider: ProviderName, source: str
+    ) -> None:
+        """A night split by a two-hour wake is two sleeps, both stored as main sleep (Garmin's flags, or WHOOP
+        rows stored before the nap rule): the rule would make the shorter one a nap, but a delete leaves the
+        flags of a source with a nap flag of its own as they are, as upstream does, and only rescores the day."""
+        data_source = DataSourceFactory(provider=provider, source=source)
+        first = self._stored(data_source, self._dt(22, day=20), self._dt(2), asleep=230)
+        second = self._stored(data_source, self._dt(4), self._dt(7), asleep=170)
+        nap = self._stored(data_source, self._dt(13), self._dt(14), asleep=55, is_nap=True)
+        rescore = event_record_service._recompute_sleep_scores
+
+        with patch.object(event_record_service, "_recompute_sleep_scores", wraps=rescore) as rescored:
+            assert event_record_service.delete_event_record(db, data_source.user_id, nap.id, EventCategory.SLEEP)
+
+        rescored.assert_called_once_with(db, data_source.user_id, {date(2026, 3, 21)})
+        db.expire_all()
+        assert db.get(SleepDetails, first.id).is_nap is False
+        assert db.get(SleepDetails, second.id).is_nap is False
+
+    def test_deleting_a_sleep_takes_the_sleep_writer_lock_before_the_delete(self, db: Session) -> None:
+        data_source = DataSourceFactory(provider=ProviderName.WITHINGS, source="withings")
+        night = self._record(data_source, self._dt(22, day=20), self._dt(6))
+        event_record_service.create_or_merge_sleep(
+            db, data_source.user_id, night, self._detail(night.id), self.THRESHOLD
+        )
+        lock = event_record_service.crud.lock_sleep_user
+        locked_while_stored: list[bool] = []
+
+        def lock_and_look(session: Session, user_id: UUID) -> None:
+            locked_while_stored.append(session.get(EventRecord, night.id) is not None)
+            lock(session, user_id)
+
+        with patch.object(event_record_service.crud, "lock_sleep_user", side_effect=lock_and_look) as locked:
+            assert event_record_service.delete_event_record(db, data_source.user_id, night.id, EventCategory.SLEEP)
+
+        locked.assert_called_once_with(db, data_source.user_id)
+        assert locked_while_stored == [True]
 
     def test_no_adjacent_creates_single_record(self, db: Session) -> None:
         """When no adjacent record exists, creates the record normally."""
