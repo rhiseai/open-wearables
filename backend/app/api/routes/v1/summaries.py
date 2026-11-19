@@ -146,7 +146,8 @@ def get_data_summary(
     """Returns per-user data counts grouped by series type, event type, and provider.
 
     Optionally scope the counts to a date window via `start_date` / `end_date` (data points are
-    filtered by `recorded_at`, events by their start time). Omitting both returns all-time counts.
+    filtered by `recorded_at`, a night's values by the night's start, events by their start time).
+    Omitting both returns all-time counts.
     """
     start_datetime = parse_query_datetime(start_date) if start_date is not None else None
     end_datetime = parse_query_end_datetime(end_date) if end_date is not None else None

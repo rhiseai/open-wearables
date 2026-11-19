@@ -2193,7 +2193,7 @@
           "External: Summaries"
         ],
         "summary": "Get Data Summary",
-        "description": "Returns per-user data counts grouped by series type, event type, and provider.\n\nOptionally scope the counts to a date window via `start_date` / `end_date` (data points are\nfiltered by `recorded_at`, events by their start time). Omitting both returns all-time counts.",
+        "description": "Returns per-user data counts grouped by series type, event type, and provider.\n\nOptionally scope the counts to a date window via `start_date` / `end_date` (data points are\nfiltered by `recorded_at`, a night's values by the night's start, events by their start time).\nOmitting both returns all-time counts.",
         "operationId": "get_data_summary_api_v1_users__user_id__summaries_data_get",
         "security": [
           {

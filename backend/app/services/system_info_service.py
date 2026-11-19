@@ -79,11 +79,11 @@ class SystemInfoService:
         """Get per-user data summary with counts by type and provider.
 
         When ``start_datetime`` and/or ``end_datetime`` are provided, counts are scoped to that
-        window (data points by ``recorded_at``, events by ``start_datetime``). Omitting both
-        returns all-time counts. The per-provider breakdown is derived from the scoped rows.
+        window (data points by ``recorded_at``, a night's values and events by ``start_datetime``).
+        Omitting both returns all-time counts. The per-provider breakdown is derived from the scoped rows.
 
-        Data point counts cover the live table, the archive and the providers' day values, which
-        were samples before the aggregate tables; event records have no archive.
+        Data point counts cover the live table, the archive and the providers' day and night values,
+        which were samples before the aggregate tables; event records have no archive.
         """
         series_rows = [
             *self.timeseries_service.crud.get_user_counts_by_provider_and_type(
@@ -93,6 +93,9 @@ class SystemInfoService:
                 db_session, user_id, start_datetime, end_datetime
             ),
             *provider_day_counts(db_session, user_id, start_datetime, end_datetime),
+            *self.event_record_service.crud.get_user_sleep_value_counts_by_provider_and_type(
+                db_session, user_id, start_datetime, end_datetime
+            ),
         ]
 
         # Query event counts grouped by provider + category + type
