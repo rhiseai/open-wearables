@@ -1,4 +1,4 @@
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Literal, Self
 from uuid import UUID
@@ -7,10 +7,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.constants.devices_map import normalize_device_model
 from app.schemas.enums import DeviceType, PeriodKind, Resolution, SeriesType
-from app.utils.dates import ZoneOffset, iso_to_timezone
+from app.utils.dates import ZoneOffset, as_utc, iso_to_timezone, offset_to_iso
 from app.utils.pagination import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 from .source_filters import SourceFilterParams
+
+# A local midnight given as a bare instant, its offset not kept, falls on the date this long after it: right for
+# every offset from -11:00 (Samoa) to +13:00 (New Zealand in summer).
+LOCAL_MIDNIGHT_TO_DAY = timedelta(hours=13)
 
 
 def _offset(zone_offset: object) -> object:
@@ -44,6 +48,16 @@ class CalendarPeriod(BaseModel):
             date.fromisoformat(day) if isinstance(day, str) else day, time(), iso_to_timezone(offset)
         )
         return cls(start=start, end=start + timedelta(days=1), zone_offset=offset)
+
+    @classmethod
+    def of_local_midnight(cls, instant: datetime) -> Self:
+        """A day the provider gives only as the instant of its local midnight, without the offset: the date
+        LOCAL_MIDNIGHT_TO_DAY on, at the offset that puts the instant on that date's midnight. The aggregate
+        backfill dates the samples such a provider stored before the aggregate tables the same way."""
+        instant = as_utc(instant)
+        day = (instant + LOCAL_MIDNIGHT_TO_DAY).date()
+        offset = datetime.combine(day, time(), timezone.utc) - instant
+        return cls.of_date(day, offset_to_iso(int(offset.total_seconds())))
 
 
 StatColumn = Literal["sum", "avg", "min", "max", "last"]

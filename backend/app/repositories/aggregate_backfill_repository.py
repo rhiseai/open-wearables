@@ -10,6 +10,7 @@ from app.database import DbSession
 from app.repositories.local_day import utc_midnight
 from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.enums.aggregation_method import get_aggregation_method
+from app.schemas.model_crud.activities.data_point_series import LOCAL_MIDNIGHT_TO_DAY
 
 # workout_details columns per series, so a series' statistics land in one row.
 _WORKOUT_COLUMNS: dict[SeriesType, dict[str, str]] = defaultdict(dict)
@@ -220,7 +221,9 @@ class AggregateBackfillRepository:
 _DAYS = {
     DayAnchor.LOCAL: "((s.recorded_at AT TIME ZONE 'UTC') + coalesce(s.zone_offset, '+00:00')::interval)::date",
     DayAnchor.UTC_DATE: "(s.recorded_at AT TIME ZONE 'UTC')::date",
-    DayAnchor.LOCAL_MIDNIGHT_NO_OFFSET: "((s.recorded_at AT TIME ZONE 'UTC') + interval '13 hours')::date",
+    # The date CalendarPeriod.of_local_midnight gives a live day value of the same shape.
+    DayAnchor.LOCAL_MIDNIGHT_NO_OFFSET: f"""((s.recorded_at AT TIME ZONE 'UTC')
+        + interval '{LOCAL_MIDNIGHT_TO_DAY // timedelta(hours=1)} hours')::date""",
     DayAnchor.NIGHT_STARTED_AT: """((s.recorded_at AT TIME ZONE 'UTC') + coalesce(s.zone_offset, '+00:00')::interval
         + interval '12 hours')::date""",
 }

@@ -20,8 +20,8 @@ class DayAnchor(StrEnum):
     LOCAL = "local"
     # recorded_at is 00:00 UTC of the provider's date.
     UTC_DATE = "utc_date"
-    # recorded_at is the local midnight but the offset was not kept: the day is the date 13 hours on, right for
-    # every offset from -11:00 (Samoa) to +13:00 (New Zealand in summer).
+    # recorded_at is the local midnight but the offset was not kept: the day is the date LOCAL_MIDNIGHT_TO_DAY on,
+    # as CalendarPeriod.of_local_midnight dates a live value of the same shape.
     LOCAL_MIDNIGHT_NO_OFFSET = "local_midnight_no_offset"
     # recorded_at is when the night's sleep started, at the row's offset: the day is the one the user woke up on,
     # the local date 12 hours on.
