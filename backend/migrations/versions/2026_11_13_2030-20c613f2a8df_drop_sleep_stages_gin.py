@@ -16,6 +16,7 @@ def upgrade() -> None:
     # No API uses JSONB containment on sleep stages. Its pending-list cleanup
     # adds synchronous work to sleep writes, so remove the index without blocking them.
     with op.get_context().autocommit_block():
+        _allow_a_concurrent_index_build()
         op.drop_index(
             "ix_sleep_details_stages_gin",
             table_name="sleep_details",
@@ -24,8 +25,16 @@ def upgrade() -> None:
         )
 
 
+def _allow_a_concurrent_index_build() -> None:
+    # A concurrent drop or build waits for every transaction that can see sleep_details
+    # to end. Production's 30 s role statement timeout cancelled the drop in the release
+    # of 2026-11-19 (RHISE-7842), so this session waits up to 15 minutes instead.
+    op.execute("SET statement_timeout = '15min'")
+
+
 def downgrade() -> None:
     with op.get_context().autocommit_block():
+        _allow_a_concurrent_index_build()
         # If the previous concurrent build was interrupted, it can leave an invalid index.
         op.drop_index(
             "ix_sleep_details_stages_gin",
