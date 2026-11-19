@@ -3772,7 +3772,7 @@
           "External: Health Scores"
         ],
         "summary": "List Health Scores",
-        "description": "Returns health scores (sleep, recovery, readiness, etc.) for a user.",
+        "description": "Returns health scores (sleep, recovery, readiness, etc.) for a user.\n\nScores computed by Open Wearables (`provider: internal`) are deprecated: no new ones are\ncomputed starting November 6, 2026. Previously computed scores are still returned.",
         "operationId": "list_health_scores_api_v1_users__user_id__health_scores_get",
         "security": [
           {
@@ -7054,7 +7054,6 @@
                                   "type": "number"
                                 },
                                 {
-                                  "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
                                   "type": "string"
                                 }
                               ],
@@ -15576,6 +15575,12 @@
             "type": "boolean",
             "title": "Is Enabled",
             "description": "Whether provider is enabled by admin"
+          },
+          "credentials_configured": {
+            "type": "boolean",
+            "title": "Credentials Configured",
+            "description": "Whether the OAuth client ID and secret are set. Always true for SDK-only providers.",
+            "default": true
           },
           "icon_url": {
             "type": "string",
