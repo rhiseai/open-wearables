@@ -279,15 +279,16 @@ sleep = await ow.get_all(f"/api/v1/users/{user_id}/summaries/sleep", start_date=
 ```
 
 
-### Choosing a different provider for sleep and activity
+### Choosing a different provider for sleep, activity and recovery
 
-`GET /api/v1/users/{user_id}/summaries/sleep` and
-`GET /api/v1/users/{user_id}/summaries/activity` accept `source_selection`:
+`GET /api/v1/users/{user_id}/summaries/sleep`,
+`GET /api/v1/users/{user_id}/summaries/activity` and
+`GET /api/v1/users/{user_id}/summaries/recovery` accept `source_selection`:
 
 | Value | Result |
 | --- | --- |
-| `priority` (default) | Existing global provider priority selects one daily summary. Activity can fill different metric groups from different providers. |
-| `per_provider` | One candidate per local date and provider. The caller applies its user's preferred provider separately for sleep and activity. |
+| `priority` (default) | Existing global provider priority selects one daily summary. Activity and recovery can fill different metric groups from different providers. |
+| `per_provider` | One candidate per local date and provider. The caller applies its user's preferred provider separately for sleep, activity and recovery. |
 
 The candidate mode keeps OW's device selection and deduplication within each provider.
 Activity candidates combine only that provider's metric groups and sibling-device samples;
@@ -303,6 +304,11 @@ The returned sessions carry the same `source.data_source_id`. In candidate mode,
 physiology comes only from the selected source: its sessions' values (the provider's first),
 else its own samples in that night.
 
+Recovery candidates combine only that provider's resting heart rate, HRV, SpO2, main sleep
+and recovery score, each group from its best-ranked device that holds it, so a provider's
+score without a device (WHOOP) shares the row of that provider's vitals. As with activity,
+`source.provider` identifies the provider, while the source and device fields are empty.
+
 ```python
 sleep_candidates = await ow.get_all(
     f"/api/v1/users/{user_id}/summaries/sleep",
@@ -312,6 +318,12 @@ sleep_candidates = await ow.get_all(
 )
 activity_candidates = await ow.get_all(
     f"/api/v1/users/{user_id}/summaries/activity",
+    start_date="2026-10-01",
+    end_date="2026-10-08",
+    source_selection="per_provider",
+)
+recovery_candidates = await ow.get_all(
+    f"/api/v1/users/{user_id}/summaries/recovery",
     start_date="2026-10-01",
     end_date="2026-10-08",
     source_selection="per_provider",

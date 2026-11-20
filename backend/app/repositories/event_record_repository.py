@@ -33,7 +33,15 @@ from app.constants.devices_map.device_types import APPLE_SOURCE_APP_PREFIX, is_a
 from app.constants.series_types.workout_detail_stats import WORKOUT_DETAIL_STATS
 from app.database import DbSession
 from app.integrations.rollup_queue import mark_dirty_days
-from app.models import DataSource, EventRecord, EventRecordAggregate, HealthScore, SleepDetails, WorkoutDetails
+from app.models import (
+    DataSource,
+    EventRecord,
+    EventRecordAggregate,
+    HealthScore,
+    SeriesTypeDefinition,
+    SleepDetails,
+    WorkoutDetails,
+)
 from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.local_day import utc_midnight
@@ -1123,6 +1131,39 @@ class EventRecordRepository(
             .all()
         )
         return [(provider, category, event_type, count) for provider, category, event_type, count in results]
+
+    def get_user_sleep_value_counts_by_provider_and_type(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_datetime: datetime | None = None,
+        end_datetime: datetime | None = None,
+    ) -> list[tuple[str, str, int]]:
+        """A user's provider values of a night (its lowest heart rate, its HRV, its SpO2), counted per provider and
+        series like samples are: they were samples before the aggregate tables, as provider day values were. A
+        window counts the nights that started in ``[start, end)``, as events are counted.
+
+        A workout's provider rows are left out: most hold its workout_details statistics, never samples.
+        """
+        query = (
+            db_session.query(DataSource.provider, SeriesTypeDefinition.code, func.count().label("count"))
+            .select_from(EventRecordAggregate)
+            .join(self.model, EventRecordAggregate.record_id == self.model.id)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .join(SeriesTypeDefinition, EventRecordAggregate.series_type_definition_id == SeriesTypeDefinition.id)
+            .filter(
+                DataSource.user_id == user_id,
+                self.model.category == EventCategory.SLEEP,
+                EventRecordAggregate.computed_by == ComputedBy.PROVIDER,
+            )
+        )
+        if start_datetime is not None:
+            query = query.filter(self.model.start_datetime >= start_datetime)
+        if end_datetime is not None:
+            query = query.filter(self.model.start_datetime < end_datetime)
+
+        rows = query.group_by(DataSource.provider, SeriesTypeDefinition.code).all()
+        return [(provider, code, count) for provider, code, count in rows]
 
     def get_user_workout_timeline_counts(
         self,

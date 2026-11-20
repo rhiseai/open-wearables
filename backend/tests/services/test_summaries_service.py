@@ -15,7 +15,14 @@ from app.models import DataSource, EventRecordAggregate, ProviderPriority
 from app.models.archival_setting import ArchivalSetting
 from app.repositories import AggregateRepository, EventRecordRepository, ProviderPriorityRepository
 from app.repositories.data_migration_repository import DataMigrationRepository
-from app.schemas.enums import ComputedBy, HealthScoreCategory, ProviderName, SeriesType, SummarySourceSelection
+from app.schemas.enums import (
+    ComputedBy,
+    HealthScoreCategory,
+    ProviderName,
+    SeriesType,
+    SummarySourceSelection,
+    get_series_type_id,
+)
 from app.services.priority_service import priority_service
 from app.services.summaries_service import SummariesService
 from app.utils.exceptions import InvalidCursorError
@@ -912,6 +919,145 @@ class TestRecoveryPagingPerDate:
             (self.DAYS[2], "whoop"),
             (self.DAYS[3], "whoop"),
         ]
+
+
+class TestRecoveryPerProvider:
+    """``per_provider``: one row per day and provider, from that provider's own devices only."""
+
+    START = _dt("2026-01-01T00:00:00+00:00")
+    END = _dt("2026-01-04T00:00:00+00:00")
+
+    @staticmethod
+    def _night(db: Session, source: Any, series_type: SeriesType, value: str) -> None:
+        """A main sleep ending 2026-01-02 that carries the provider's own value of the series, as Oura's history,
+        Withings and Suunto send a night's resting pulse."""
+        record = EventRecordFactory(
+            data_source=source,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T23:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T07:00:00+00:00"),
+            duration_seconds=8 * 3600,
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=record, is_nap=False)
+        AggregateRepository(EventRecordAggregate).upsert(
+            db,
+            [
+                {
+                    "record_id": record.id,
+                    "series_type_definition_id": get_series_type_id(series_type),
+                    "computed_by": ComputedBy.PROVIDER,
+                    "avg": Decimal(value),
+                    "count": 1,
+                }
+            ],
+        )
+
+    def _days(self, db: Session, service: SummariesService, user: Any) -> list:
+        return service.get_recovery_summaries(
+            db,
+            user.id,
+            self.START,
+            self.END,
+            cursor=None,
+            limit=10,
+            source_selection=SummarySourceSelection.PER_PROVIDER,
+        ).data
+
+    def test_each_provider_keeps_its_own_values(self, db: Session, service: SummariesService) -> None:
+        """Priority fills the winner's gaps from other providers; per provider, nothing crosses providers."""
+        user = UserFactory()
+        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin", device_type="watch")
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_type="ring")
+        apple = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        priority_service.update_provider_priority(db, ProviderName.GARMIN, 1)
+        priority_service.update_provider_priority(db, ProviderName.OURA, 2)
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 3)
+        day = date(2026, 1, 2)
+        provider_day(db, garmin, SeriesType.heart_rate_variability_rmssd, day, avg=Decimal("65"))
+        self._night(db, oura, SeriesType.resting_heart_rate, "48")
+        provider_day(db, apple, SeriesType.heart_rate_variability_sdnn, day, avg=Decimal("41"))
+
+        [priority] = service.get_recovery_summaries(db, user.id, self.START, self.END, cursor=None, limit=10).data
+        by_provider = {row.source.provider: row for row in self._days(db, service, user)}
+
+        assert (priority.source.provider, priority.avg_hrv_rmssd_ms) == ("garmin", 65.0)
+        assert (priority.resting_heart_rate_bpm, priority.avg_hrv_sdnn_ms) == (48, 41.0)
+        assert set(by_provider) == {"garmin", "oura", "apple"}
+        garmin_day, oura_day, apple_day = by_provider["garmin"], by_provider["oura"], by_provider["apple"]
+        assert (garmin_day.avg_hrv_rmssd_ms, garmin_day.resting_heart_rate_bpm, garmin_day.avg_hrv_sdnn_ms) == (
+            65.0,
+            None,
+            None,
+        )
+        assert (oura_day.resting_heart_rate_bpm, oura_day.sleep_duration_seconds) == (48, 8 * 3600)
+        assert (apple_day.avg_hrv_sdnn_ms, apple_day.resting_heart_rate_bpm) == (41.0, None)
+        assert all((row.source.source, row.source.device) == (None, None) for row in by_provider.values())
+
+    def test_a_score_without_a_source_shares_its_providers_row(self, db: Session, service: SummariesService) -> None:
+        """WHOOP's scores carry no data source; per provider they still land on the band's row."""
+        user = UserFactory()
+        band = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
+        provider_day(db, band, SeriesType.resting_heart_rate, date(2026, 1, 2), avg=Decimal("52"))
+        HealthScoreFactory(
+            user_id=user.id,
+            data_source_id=None,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            value=Decimal("70"),
+            recorded_at=_dt("2026-01-02T08:00:00+00:00"),
+            zone_offset="+00:00",
+        )
+
+        [day] = self._days(db, service, user)
+
+        assert (day.source.provider, day.resting_heart_rate_bpm, day.recovery_score) == ("whoop", 52, 70)
+
+    @pytest.mark.parametrize("limit", [1, 2])
+    def test_pages_a_day_two_providers_share_once_each_way(
+        self, db: Session, service: SummariesService, limit: int
+    ) -> None:
+        """Apple's writer sorts after Garmin's, the provider before it: a page runs in provider order."""
+        user = UserFactory()
+        for provider, writer in ((ProviderName.APPLE, "zepp life"), (ProviderName.GARMIN, "garmin")):
+            source = DataSourceFactory(user=user, provider=provider, source=writer)
+            for offset in range(2):
+                provider_day(db, source, SeriesType.resting_heart_rate, date(2026, 1, 2 + offset), avg=Decimal("50"))
+        # Read the providers back as a request does, plain strings, not the enums the factory set.
+        db.expire_all()
+
+        seen: list[tuple[date, str]] = []
+        pages = []
+        cursor = None
+        while True:
+            page = service.get_recovery_summaries(
+                db,
+                user.id,
+                self.START,
+                self.END,
+                cursor=cursor,
+                limit=limit,
+                source_selection=SummarySourceSelection.PER_PROVIDER,
+            )
+            pages.append(page)
+            seen += [(row.date, row.source.provider) for row in page.data]
+            if not page.pagination.next_cursor:
+                break
+            cursor = page.pagination.next_cursor
+        back = service.get_recovery_summaries(
+            db,
+            user.id,
+            self.START,
+            self.END,
+            cursor=pages[-1].pagination.previous_cursor,
+            limit=limit,
+            source_selection=SummarySourceSelection.PER_PROVIDER,
+        )
+
+        days = [date(2026, 1, 2), date(2026, 1, 3)]
+        assert seen == [(day, provider) for day in days for provider in ("apple", "garmin")]
+        assert sorted((row.date, row.source.provider) for row in back.data) == seen[-2 * limit : -limit]
 
 
 # ---------------------------------------------------------------------------
