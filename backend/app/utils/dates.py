@@ -2,9 +2,10 @@ import re
 from contextlib import suppress
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Annotated
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Query
-from pydantic import BeforeValidator, Field
+from pydantic import AfterValidator, BeforeValidator, Field
 
 from app.utils.exceptions import DatetimeParseError
 
@@ -42,6 +43,31 @@ ZoneOffset = Annotated[
         max_length=10,
     ),
     BeforeValidator(_normalize_zone_offset),
+]
+
+
+def _iana_timezone(name: str | None) -> str | None:
+    if name is None:
+        return None
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as error:
+        raise ValueError(f"Unknown IANA time zone: '{name}'") from error
+    return name
+
+
+FallbackTimezoneQueryParam = Annotated[
+    str | None,
+    Query(
+        description=(
+            "IANA time zone of the user, e.g. `America/New_York`. Rows that carry no UTC offset "
+            "of their own (most Apple Health samples) are placed on their local day in this zone; "
+            "without it they fall on their UTC day. Rows with their own offset keep it."
+        ),
+        examples=["America/New_York"],
+        max_length=64,
+    ),
+    AfterValidator(_iana_timezone),
 ]
 
 
