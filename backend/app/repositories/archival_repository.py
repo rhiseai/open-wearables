@@ -159,6 +159,13 @@ class DataPointSeriesArchiveRepository:
         invocation will continue where this one left off.
 
         Returns the number of live rows removed, and whether none older are left.
+
+        The ``date`` of a bucket is the UTC date of ``recorded_at``: a row's own
+        ``zone_offset`` is not applied, and OW stores no zone for the user. An
+        evening sample west of UTC is archived on the next day, and the summaries'
+        ``timezone`` parameter cannot move it, since the live rows are gone
+        (RHISE-8109). Archived days stay as they are; re-dating them needs the
+        user's zone at archive time, a product decision.
         """
         total_deleted = 0
         start_time = time.monotonic()

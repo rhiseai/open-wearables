@@ -1074,11 +1074,23 @@ class EventRecordService(
             ),
         )
 
-    def _winning_sleep_ids(self, db_session: DbSession, user_id: UUID, params: EventRecordQueryParams) -> Query:
-        """An inline subquery of the top-priority source's sessions per night."""
+    def _winning_sleep_ids(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        params: EventRecordQueryParams,
+        fallback_timezone: str | None,
+    ) -> Query:
+        """An inline subquery of the top-priority source's sessions per night.
+
+        A night is the local date of its wake; a session without its own offset is
+        dated in ``fallback_timezone``, else on its UTC date (RHISE-8109).
+        """
         provider_order = self.provider_priority_repo.get_priority_order(db_session)
         device_type_order = self.device_type_priority_repo.get_priority_order(db_session)
-        return self.crud.winning_sleep_record_ids(db_session, str(user_id), params, provider_order, device_type_order)
+        return self.crud.winning_sleep_record_ids(
+            db_session, str(user_id), params, provider_order, device_type_order, fallback_timezone
+        )
 
     @handle_exceptions
     def get_sleep_totals(
@@ -1087,8 +1099,11 @@ class EventRecordService(
         user_id: UUID,
         params: EventRecordQueryParams,
         filter_by_priority: bool = False,
+        fallback_timezone: str | None = None,
     ) -> SleepTotals:
-        restrict = self._winning_sleep_ids(db_session, user_id, params) if filter_by_priority else None
+        restrict = (
+            self._winning_sleep_ids(db_session, user_id, params, fallback_timezone) if filter_by_priority else None
+        )
         count, naps, asleep, in_bed, efficiency = self.crud.get_sleep_totals(
             db_session, params, str(user_id), restrict_to_record_ids=restrict
         )
@@ -1108,10 +1123,13 @@ class EventRecordService(
         params: EventRecordQueryParams,
         filter_by_priority: bool = False,
         include: Sequence[SleepInclude] = (),
+        fallback_timezone: str | None = None,
     ) -> PaginatedResponse[SleepSession]:
         params.category = EventCategory.SLEEP
         with_stages = SleepInclude.STAGES in include
-        restrict_to_record_ids = self._winning_sleep_ids(db_session, user_id, params) if filter_by_priority else None
+        restrict_to_record_ids = (
+            self._winning_sleep_ids(db_session, user_id, params, fallback_timezone) if filter_by_priority else None
+        )
 
         records, total_count = self._get_records_with_filters(
             db_session, params, str(user_id), restrict_to_record_ids=restrict_to_record_ids
