@@ -35,6 +35,7 @@ from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSour
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
 from app.repositories.repositories import (
     CrudRepository,
+    local_wall_clock,
     source_filter_conditions,
     source_priority_order,
     utc_bucket_start,
@@ -762,6 +763,7 @@ class EventRecordRepository(
         query_params: EventRecordQueryParams,
         provider_order: dict,
         device_type_order: dict,
+        fallback_timezone: str | None = None,
     ) -> Query:
         """Subquery of sleep record ids belonging to the top-priority source per night.
 
@@ -775,8 +777,7 @@ class EventRecordRepository(
         and keep dedup + pagination in a single SQL statement.
         """
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(EventRecord.end_datetime, EventRecord.zone_offset, fallback_timezone), Date
         )
         filters = [
             DataSource.user_id == UUID(user_id),
@@ -975,6 +976,7 @@ class EventRecordRepository(
         provider_order: dict[ProviderName, int],
         device_type_order: dict[DeviceType, int],
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """Get daily sleep summaries: per date, the aggregate of its highest-priority source.
 
@@ -996,8 +998,7 @@ class EventRecordRepository(
         # date logic in fill_missing_sleep_scores_task so chart, score, and
         # session list all key on the same date.
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(EventRecord.end_datetime, EventRecord.zone_offset, fallback_timezone), Date
         )
 
         per_provider = source_selection == SummarySourceSelection.PER_PROVIDER
@@ -1241,7 +1242,9 @@ class EventRecordRepository(
 
         # Attach per-session breakdown (individual sleep/nap records) for each summary,
         # keyed by the same (date, provider, source, device_model) grouping identity.
-        sessions_by_key = self._get_sleep_sessions(db_session, user_id, start_date, end_date, source_selection)
+        sessions_by_key = self._get_sleep_sessions(
+            db_session, user_id, start_date, end_date, source_selection, fallback_timezone
+        )
         for summary in summaries:
             key = (
                 (summary["sleep_date"], summary["data_source_id"])
@@ -1264,6 +1267,7 @@ class EventRecordRepository(
         start_date: datetime,
         end_date: datetime,
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> dict[tuple, list[dict]]:
         """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model).
 
@@ -1273,8 +1277,7 @@ class EventRecordRepository(
         duration, matching the aggregate duration logic. Sessions are sorted by start time.
         """
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(EventRecord.end_datetime, EventRecord.zone_offset, fallback_timezone), Date
         )
         is_nap_expr = func.coalesce(SleepDetails.is_nap, False)
         duration_seconds = case(
@@ -1341,6 +1344,7 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """Get daily workout aggregates including elevation, distance, and energy.
 
@@ -1351,8 +1355,7 @@ class EventRecordRepository(
         - elevation_meters, distance_meters, energy_burned_kcal
         """
         local_workout_date = cast(
-            self.model.end_datetime + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(self.model.end_datetime, self.model.zone_offset, fallback_timezone), Date
         )
 
         results = (

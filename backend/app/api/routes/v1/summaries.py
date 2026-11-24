@@ -16,7 +16,12 @@ from app.schemas.responses.dashboard import UserDataSummaryResponse, UserDataTim
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep, system_info_service
 from app.services.summaries_service import summaries_service
-from app.utils.dates import DateTimeQueryParam, parse_query_datetime, parse_query_end_datetime
+from app.utils.dates import (
+    DateTimeQueryParam,
+    FallbackTimezoneQueryParam,
+    parse_query_datetime,
+    parse_query_end_datetime,
+)
 from app.utils.pagination import DEFAULT_PAGE_SIZE, PageLimitQueryParam
 
 router = APIRouter()
@@ -33,6 +38,7 @@ def get_activity_summary(
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
     source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
@@ -41,7 +47,15 @@ def get_activity_summary(
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, source_selection=source_selection
+        db,
+        user_id,
+        start_datetime,
+        end_datetime,
+        cursor,
+        limit,
+        sort_order,
+        source_selection=source_selection,
+        fallback_timezone=timezone,
     )
 
 
@@ -52,6 +66,7 @@ def get_activity_totals(
     end_date: DateTimeQueryParam,
     db: DbSession,
     _api_key: ApiKeyDep,
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> ActivityTotals:
     """Returns the period's daily activity added up: days, steps, distance and active energy.
 
@@ -59,7 +74,7 @@ def get_activity_totals(
     so a total matches what paging through them would add up to.
     """
     return summaries_service.get_activity_totals(
-        db, user_id, parse_query_datetime(start_date), parse_query_end_datetime(end_date)
+        db, user_id, parse_query_datetime(start_date), parse_query_end_datetime(end_date), fallback_timezone=timezone
     )
 
 
@@ -73,12 +88,20 @@ def get_sleep_summary(
     cursor: str | None = None,
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
     source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> PaginatedResponse[SleepSummary]:
     """Returns daily sleep metrics."""
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
     return summaries_service.get_sleep_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, source_selection=source_selection
+        db,
+        user_id,
+        start_datetime,
+        end_datetime,
+        cursor,
+        limit,
+        source_selection=source_selection,
+        fallback_timezone=timezone,
     )
 
 

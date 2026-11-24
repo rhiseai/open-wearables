@@ -1922,3 +1922,126 @@ class TestDataTimelineEndpoint:
         )
 
         assert response.status_code == 400
+
+
+class TestFallbackTimezone:
+    """Rows without their own zone_offset fall on the user's day when a timezone is passed (RHISE-8097)."""
+
+    @staticmethod
+    def _get(client: TestClient, path: str, user_id: object, params: dict[str, str]) -> dict:
+        api_key = ApiKeyFactory()
+        response = client.get(
+            f"/api/v1/users/{user_id}/summaries/{path}", headers=api_key_headers(api_key.plain_key), params=params
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    @staticmethod
+    def _new_york_steps() -> tuple[object, object]:
+        """Apple Health steps with no zone_offset around a New York evening (UTC-5)."""
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, source="apple")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        for recorded_at, steps in (
+            (datetime(2026, 11, 16, 15, 0, tzinfo=timezone.utc), 4000),  # 10:00 on the 16th in New York
+            (datetime(2026, 11, 17, 1, 0, tzinfo=timezone.utc), 300),  # 20:00 on the 16th in New York
+            (datetime(2026, 11, 17, 15, 0, tzinfo=timezone.utc), 200),  # 10:00 on the 17th in New York
+        ):
+            DataPointSeriesFactory(
+                mapping=mapping, series_type=steps_type, value=Decimal(steps), recorded_at=recorded_at
+            )
+        return user, mapping
+
+    def test_steps_fall_on_the_users_day(self, client: TestClient, db: Session) -> None:
+        user, _ = self._new_york_steps()
+        params = {"start_date": "2026-11-16", "end_date": "2026-11-17"}
+
+        utc_days = self._get(client, "activity", user.id, params)["data"]
+        local_days = self._get(client, "activity", user.id, params | {"timezone": "America/New_York"})["data"]
+
+        assert [(d["date"], d["steps"]) for d in utc_days] == [("2026-11-16", 4000), ("2026-11-17", 500)]
+        assert [(d["date"], d["steps"]) for d in local_days] == [("2026-11-16", 4300), ("2026-11-17", 200)]
+
+    def test_step_minutes_follow_the_same_day(self, client: TestClient, db: Session) -> None:
+        user, _ = self._new_york_steps()
+        params = {"start_date": "2026-11-16", "end_date": "2026-11-17", "timezone": "America/New_York"}
+
+        days = {d["date"]: d for d in self._get(client, "activity", user.id, params)["data"]}
+
+        assert days["2026-11-16"]["active_minutes"] == 2
+        assert days["2026-11-17"]["active_minutes"] == 1
+
+    def test_a_row_keeps_its_own_zone_offset(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, source="garmin")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        # 23:30 UTC on the 16th is 00:30 on the 17th at +01:00, whatever the fallback zone says.
+        DataPointSeriesFactory(
+            mapping=mapping,
+            series_type=steps_type,
+            value=Decimal("700"),
+            recorded_at=datetime(2026, 11, 16, 23, 30, tzinfo=timezone.utc),
+            zone_offset="+01:00",
+        )
+        params = {"start_date": "2026-11-16", "end_date": "2026-11-17", "timezone": "America/New_York"}
+
+        days = self._get(client, "activity", user.id, params)["data"]
+
+        assert [(d["date"], d["steps"]) for d in days] == [("2026-11-17", 700)]
+
+    def test_totals_use_the_users_day(self, client: TestClient, db: Session) -> None:
+        user, _ = self._new_york_steps()
+        params = {"start_date": "2026-11-17", "end_date": "2026-11-17"}
+
+        utc_total = self._get(client, "activity/totals", user.id, params)
+        local_total = self._get(client, "activity/totals", user.id, params | {"timezone": "America/New_York"})
+
+        assert utc_total["steps"] == 500
+        assert local_total["steps"] == 200
+
+    def test_daylight_saving_shift_is_followed(self, client: TestClient, db: Session) -> None:
+        """New York is UTC-4 in summer: 03:30 UTC on 1 July is still 30 June there."""
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, source="apple")
+        DataPointSeriesFactory(
+            mapping=mapping,
+            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
+            value=Decimal("100"),
+            recorded_at=datetime(2026, 7, 1, 3, 30, tzinfo=timezone.utc),
+        )
+        params = {"start_date": "2026-06-30", "end_date": "2026-07-01", "timezone": "America/New_York"}
+
+        days = self._get(client, "activity", user.id, params)["data"]
+
+        assert [(d["date"], d["steps"]) for d in days] == [("2026-06-30", 100)]
+
+    def test_sleep_without_zone_offset_wakes_on_the_users_day(self, client: TestClient, db: Session) -> None:
+        """Waking at 07:00 in Tokyo is 22:00 UTC the evening before."""
+        user = UserFactory()
+        mapping = DataSourceFactory(user=user, source="apple")
+        sleep_start = datetime(2026, 5, 4, 14, 0, tzinfo=timezone.utc)
+        sleep_end = datetime(2026, 5, 4, 22, 0, tzinfo=timezone.utc)
+        EventRecordFactory(
+            mapping=mapping,
+            category="sleep",
+            start_datetime=sleep_start,
+            end_datetime=sleep_end,
+            duration_seconds=int((sleep_end - sleep_start).total_seconds()),
+        )
+        params = {"start_date": "2026-05-04", "end_date": "2026-05-05"}
+
+        utc_nights = self._get(client, "sleep", user.id, params)["data"]
+        local_nights = self._get(client, "sleep", user.id, params | {"timezone": "Asia/Tokyo"})["data"]
+
+        assert [n["date"] for n in utc_nights] == ["2026-05-04"]
+        assert [n["date"] for n in local_nights] == ["2026-05-05"]
+
+    def test_unknown_timezone_is_rejected(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        api_key = ApiKeyFactory()
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(api_key.plain_key),
+            params={"start_date": "2026-11-16", "end_date": "2026-11-17", "timezone": "Mars/Olympus"},
+        )
+        assert response.status_code in (400, 422)
