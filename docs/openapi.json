@@ -2948,6 +2948,28 @@
             "description": "When true, keep only the highest-priority source's sessions per sleep date (provider/device priority, same ranking as summaries). Defaults to false for backwards compatibility."
           },
           {
+            "name": "timezone",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "IANA time zone of the user, e.g. `America/New_York`. Rows that carry no UTC offset of their own (most Apple Health samples) are placed on their local day in this zone; without it they fall on their UTC day. Rows with their own offset keep it.",
+              "examples": [
+                "America/New_York"
+              ],
+              "title": "Timezone"
+            },
+            "description": "IANA time zone of the user, e.g. `America/New_York`. Rows that carry no UTC offset of their own (most Apple Health samples) are placed on their local day in this zone; without it they fall on their UTC day. Rows with their own offset keep it."
+          },
+          {
             "name": "X-Open-Wearables-API-Key",
             "in": "header",
             "required": false,
@@ -3138,6 +3160,28 @@
               "title": "Filter By Priority"
             },
             "description": "When true, keep only the highest-priority source's sessions per sleep date (provider/device priority, same ranking as summaries). Defaults to false for backwards compatibility."
+          },
+          {
+            "name": "timezone",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "IANA time zone of the user, e.g. `America/New_York`. Rows that carry no UTC offset of their own (most Apple Health samples) are placed on their local day in this zone; without it they fall on their UTC day. Rows with their own offset keep it.",
+              "examples": [
+                "America/New_York"
+              ],
+              "title": "Timezone"
+            },
+            "description": "IANA time zone of the user, e.g. `America/New_York`. Rows that carry no UTC offset of their own (most Apple Health samples) are placed on their local day in this zone; without it they fall on their UTC day. Rows with their own offset keep it."
           },
           {
             "name": "X-Open-Wearables-API-Key",

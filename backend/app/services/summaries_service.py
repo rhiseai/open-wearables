@@ -361,6 +361,9 @@ class SummariesService:
         If archival is enabled, some days may only have data in the archive table.
         This method queries the archive and merges rows, preferring live data when
         both exist for the same (date, provider, source, device_model) key.
+
+        Archived rows are UTC-day buckets (``archive_data_before``): the
+        ``fallback_timezone`` of the live rows does not reach them (RHISE-8109).
         """
         try:
             self.archival_settings_repo.get(db_session)

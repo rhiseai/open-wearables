@@ -17,7 +17,12 @@ from app.schemas.responses.activity import (
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep
 from app.services.event_record_service import event_record_service
-from app.utils.dates import DateTimeQueryParam, parse_query_datetime, parse_query_end_datetime
+from app.utils.dates import (
+    DateTimeQueryParam,
+    FallbackTimezoneQueryParam,
+    parse_query_datetime,
+    parse_query_end_datetime,
+)
 from app.utils.pagination import DEFAULT_PAGE_SIZE, PageLimitQueryParam
 
 router = APIRouter()
@@ -131,6 +136,7 @@ def list_sleep_sessions(
     data_source_id: UUID | None = None,
     is_nap: IsNapQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> PaginatedResponse[SleepSession]:
     """Returns sleep sessions (including naps)."""
     params = EventRecordQueryParams(
@@ -145,7 +151,7 @@ def list_sleep_sessions(
         is_nap=is_nap,
     )
     return event_record_service.get_sleep_sessions(
-        db, user_id, params, filter_by_priority=filter_by_priority, include=include
+        db, user_id, params, filter_by_priority=filter_by_priority, include=include, fallback_timezone=timezone
     )
 
 
@@ -162,6 +168,7 @@ def get_sleep_totals(
     data_source_id: UUID | None = None,
     is_nap: IsNapQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> SleepTotals:
     """Returns the count, naps, time asleep, time in bed and mean efficiency of the sessions.
 
@@ -179,7 +186,9 @@ def get_sleep_totals(
         data_source_id=data_source_id,
         is_nap=is_nap,
     )
-    return event_record_service.get_sleep_totals(db, user_id, params, filter_by_priority=filter_by_priority)
+    return event_record_service.get_sleep_totals(
+        db, user_id, params, filter_by_priority=filter_by_priority, fallback_timezone=timezone
+    )
 
 
 @router.get("/users/{user_id}/events/menstrual-cycles")
