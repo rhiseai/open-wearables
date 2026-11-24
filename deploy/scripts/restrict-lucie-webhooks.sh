@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Keep Lucie's webhook endpoint subscribed to the three event types it handles.
+# Keep Lucie's webhook endpoint subscribed to the event types it handles.
+# body_composition.created carries weigh-ins to Lucie's weight goals (RHISE-8086).
 #
 # This runs on the host, at the end of a deploy, rather than in CI: it needs
 # the admin credentials, and the whole point of RHISE-3839 is that credentials
@@ -17,7 +18,7 @@ SECRET_PREFIX="${OW_SECRET_PREFIX:-lucie-staging/ow}"
 OW_DOMAIN="${OW_DOMAIN:-ow-staging.getlucie.ai}"
 OW_API_BASE="https://${OW_DOMAIN}/api"
 LUCIE_ENDPOINT_PATTERN='^https://[^/]*getlucie\.ai/(api/v1/)?webhooks/ow/?$'
-FILTER_TYPES='["sleep.created","sleep.updated","connection.created"]'
+FILTER_TYPES='["sleep.created","sleep.updated","connection.created","body_composition.created"]'
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-eusc-de-east-1}"
 
 log()  { printf '\033[1;36m[webhooks]\033[0m %s\n' "$*"; }
