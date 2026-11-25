@@ -122,5 +122,14 @@ echo "Starting the FastAPI application..."
 if [ "$ENVIRONMENT" = "local" ]; then
     exec uv run fastapi dev app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
 else
-    exec uv run fastapi run app/main.py --host 0.0.0.0 --port "${API_PORT:-8000}"
+    # uvicorn itself rather than `fastapi run`, which cannot set the keep-alive
+    # timeout (uvicorn.run reads no UVICORN_* variable either). The proxy in front
+    # must be the side that closes an idle connection: at uvicorn's default of
+    # 5 s the backend closed first, and a request the proxy sent into a
+    # connection the backend had just closed came back to the caller as a 502
+    # (RHISE-8164). 105 s outlasts both proxies: the production ALB keeps idle
+    # connections 60 s (lucie infra, aws_lb.openwearables) and staging's Traefik
+    # 90 s (its default idleConnTimeout, deploy/docker-compose.yml). Proxy
+    # headers stay on, as `fastapi run` had them.
+    exec uv run uvicorn app.main:api --host 0.0.0.0 --port "${API_PORT:-8000}" --timeout-keep-alive 105
 fi
