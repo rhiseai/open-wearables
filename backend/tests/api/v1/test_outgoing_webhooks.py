@@ -7,21 +7,34 @@ Covers:
 - outgoing_webhooks API router (#722-726)
 """
 
-from __future__ import annotations
-
 import re
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from kombu.exceptions import EncodeError
+from pytest_mock import MockerFixture
 from sqlalchemy.orm import Session
+from svix.api import (
+    Endpoint,
+    EndpointOut,
+    EventType,
+    EventTypeOut,
+    ListResponseEndpointOut,
+    ListResponseEventTypeOut,
+    ListResponseMessageAttemptOut,
+    Message,
+    MessageOut,
+    Svix,
+)
 
 from app.config import settings
 from app.integrations.celery.tasks.emit_webhook_event_task import emit_webhook_event
+from app.models import Developer
 from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
 from app.schemas.sync_status import SyncRunContext, SyncScope, SyncSource
@@ -46,6 +59,27 @@ from tests.factories import DeveloperFactory, UserFactory
 
 # Svix eventId charset: colons/plus signs from ISO 8601 timestamps must not survive.
 _SVIX_ID_SAFE_RE = re.compile(r"^[a-zA-Z0-9\-_.]+$")
+
+_NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _endpoint_out(endpoint_id: str, **fields: Any) -> EndpointOut:
+    defaults: dict[str, Any] = {"url": "https://example.com/wh", "description": "", "metadata": {}}
+    return EndpointOut(id=endpoint_id, created_at=_NOW, updated_at=_NOW, **(defaults | fields))
+
+
+def _message(message_id: str) -> MessageOut:
+    return MessageOut(id=message_id, event_type="workout.created", payload={}, timestamp=_NOW)
+
+
+def _svix_client() -> MagicMock:
+    """A Svix client mock; its API groups are properties, which autospec does not follow."""
+    client = create_autospec(Svix, instance=True)
+    client.endpoint = create_autospec(Endpoint, instance=True)
+    client.event_type = create_autospec(EventType, instance=True)
+    client.message = create_autospec(Message, instance=True)
+    return client
+
 
 # ---------------------------------------------------------------------------
 # WebhookEventType enum
@@ -73,13 +107,13 @@ class TestWebhookEmit:
         # Dispatch only fires when webhooks are enabled; these tests assert it does.
         # Subscription gating has its own tests, so timeseries events are always on here.
         with (
-            patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True),
+            patch("app.services.outgoing_webhooks.svix.is_enabled", autospec=True, return_value=True),
             patch.object(settings, "outgoing_webhooks_timeseries_events", "all"),
         ):
             yield
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_workout_created_dispatches(self, mock_task: MagicMock) -> None:
+    def test_on_workout_created_dispatches(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         rid = uuid4()
         on_workout_created(
@@ -107,8 +141,8 @@ class TestWebhookEmit:
         assert args.kwargs["args"][1]["data"]["distance_meters"] == 10000.0
         assert args.kwargs["args"][1]["data"]["avg_heart_rate_bpm"] == 155
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_sleep_created_dispatches(self, mock_task: MagicMock) -> None:
+    def test_on_sleep_created_dispatches(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         rid = uuid4()
         on_sleep_created(
@@ -141,13 +175,13 @@ class TestWebhookEmit:
         assert args.kwargs["args"][1]["data"]["source"]["device_type"] == "ring"
         assert args.kwargs["args"][1]["data"]["source"]["device_name"] == "Oura Ring Gen3"
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_sleep_created_idempotency_key_is_content_aware(self, mock_task: MagicMock) -> None:
+    def test_on_sleep_created_idempotency_key_is_content_aware(self, mocker: MockerFixture) -> None:
         """Same session finalized (different content) must get a distinct idempotency key.
 
         Keying on record_id alone would let Svix dedup the finalized update, leaving
         consumers on the first partial reading. Identical content still dedups.
         """
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid, rid = uuid4(), uuid4()
 
         def _emit(*, duration_seconds: float, efficiency_percent: float) -> str:
@@ -174,8 +208,8 @@ class TestWebhookEmit:
         assert stub_key != final_key  # finalized content → new key → delivered
         assert final_key == retry_key  # identical retry → same key → deduped
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_timeseries_batch_saved_dispatches(self, mock_task: MagicMock) -> None:
+    def test_on_timeseries_batch_saved_dispatches(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         samples = [
             {
@@ -218,9 +252,9 @@ class TestWebhookEmit:
         assert data["samples"][1]["value"] == 65.0
         assert "chunk_index" not in data
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_timeseries_batch_saved_without_samples(self, mock_task: MagicMock) -> None:
+    def test_on_timeseries_batch_saved_without_samples(self, mocker: MockerFixture) -> None:
         """Backward-compatible call without samples still dispatches correctly."""
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         on_timeseries_batch_saved(
             user_id=uid,
@@ -236,9 +270,9 @@ class TestWebhookEmit:
         assert data["samples"] == []
         assert data["sample_count"] == 100
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_timeseries_batch_saved_chunks_large_payload(self, mock_task: MagicMock) -> None:
+    def test_on_timeseries_batch_saved_chunks_large_payload(self, mocker: MockerFixture) -> None:
         """Batches are split by exact JSON bytes, never an estimated sample count."""
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         large_samples = [
             {
@@ -398,8 +432,8 @@ class TestWebhookEmit:
         assert summary["emitted"] == 65
         assert summary["suppressed"] == 0
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_timeseries_skips_unmapped_series_type(self, mock_task: MagicMock) -> None:
+    def test_on_timeseries_skips_unmapped_series_type(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         on_timeseries_batch_saved(
             user_id=uid,
@@ -409,8 +443,8 @@ class TestWebhookEmit:
         )
         mock_task.send_task.assert_not_called()
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_connection_created_dispatches(self, mock_task: MagicMock) -> None:
+    def test_on_connection_created_dispatches(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         cid = uuid4()
         on_connection_created(
@@ -427,8 +461,8 @@ class TestWebhookEmit:
         # connected_at's colons/offset must not leak into the Svix event_id
         assert _SVIX_ID_SAFE_RE.match(args.kwargs["kwargs"]["idempotency_key"])
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_on_connection_revoked_dispatches(self, mock_task: MagicMock) -> None:
+    def test_on_connection_revoked_dispatches(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         cid = uuid4()
         on_connection_revoked(
@@ -454,6 +488,7 @@ class TestWebhookEmit:
 
         with patch(
             "app.services.outgoing_webhooks.events.celery_app",
+            autospec=True,
         ) as mock_task:
             mock_task.send_task.side_effect = ConnectionError("Redis not available")
             # Should NOT raise
@@ -463,7 +498,7 @@ class TestWebhookEmit:
         """With OUTGOING_WEBHOOKS_ENABLED off, nothing is enqueued."""
         with (
             patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=False),
-            patch("app.services.outgoing_webhooks.events.celery_app") as mock_task,
+            patch("app.services.outgoing_webhooks.events.celery_app", autospec=True) as mock_task,
         ):
             on_connection_created(
                 user_id=uuid4(),
@@ -480,24 +515,23 @@ class TestWebhookEmit:
 
 
 class TestEmitWebhookEventTask:
-    @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
-    def test_invalid_payload_never_reaches_svix(self, mock_svix: MagicMock) -> None:
+    def test_invalid_payload_never_reaches_svix(self, mocker: MockerFixture) -> None:
+        mock_svix = mocker.patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service", autospec=True)
+
         result = emit_webhook_event("sleep.created", {"data": {}})
 
         assert result["errors"] == ["invalid_payload"]
         mock_svix.send.assert_not_called()
 
-    @patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service")
-    @patch("app.integrations.celery.tasks.emit_webhook_event_task.developer_service")
-    def test_sends_to_all_developers(
-        self,
-        mock_dev_service: MagicMock,
-        mock_svix: MagicMock,
-    ) -> None:
-        dev1 = MagicMock(id=uuid4(), email="dev1@test.com")
-        dev2 = MagicMock(id=uuid4(), email="dev2@test.com")
+    def test_sends_to_all_developers(self, mocker: MockerFixture) -> None:
+        mock_dev_service = mocker.patch(
+            "app.integrations.celery.tasks.emit_webhook_event_task.developer_service", autospec=True
+        )
+        mock_svix = mocker.patch("app.integrations.celery.tasks.emit_webhook_event_task.svix_service", autospec=True)
+        dev1 = Developer(id=uuid4(), email="dev1@test.com")
+        dev2 = Developer(id=uuid4(), email="dev2@test.com")
         mock_dev_service.crud.get_all.return_value = [dev1, dev2]
-        mock_svix.send.return_value = MagicMock(id="msg_123")
+        mock_svix.send.return_value = _message("msg_123")
 
         result = emit_webhook_event(
             "workout.created",
@@ -524,10 +558,11 @@ class TestOutgoingWebhooksAPI:
     @pytest.fixture(autouse=True)
     def mock_svix(self) -> Any:
         """Mock svix_webhook_service to avoid needing a real Svix server."""
-        with patch("app.api.routes.v1.outgoing_webhooks.svix_service") as m:
+        with patch("app.api.routes.v1.outgoing_webhooks.svix_service", autospec=True) as m:
             m.is_enabled.return_value = True
             m.ensure_application.return_value = "app_uid_123"
             m.user_id_from_endpoint.return_value = None
+            m.event_types = svix_service.event_types  # calls no Svix server
             yield m
 
     def test_list_event_types(self, client: TestClient) -> None:
@@ -539,6 +574,21 @@ class TestOutgoingWebhooksAPI:
         assert "workout.created" in names
         assert "sleep.created" in names
 
+    def test_extension_event_types_are_listed(self, client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "app.services.outgoing_webhooks.svix.collect_webhook_event_types",
+            lambda: {"my_extension.thing.created": "A thing was created."},
+        )
+
+        data = client.get("/api/v1/webhooks/event-types").json()
+
+        assert data[-1] == {
+            "name": "my_extension.thing.created",
+            "description": "A thing was created.",
+            "child_events": None,
+        }
+        assert len(data) == len(WebhookEventType) + 1
+
     def test_create_endpoint(
         self,
         client: TestClient,
@@ -549,7 +599,7 @@ class TestOutgoingWebhooksAPI:
 
         token = create_access_token(developer.id)
 
-        ep_out = MagicMock(id="ep_123", url="https://example.com/wh", description="test", filter_types=None)
+        ep_out = _endpoint_out("ep_123", url="https://example.com/wh", description="test")
         mock_svix.create_endpoint.return_value = ep_out
 
         resp = client.post(
@@ -573,8 +623,8 @@ class TestOutgoingWebhooksAPI:
         token = create_access_token(developer.id)
 
         mock_svix.iter_endpoints.return_value = [
-            MagicMock(id="ep_1", url="https://a.com/wh", description="a", filter_types=None),
-            MagicMock(id="ep_2", url="https://b.com/wh", description="b", filter_types=["workout.created"]),
+            _endpoint_out("ep_1", url="https://a.com/wh", description="a"),
+            _endpoint_out("ep_2", url="https://b.com/wh", description="b", event_types=["workout.created"]),
         ]
 
         resp = client.get(
@@ -630,7 +680,7 @@ class TestOutgoingWebhooksAPI:
 
         token = create_access_token(developer.id)
 
-        mock_svix.send_test_message.return_value = MagicMock(id="msg_test_1")
+        mock_svix.send_test_message.return_value = _message("msg_test_1")
 
         resp = client.post(
             "/api/v1/webhooks/endpoints/ep_123/test",
@@ -670,7 +720,7 @@ class TestOutgoingWebhooksAPI:
 
 @pytest.fixture
 def mock_client() -> Generator[MagicMock, None, None]:
-    mock = MagicMock()
+    mock = _svix_client()
     with patch("app.services.outgoing_webhooks.svix._client", mock):
         yield mock
 
@@ -728,8 +778,8 @@ class TestSvixDeliveryContent:
 
     def test_list_attempts_requests_response_body(self, client: TestClient, db: Session) -> None:
         token = create_access_token(DeveloperFactory().id)
-        with patch("app.api.routes.v1.outgoing_webhooks.svix_service") as svix:
-            svix.list_message_attempts.return_value = MagicMock(data=[], done=True, iterator=None, prev_iterator=None)
+        with patch("app.api.routes.v1.outgoing_webhooks.svix_service", autospec=True) as svix:
+            svix.list_message_attempts.return_value = ListResponseMessageAttemptOut(data=[], done=True, iterator=None)
 
             resp = client.get(
                 "/api/v1/webhooks/endpoints/ep_1/attempts",
@@ -750,7 +800,7 @@ class TestSvixPayloadRetention:
         assert mock_client.message.create.call_args.args[1].payload_retention_period == 12
 
     def test_send_test_message_sets_payload_retention(self, mock_client: MagicMock) -> None:
-        mock_client.endpoint.get.return_value = MagicMock(event_types=None)
+        mock_client.endpoint.get.return_value = _endpoint_out("ep_1")
         with patch.object(svix_service.settings, "outgoing_webhook_payload_retention_days", 12):
             svix_service.send_test_message("app_1", "ep_1", "workout.created")
 
@@ -776,16 +826,11 @@ class TestUpdateEndpointClearingContract:
 
     @pytest.fixture(autouse=True)
     def mock_svix(self) -> Any:
-        with patch("app.api.routes.v1.outgoing_webhooks.svix_service") as m:
+        with patch("app.api.routes.v1.outgoing_webhooks.svix_service", autospec=True) as m:
             m.is_enabled.return_value = True
             m.ensure_application.return_value = "app_uid_123"
             m.user_id_from_endpoint.return_value = None
-            m.patch_endpoint.return_value = MagicMock(
-                id="ep_123",
-                url="https://example.com/wh",
-                description="",
-                filter_types=None,
-            )
+            m.patch_endpoint.return_value = _endpoint_out("ep_123")
             yield m
 
     def _patch(self, client: TestClient, body: dict[str, Any]) -> Any:
@@ -843,11 +888,11 @@ class TestUpdateEndpointClearingContract:
 class TestSyncDataTypePayload:
     @pytest.fixture(autouse=True)
     def _webhooks_enabled(self) -> Generator[None, None, None]:
-        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", autospec=True, return_value=True):
             yield
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_separates_what_the_run_wrote_from_what_is_held(self, mock_task: MagicMock) -> None:
+    def test_separates_what_the_run_wrote_from_what_is_held(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         on_sync_data_type_finished(
             user_id=uuid4(),
             provider="apple",
@@ -871,8 +916,8 @@ class TestSyncDataTypePayload:
         assert data["written"] == {"start": "2024-01-01T00:00:00+00:00", "end": "2024-03-31T23:59:00+00:00"}
         assert data["coverage"] == {"start": "2019-03-14T06:00:00+00:00", "end": "2024-03-31T23:59:00+00:00"}
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_a_failed_type_without_data_has_no_spans(self, mock_task: MagicMock) -> None:
+    def test_a_failed_type_without_data_has_no_spans(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         on_sync_data_type_finished(
             user_id=uuid4(),
             provider="apple",
@@ -895,7 +940,7 @@ class TestDataEventSyncProvenance:
 
     @pytest.fixture(autouse=True)
     def _webhooks_enabled(self) -> Generator[None, None, None]:
-        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", autospec=True, return_value=True):
             yield
 
     @staticmethod
@@ -909,8 +954,8 @@ class TestDataEventSyncProvenance:
             "source": {"provider": "garmin", "device": "Forerunner 255"},
         }
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_timeseries_payload_carries_the_run(self, mock_task: MagicMock) -> None:
+    def test_timeseries_payload_carries_the_run(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         on_timeseries_batch_saved(
             user_id=uuid4(),
             provider="garmin",
@@ -923,8 +968,8 @@ class TestDataEventSyncProvenance:
         data = mock_task.send_task.call_args_list[0].kwargs["args"][1]["data"]
         assert data["sync"] == {"run_id": "pull_abc", "source": "backfill", "scope": "historical"}
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_every_chunk_of_a_split_batch_carries_the_run(self, mock_task: MagicMock) -> None:
+    def test_every_chunk_of_a_split_batch_carries_the_run(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         sync = {"run_id": "sdk_abc", "source": "sdk", "scope": "historical"}
         sample = self._sample("2026-04-16T06:00:00+00:00")
         # Enough samples to pass the byte limit, so the batch splits into chunks
@@ -943,9 +988,9 @@ class TestDataEventSyncProvenance:
         assert all(p["sync"] == sync for p in payloads)
         assert {p["chunk_index"] for p in payloads} == set(range(len(payloads)))
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_payload_says_null_when_no_run_owns_the_write(self, mock_task: MagicMock) -> None:
+    def test_payload_says_null_when_no_run_owns_the_write(self, mocker: MockerFixture) -> None:
         """Seed data and linked-account fan-out write without a run of their own."""
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         on_timeseries_batch_saved(
             user_id=uuid4(),
             provider="garmin",
@@ -964,9 +1009,9 @@ class TestDataEventSyncProvenance:
 
         with (
             patch("app.services.timeseries_service.svix_service.is_enabled", return_value=True),
-            patch("app.services.timeseries_service.threading.Thread") as thread,
+            patch("app.services.timeseries_service.threading.Thread", autospec=True) as thread,
         ):
-            thread.side_effect = lambda target, args, daemon: captured.append(args) or MagicMock()
+            thread.side_effect = lambda target, args, daemon: captured.append(args) or DEFAULT
             with sync_run_context(
                 SyncRunContext(run_id="pull_abc", source=SyncSource.BACKFILL, scope=SyncScope.HISTORICAL)
             ):
@@ -999,7 +1044,7 @@ class TestTimeseriesIdempotencyKey:
 
     @pytest.fixture(autouse=True)
     def _webhooks_enabled(self) -> Generator[None, None, None]:
-        with patch("app.services.outgoing_webhooks.svix.is_enabled", return_value=True):
+        with patch("app.services.outgoing_webhooks.svix.is_enabled", autospec=True, return_value=True):
             yield
 
     @staticmethod
@@ -1020,24 +1065,24 @@ class TestTimeseriesIdempotencyKey:
         )
         return self._keys(mock_task)
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_separate_runs_over_the_same_window_get_distinct_keys(self, mock_task: MagicMock) -> None:
+    def test_separate_runs_over_the_same_window_get_distinct_keys(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         backfill = self._emit(mock_task, uid, {"run_id": "backfill_1", "source": "backfill", "scope": "historical"})
         live = self._emit(mock_task, uid, {"run_id": "pull_2", "source": "pull", "scope": "live"})
 
         assert set(backfill).isdisjoint(live)
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_the_same_run_re_emitting_still_dedupes(self, mock_task: MagicMock) -> None:
+    def test_the_same_run_re_emitting_still_dedupes(self, mocker: MockerFixture) -> None:
         """A retried task must not deliver the batch twice."""
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
         sync = {"run_id": "backfill_1", "source": "backfill", "scope": "historical"}
 
         assert self._emit(mock_task, uid, sync) == self._emit(mock_task, uid, sync)
 
-    @patch("app.services.outgoing_webhooks.events.celery_app")
-    def test_writes_without_a_run_keep_the_original_key_format(self, mock_task: MagicMock) -> None:
+    def test_writes_without_a_run_keep_the_original_key_format(self, mocker: MockerFixture) -> None:
+        mock_task = mocker.patch("app.services.outgoing_webhooks.events.celery_app", autospec=True)
         uid = uuid4()
 
         keys = self._emit(mock_task, uid, None)
@@ -1052,18 +1097,18 @@ class TestIterEndpoints:
 
     @pytest.fixture
     def svix_client(self) -> Generator[MagicMock, None, None]:
-        client = MagicMock()
+        client = _svix_client()
         with patch("app.services.outgoing_webhooks.svix._client", client):
             yield client
 
     @staticmethod
-    def _endpoint(n: int) -> MagicMock:
-        return MagicMock(id=f"ep_{n}")
+    def _endpoint(n: int) -> EndpointOut:
+        return _endpoint_out(f"ep_{n}")
 
     def test_follows_the_iterator_across_pages(self, svix_client: MagicMock) -> None:
         svix_client.endpoint.list.side_effect = [
-            MagicMock(data=[self._endpoint(1), self._endpoint(2)], done=False, iterator="it_1"),
-            MagicMock(data=[self._endpoint(3)], done=True, iterator=None),
+            ListResponseEndpointOut(data=[self._endpoint(1), self._endpoint(2)], done=False, iterator="it_1"),
+            ListResponseEndpointOut(data=[self._endpoint(3)], done=True, iterator=None),
         ]
 
         endpoints = list(svix_service.iter_endpoints("app_1"))
@@ -1072,7 +1117,7 @@ class TestIterEndpoints:
         assert [c.args[1].iterator for c in svix_client.endpoint.list.call_args_list] == [None, "it_1"]
 
     def test_raises_on_a_repeated_iterator_instead_of_looping(self, svix_client: MagicMock) -> None:
-        svix_client.endpoint.list.return_value = MagicMock(data=[], done=False, iterator="it_1")
+        svix_client.endpoint.list.return_value = ListResponseEndpointOut(data=[], done=False, iterator="it_1")
 
         with pytest.raises(RuntimeError, match="same iterator twice while listing endpoints of app app_1"):
             list(svix_service.iter_endpoints("app_1"))
@@ -1082,22 +1127,26 @@ class TestIterEndpoints:
 _register_event_types = svix_service.register_event_types
 
 
-def _event_types(registered: list[WebhookEventType]) -> list[MagicMock]:
+def _event_types(registered: list[WebhookEventType]) -> list[EventTypeOut]:
     """Svix event types as already registered, with their current descriptions."""
-    types = []
-    for evt in registered:
-        event_type = MagicMock(description=EVENT_TYPE_DESCRIPTIONS.get(evt, ""))
-        event_type.name = evt.value  # `name` is a MagicMock constructor argument, so set it after
-        types.append(event_type)
-    return types
+    return [
+        EventTypeOut(
+            name=evt.value,
+            description=EVENT_TYPE_DESCRIPTIONS.get(evt, ""),
+            deprecated=False,
+            created_at=_NOW,
+            updated_at=_NOW,
+        )
+        for evt in registered
+    ]
 
 
 def test_event_type_sync_reads_every_page_before_deciding_what_to_create() -> None:
     registered = list(WebhookEventType)
-    client = MagicMock()
+    client = _svix_client()
     client.event_type.list.side_effect = [
-        MagicMock(data=_event_types(registered[:10]), done=False, iterator="it_1"),
-        MagicMock(data=_event_types(registered[10:]), done=True, iterator=None),
+        ListResponseEventTypeOut(data=_event_types(registered[:10]), done=False, iterator="it_1"),
+        ListResponseEventTypeOut(data=_event_types(registered[10:]), done=True, iterator=None),
     ]
 
     with patch("app.services.outgoing_webhooks.svix._client", client):
@@ -1106,3 +1155,52 @@ def test_event_type_sync_reads_every_page_before_deciding_what_to_create() -> No
     assert [c.args[0].iterator for c in client.event_type.list.call_args_list] == [None, "it_1"]
     client.event_type.create.assert_not_called()
     client.event_type.patch.assert_not_called()
+
+
+def test_event_type_sync_registers_the_extensions_types() -> None:
+    client = _svix_client()
+    client.event_type.list.return_value = ListResponseEventTypeOut(
+        data=_event_types(list(WebhookEventType)), done=True, iterator=None
+    )
+
+    with (
+        patch("app.services.outgoing_webhooks.svix._client", client),
+        patch(
+            "app.services.outgoing_webhooks.svix.collect_webhook_event_types",
+            autospec=True,
+            return_value={"my_extension.thing.created": "A thing was created."},
+        ),
+    ):
+        assert _register_event_types() is True
+
+    client.event_type.patch.assert_not_called()
+    [created] = [c.args[0] for c in client.event_type.create.call_args_list]
+    assert (created.name, created.description) == ("my_extension.thing.created", "A thing was created.")
+
+
+def test_dispatch_drops_an_unserializable_payload_before_it_is_queued() -> None:
+    with (
+        patch("app.services.outgoing_webhooks.events.svix_service.is_enabled", autospec=True, return_value=True),
+        patch("app.services.outgoing_webhooks.events.celery_app", autospec=True) as celery_app,
+        patch("app.services.outgoing_webhooks.events.logger", autospec=True) as logger,
+    ):
+        _dispatch("my_extension.thing.created", {"type": "my_extension.thing.created", "data": {"ids": {1, 2}}})
+
+    celery_app.send_task.assert_not_called()
+    logger.warning.assert_called_once()
+    assert logger.warning.call_args.args[0] == "Dropping invalid webhook event"
+
+
+def test_dispatch_logs_a_payload_the_queue_cannot_encode_as_an_error_and_does_not_raise() -> None:
+    with (
+        patch("app.services.outgoing_webhooks.events.svix_service.is_enabled", autospec=True, return_value=True),
+        patch("app.services.outgoing_webhooks.events.celery_app", autospec=True) as celery_app,
+        patch("app.services.outgoing_webhooks.events.logger", autospec=True) as logger,
+    ):
+        celery_app.send_task.side_effect = EncodeError("not JSON")
+
+        _dispatch("my_extension.thing.created", {"type": "my_extension.thing.created", "data": {"ids": [1, 2]}})
+
+    logger.error.assert_called_once()
+    assert logger.error.call_args.args[0] == "Webhook event payload can't be serialized"
+    logger.warning.assert_not_called()

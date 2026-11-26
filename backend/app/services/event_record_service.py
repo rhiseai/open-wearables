@@ -478,6 +478,10 @@ class EventRecordService(
             )
         db_session.commit()
 
+    def claim_sleep_stored_without_id(self, db_session: DbSession, user_id: UUID, record: EventRecordCreate) -> None:
+        """Give the record's external_id to the overlapping night of its provider stored without one."""
+        self.crud.claim_sleep_stored_without_id(db_session, user_id, record)
+
     def find_adjacent_sleep_record(
         self,
         db_session: DbSession,
@@ -559,6 +563,7 @@ class EventRecordService(
         threshold_minutes: int,
         *,
         commit: bool = True,
+        merge_adjacent: bool = True,
     ) -> EventRecord:
         """Reconcile one writer's complete adjacent sleep component atomically.
 
@@ -568,11 +573,14 @@ class EventRecordService(
         flushed before expanding that row onto an occupied unique time window.
         ``commit=False`` leaves transaction ownership to the SDK batch caller.
         Webhooks contain snapshots and are dispatched only on the outer commit.
+        Without ``merge_adjacent`` only the session stored under the record's
+        external_id and sessions overlapping it join; a neighbour within the
+        threshold stays apart (Polar and Ultrahuman: another id is another night).
         """
         try:
             self.lock_sleep_user(db_session, user_id)
             result, action, final_detail = self._create_or_merge_sleep_inner(
-                db_session, user_id, record, detail, threshold_minutes
+                db_session, user_id, record, detail, threshold_minutes, merge_adjacent
             )
             if action is not None:
                 self._queue_sleep_webhook(db_session, user_id, record, result, action, final_detail)
@@ -708,6 +716,7 @@ class EventRecordService(
         record: EventRecordCreate,
         detail: EventRecordDetailCreate,
         threshold_minutes: int,
+        merge_adjacent: bool = True,
     ) -> tuple[EventRecord, str | None, EventRecordDetailCreate]:
         data_source_id = self.crud.resolve_sleep_data_source(db_session, record)
         record = record.model_copy(update={"data_source_id": data_source_id})
@@ -724,6 +733,7 @@ class EventRecordService(
             # A source with no nap flag of its own sends every session as main sleep, and a stored nap flag of
             # its is the rule's, decided again after this write: it keeps no session from joining another.
             is_nap=bool(detail.is_nap) if own_nap_flag else None,
+            merge_adjacent=merge_adjacent,
         )
         own = [
             candidate
@@ -771,6 +781,12 @@ class EventRecordService(
             # The incoming session says nothing about naps: keep the stored flag until the day is
             # re-flagged, so a nap sent again unchanged is not rewritten and announced as updated.
             final_detail = final_detail.model_copy(update={"is_nap": survivor.sleep_detail.is_nap})
+        if authoritative and survivor not in own:
+            # Matched by its window, not its id: the stored session takes the delivery's id, so the next delivery
+            # finds it wherever it moves (Google re-issues a session under a new name, #1909).
+            survivor.external_id = record.external_id
+        # Google Health sleep stored before it carried a type (#1853).
+        survivor.type = "sleep_session"
         duplicates = [candidate for candidate in candidates if candidate.id != survivor.id]
         zone_offset = record.zone_offset if record.zone_offset is not None else survivor.zone_offset
         old_start, old_end, old_zone = survivor.start_datetime, survivor.end_datetime, survivor.zone_offset
@@ -963,6 +979,26 @@ class EventRecordService(
         # Webhooks are not emitted for bulk-created records; they fire from
         # bulk_create_details() when the matching details are inserted.
         return self.crud.bulk_create(db_session, records)
+
+    def bulk_create_with_details(
+        self,
+        db_session: DbSession,
+        items: list[tuple[EventRecordCreate, EventRecordDetailCreate]],
+        detail_type: DetailType = EventCategory.WORKOUT,
+    ) -> int:
+        """Insert records and their details in batches. Returns how many records were stored, new or refreshed.
+
+        Records matched on external_id refresh their details; only new ones fire webhooks. Caller commits.
+        """
+        stored = self.bulk_create(db_session, [record for record, _ in items])
+        inserted = {record_id for record_id, stored_id in stored.items() if record_id == stored_id}
+        details = [
+            detail.model_copy(update={"record_id": stored[detail.record_id]})
+            for _, detail in items
+            if detail.record_id in stored
+        ]
+        self.bulk_create_details(db_session, details, detail_type=detail_type, created=inserted)
+        return len(set(stored.values()))
 
     def bulk_create_details(
         self,

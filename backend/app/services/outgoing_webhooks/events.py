@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import re
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
+from kombu.exceptions import EncodeError
 
 from app.constants.celery_tasks import CeleryTask
 from app.constants.devices_map import resolve_device_name
@@ -30,6 +31,7 @@ logger = get_logger(__name__)
 # characters in ISO 8601 timestamps are not allowed.
 _SVIX_ID_SAFE = re.compile(r"[^a-zA-Z0-9\-_.]")
 _SVIX_EVENT_ID_MAX_LENGTH = 128
+_SVIX_ID_MAX = 256  # Svix answers 422 for a longer eventId
 
 
 def _safe_key(raw: str) -> str:
@@ -63,6 +65,10 @@ def _enqueue_dispatch(
             kwargs={"channels": channels, "idempotency_key": idempotency_key},
         )
         return True
+    except EncodeError as e:
+        # A bug in the emitter, not an outage
+        logger.error("Webhook event payload can't be serialized", event_type=event_type, exc_info=e)
+        return False
     except Exception:
         logger.warning("Could not enqueue webhook event", event_type=event_type, exc_info=True)
         return False
@@ -623,4 +629,23 @@ def on_sync_data_type_finished(
         },
         idempotency_key=_safe_key(f"{event_type}.{run_id}.{data_type}"),
         channels=[f"user.{user_id}"],
+    )
+
+
+def on_extension_event(
+    event_type: str, data: dict[str, Any], *, user_id: UUID | None, idempotency_key: str | None
+) -> None:
+    """An extension's own event; app.extensions.webhooks.emit checks that the extension declares it."""
+    # Set before enqueueing: a retry re-sends to every developer, and only the same event id stops a second delivery.
+    key = idempotency_key or uuid4().hex
+    # A type has no "-", so no other type and key give the same id.
+    event_id = f"{event_type}-{key}"
+    if _SVIX_ID_SAFE.search(key) or len(event_id) > _SVIX_ID_MAX:
+        # Not _safe_key: rec:1 and rec/1 would share an id, and Svix would drop the second event as a duplicate.
+        event_id = hashlib.sha256(event_id.encode()).hexdigest()
+    _dispatch(
+        event_type,
+        {"type": event_type, "data": {**data, "user_id": str(user_id)} if user_id else data},
+        channels=[f"user.{user_id}"] if user_id else None,
+        idempotency_key=event_id,
     )

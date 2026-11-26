@@ -105,6 +105,8 @@ class Settings(BaseSettings):
     # whose response it never read, so it still holds the old token. Replays end sooner as soon
     # as the successor is used or revoked.
     refresh_token_replay_window_seconds: int = Field(7 * 24 * 3600, ge=0)
+    login_max_failed_attempts: int = 10
+    login_lockout_seconds: int = 900
 
     # VALIDATION SETTINGS
     min_password_length: int = 8

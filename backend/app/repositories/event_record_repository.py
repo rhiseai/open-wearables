@@ -36,6 +36,7 @@ from app.integrations.rollup_queue import mark_dirty_days
 from app.models import DataSource, EventRecord, EventRecordAggregate, HealthScore, SleepDetails, WorkoutDetails
 from app.repositories.data_source_repository import DATA_SOURCE_FIELDS, DataSourceIdentity, DataSourceRepository
 from app.repositories.data_type_coverage_repository import data_type_coverage_repository
+from app.repositories.health_score_repository import HealthScoreRepository
 from app.repositories.local_day import utc_midnight
 from app.repositories.repositories import (
     CrudRepository,
@@ -68,6 +69,15 @@ def _nap_condition(is_nap: bool) -> ColumnElement[bool]:
     """Match sleep records by nap flag; a missing detail row or NULL flag counts as main sleep."""
     flagged_nap = EventRecord.sleep_detail.has(SleepDetails.is_nap.is_(True))
     return flagged_nap if is_nap else ~flagged_nap
+
+
+# Categories a bulk insert matches on external_id before the time window
+_EXTERNAL_ID_CATEGORIES = frozenset({EventCategory.WORKOUT, EventCategory.SLEEP})
+
+
+def _sleep_session(model: type[EventRecord]) -> ColumnElement[bool]:
+    """A stored sleep session. Google Health sleep stored before it carried a type (#1853) has none."""
+    return and_(model.category == EventCategory.SLEEP, or_(model.type == "sleep_session", model.type.is_(None)))
 
 
 # What the user's other devices recorded inside a sleep, for the series the sleep's own device has no value of:
@@ -182,60 +192,67 @@ class EventRecordRepository(
         creation_data["data_source_id"] = data_source_id
         return data_source_id, provider, self.model(**creation_data)
 
-    def _fetch_existing(self, db_session: DbSession, data_source_id: UUID, creation: EventRecord) -> EventRecord | None:
+    def _fetch_existing(
+        self, db_session: DbSession, data_source_id: UUID, start: datetime, end: datetime
+    ) -> EventRecord | None:
         return (
             db_session.query(self.model)
             .filter(
                 self.model.data_source_id == data_source_id,
                 self.model.category != EventCategory.MEAL,
-                self.model.start_datetime == creation.start_datetime,
-                self.model.end_datetime == creation.end_datetime,
+                self.model.start_datetime == start,
+                self.model.end_datetime == end,
             )
             .one_or_none()
         )
 
-    def _workout_key(self, creator: EventRecordCreate) -> tuple[UUID, str, str] | None:
-        """The user, provider and external_id that identify a workout across deliveries."""
-        if creator.category != EventCategory.WORKOUT or not creator.external_id or not creator.user_id:
+    def _external_key(self, creator: EventRecordCreate) -> tuple[UUID, str, str, str] | None:
+        """The user, provider, category and external_id that identify a workout or sleep across deliveries."""
+        if creator.category not in _EXTERNAL_ID_CATEGORIES or not creator.external_id or not creator.user_id:
             return None
-        return creator.user_id, self.data_source_repo.provider_of(creator).value, creator.external_id
+        provider = self.data_source_repo.provider_of(creator).value
+        return creator.user_id, provider, creator.category, creator.external_id
 
-    def _fetch_workouts_by_external_id(
+    def _fetch_by_external_id(
         self, db_session: DbSession, creators: list[EventRecordCreate]
     ) -> dict[UUID, EventRecord]:
-        """Creator id -> newest stored workout of its user and provider with its external_id, in one query."""
-        keys = {key: creator.id for creator in creators if (key := self._workout_key(creator))}
+        """Creator id -> newest stored record of its user, provider and category with its external_id, in one query."""
+        keys = {key: creator.id for creator in creators if (key := self._external_key(creator))}
         if not keys:
             return {}
         source_ids = select(DataSource.id).where(
-            DataSource.user_id.in_({user_id for user_id, _, _ in keys}),
-            DataSource.provider.in_({provider for _, provider, _ in keys}),
+            DataSource.user_id.in_({user_id for user_id, _, _, _ in keys}),
+            DataSource.provider.in_({provider for _, provider, _, _ in keys}),
         )
         rows = (
             db_session.query(self.model, DataSource.user_id, DataSource.provider)
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 self.model.data_source_id.in_(source_ids.scalar_subquery()),
-                self.model.category == EventCategory.WORKOUT,
-                self.model.external_id.in_({external_id for _, _, external_id in keys}),
+                self.model.category.in_({category for _, _, category, _ in keys}),
+                self.model.external_id.in_({external_id for _, _, _, external_id in keys}),
             )
             .order_by(self.model.created_at.desc())
         )
         found: dict[UUID, EventRecord] = {}
         for record, user_id, provider in rows:
-            if creator_id := keys.get((user_id, provider, record.external_id)):
+            if creator_id := keys.get((user_id, provider, record.category, record.external_id)):
                 found.setdefault(creator_id, record)
         return found
 
-    def _refresh_from(self, db_session: DbSession, record: EventRecord, creator: EventRecordCreate) -> EventRecord:
-        """Update a stored workout to the newest delivery's times and type.
+    def _refresh_from(
+        self, db_session: DbSession, record: EventRecord, creator: EventRecordCreate
+    ) -> EventRecord | None:
+        """Update a stored workout or sleep to the newest delivery's times and type.
 
-        If another copy already holds those times, that copy is returned instead.
+        If another copy already holds those times, that copy is returned instead. If a record under another
+        external_id holds them, the delivery is not stored, like an insert that conflicts: None.
         """
         fields = ("type", "duration_seconds", "start_datetime", "end_datetime", "zone_offset")
         updates = {field: value for field in fields if (value := getattr(creator, field)) is not None}
         if all(getattr(record, field) == value for field, value in updates.items()):
             return record
+        old_end = record.end_datetime
         old_days = local_days(record.data_source_id, record.start_datetime, record.end_datetime, record.zone_offset)
         nested = db_session.begin_nested()
         try:
@@ -246,14 +263,13 @@ class EventRecordRepository(
         except IntegrityError:
             nested.rollback()
             db_session.refresh(record)
-            holder = db_session.query(self.model).filter(
-                self.model.data_source_id == record.data_source_id,
-                self.model.category != EventCategory.MEAL,
-                self.model.start_datetime == creator.start_datetime,
-                self.model.end_datetime == creator.end_datetime,
-                self.model.external_id == record.external_id,
+            holder = self._fetch_existing(
+                db_session, record.data_source_id, creator.start_datetime, creator.end_datetime
             )
-            return holder.one_or_none() or record
+            return holder if holder is not None and holder.external_id == record.external_id else None
+        if record.category == EventCategory.SLEEP and record.end_datetime != old_end:
+            # The provider's sleep score sits at the night's end, so the one at the old end would stay as a second
+            HealthScoreRepository(HealthScore).drop_provider_sleep_score(db_session, record.data_source_id, old_end)
         self._record_coverage(db_session, [(creator, self.data_source_repo.provider_of(creator))])
         mark_dirty_days(
             db_session,
@@ -379,10 +395,15 @@ class EventRecordRepository(
         return len(deleted)
 
     def create(self, db_session: DbSession, creator: EventRecordCreate) -> EventRecord:
-        if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(creator.id):
+        if existing := self._fetch_by_external_id(db_session, [creator]).get(creator.id):
             record = self._refresh_from(db_session, existing, creator)
             db_session.commit()
-            return record
+            if record is None:
+                # Like an insert that conflicts, the record holding those times stands for the delivery
+                record = self._fetch_existing(
+                    db_session, existing.data_source_id, creator.start_datetime, creator.end_datetime
+                )
+            return record or existing
         data_source_id, provider, creation = self._build_creation(db_session, creator)
         try:
             db_session.add(creation)
@@ -396,9 +417,9 @@ class EventRecordRepository(
             return creation
         except IntegrityError:
             db_session.rollback()
-            if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(
-                creator.id
-            ) or self._fetch_existing(db_session, data_source_id, creation):
+            if existing := self._fetch_by_external_id(db_session, [creator]).get(creator.id) or self._fetch_existing(
+                db_session, data_source_id, creation.start_datetime, creation.end_datetime
+            ):
                 return existing
             raise
 
@@ -408,8 +429,17 @@ class EventRecordRepository(
         Uses a savepoint for IntegrityError handling so a conflict rolls back only
         the INSERT (or a workout's refresh) and leaves the outer transaction intact.
         """
-        if existing := self._fetch_workouts_by_external_id(db_session, [creator]).get(creator.id):
-            return self._refresh_from(db_session, existing, creator)
+        # Workouts only: create_or_merge_sleep has matched a sleep's own external_id before it inserts one.
+        if creator.category == EventCategory.WORKOUT and (
+            existing := self._fetch_by_external_id(db_session, [creator]).get(creator.id)
+        ):
+            record = self._refresh_from(db_session, existing, creator)
+            if record is None:
+                # Like an insert that conflicts, the record holding those times stands for the delivery
+                record = self._fetch_existing(
+                    db_session, existing.data_source_id, creator.start_datetime, creator.end_datetime
+                )
+            return record or existing
         data_source_id, provider, creation = self._build_creation(db_session, creator)
         nested = db_session.begin_nested()
         try:
@@ -418,7 +448,9 @@ class EventRecordRepository(
             nested.commit()
         except IntegrityError:
             nested.rollback()
-            if existing := self._fetch_existing(db_session, data_source_id, creation):
+            if existing := self._fetch_existing(
+                db_session, data_source_id, creation.start_datetime, creation.end_datetime
+            ):
                 return existing
             raise
         self._record_coverage(db_session, [(creator, provider)])
@@ -539,6 +571,7 @@ class EventRecordRepository(
         *,
         replace_own_window: bool = False,
         is_nap: bool | None = None,
+        merge_adjacent: bool = True,
     ) -> list[EventRecord]:
         """Lock the complete adjacent component of one exact data source.
 
@@ -547,7 +580,8 @@ class EventRecordRepository(
         With ``is_nap`` set, a row that only borders the component joins when it
         is of the same kind: a nap the provider flagged never merges into the
         main sleep beside it, nor the reverse (RHISE-7796). Overlapping rows and
-        own-ID rows join whatever their flag.
+        own-ID rows join whatever their flag. Without ``merge_adjacent`` only
+        overlapping and own-ID rows join, never a row that just borders them.
         The caller holds the user advisory lock before this first read.
         """
         threshold = timedelta(minutes=threshold_minutes)
@@ -557,7 +591,9 @@ class EventRecordRepository(
                 self.model.start_datetime <= end_time + threshold,
                 self.model.end_datetime >= start_time - threshold,
             )
-            if is_nap is not None:
+            if not merge_adjacent:
+                adjacent = and_(self.model.start_datetime < end_time, self.model.end_datetime > start_time)
+            elif is_nap is not None:
                 # Overlapping rows are the same sleep sent twice and always join.
                 overlapping = and_(self.model.start_datetime < end_time, self.model.end_datetime > start_time)
                 adjacent = or_(overlapping, and_(adjacent, _nap_condition(is_nap)))
@@ -568,8 +604,7 @@ class EventRecordRepository(
                 .options(selectinload(self.model.sleep_detail))
                 .filter(
                     self.model.data_source_id == data_source_id,
-                    self.model.category == "sleep",
-                    self.model.type == "sleep_session",
+                    _sleep_session(self.model),
                     adjacent,
                 )
                 .order_by(self.model.start_datetime, self.model.id)
@@ -600,8 +635,7 @@ class EventRecordRepository(
             .options(selectinload(self.model.sleep_detail))
             .filter(
                 self.model.data_source_id == data_source_id,
-                self.model.category == "sleep",
-                self.model.type == "sleep_session",
+                _sleep_session(self.model),
                 self.model.end_datetime >= start_time,
                 self.model.end_datetime < end_time,
             )
@@ -643,27 +677,28 @@ class EventRecordRepository(
     ) -> dict[UUID, UUID]:
         """Insert non-meal records, skipping existing ones. Meals go through bulk_upsert_meals.
 
-        Returns creator id -> stored record id, for the records inserted and the workouts matched on external_id.
+        Returns creator id -> stored record id, for the records inserted and the ones matched on external_id.
         """
         if not creators:
             return {}
 
-        # Several deliveries of one workout in a batch: the last stands for all, the earlier ones map to it
-        latest = {key: creator.id for creator in creators if (key := self._workout_key(creator))}
+        # Several deliveries of one workout or sleep in a batch: the last stands for all, the earlier ones map to it
+        latest = {key: creator.id for creator in creators if (key := self._external_key(creator))}
         copies = {
             creator.id: latest[key]
             for creator in creators
-            if (key := self._workout_key(creator)) and latest[key] != creator.id
+            if (key := self._external_key(creator)) and latest[key] != creator.id
         }
         creators = [creator for creator in creators if creator.id not in copies]
 
-        # Workouts already stored under their external_id take the newest delivery instead of inserting
+        # Records already stored under their external_id take the newest delivery instead of inserting
         creators_by_id = {creator.id: creator for creator in creators}
-        stored = {
-            creator_id: self._refresh_from(db_session, record, creators_by_id[creator_id]).id
-            for creator_id, record in self._fetch_workouts_by_external_id(db_session, creators).items()
+        refreshed = {
+            creator_id: self._refresh_from(db_session, record, creators_by_id[creator_id])
+            for creator_id, record in self._fetch_by_external_id(db_session, creators).items()
         }
-        values_list = self._resolve_values(db_session, [c for c in creators if c.id not in stored])
+        stored = {creator_id: record.id for creator_id, record in refreshed.items() if record is not None}
+        values_list = self._resolve_values(db_session, [c for c in creators if c.id not in refreshed])
 
         # Batch insert with ON CONFLICT DO NOTHING
         # Chunk to stay under PostgreSQL's 65535 parameter limit (10 params/row → max ~6553 rows)
@@ -1846,8 +1881,7 @@ class EventRecordRepository(
         threshold = timedelta(minutes=threshold_minutes)
         filters = [
             DataSource.user_id == user_id,
-            self.model.category == EventCategory.SLEEP,
-            self.model.type == "sleep_session",
+            _sleep_session(self.model),
             self.model.start_datetime <= end_time + threshold,
             self.model.end_datetime >= start_time - threshold,
         ]
@@ -1870,6 +1904,27 @@ class EventRecordRepository(
             .with_for_update(of=self.model)
             .first()
         )
+
+    def claim_sleep_stored_without_id(self, db_session: DbSession, user_id: UUID, record: EventRecordCreate) -> None:
+        """Give the record's external_id to the overlapping night of its provider stored without one.
+
+        For a provider keeping one sleep per date (Polar), an overlapping night is this one, moved or not. Nights
+        stored before Polar sleep carried an id, by an old pod during a deploy, or without stages by
+        dedupe_polar_sleep have none. Flushed, so the external_id lookup of the save that follows finds it
+        and replaces that night.
+        """
+        stored = self.find_adjacent_sleep_record(
+            db_session,
+            user_id,
+            record.start_datetime,
+            record.end_datetime,
+            0,
+            source=record.source,
+            provider=record.provider,
+        )
+        if stored is not None and stored.external_id is None:
+            stored.external_id = record.external_id
+            db_session.flush()
 
     def get_sleep_records_with_details(
         self,
