@@ -58,6 +58,8 @@ def _run_worker(
     redis_address = urlparse(redis_url)
     settings.redis_host = redis_address.hostname or "localhost"
     settings.redis_port = redis_address.port or 6379
+    # The xdist worker's own Redis database: database 0 is gw0's, whose rollup lock these workers would take.
+    settings.redis_db = int(redis_address.path.lstrip("/") or 0)
     settings.outgoing_webhooks_enabled = False
     settings.telemetry_enabled = False
     settings.persist_live_sync_runs = False
