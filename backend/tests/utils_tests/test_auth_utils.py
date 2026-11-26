@@ -335,6 +335,7 @@ class TestRequireApiKey:
         developer = DeveloperFactory(email="detached@example.com")
         api_key = ApiKeyFactory()
 
+        # auth_sessions has already patched SessionLocal, so it can not be autospecced again.
         with patch("app.services.api_key_service.SessionLocal") as mock_session_local:
             mock_session_local.return_value.__enter__.return_value = db
             result = await _require_api_key(

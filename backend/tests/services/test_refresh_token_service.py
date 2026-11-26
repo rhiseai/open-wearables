@@ -433,7 +433,7 @@ class TestReplayRotation:
 
         # Act
         with (
-            patch.object(refresh_token_service, failing_step, side_effect=RuntimeError("db down")),
+            patch.object(refresh_token_service, failing_step, autospec=True, side_effect=RuntimeError("db down")),
             pytest.raises(RuntimeError),
         ):
             refresh_token_service.refresh_token(db, old_refresh_token)

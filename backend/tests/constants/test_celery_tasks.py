@@ -47,6 +47,8 @@ def test_workers_consume_every_queue_and_only_those() -> None:
         queue
         for name in ("worker.sh", "history-worker.sh")
         for flag in re.findall(r"-Q (\S+)", (scripts / name).read_text())
+        # The extension worker's -Q is a variable
+        if not flag.startswith('"$')
         for queue in flag.split(",")
     }
 

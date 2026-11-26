@@ -157,6 +157,8 @@ async def _probe_api(user_id: UUID, raw_key: str, start: datetime) -> None:
     assert timeseries.status_code == 200
 
 
+# Two spawned Celery workers take about 15 s to start, run and stop: past the suite's 10 s default.
+@pytest.mark.timeout(60)
 def test_historical_backlog_leaves_live_sdk_worker_available(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     redis_url = settings.redis_url
     producer = Celery("import-isolation-producer", broker=redis_url, backend=redis_url, set_as_current=False)

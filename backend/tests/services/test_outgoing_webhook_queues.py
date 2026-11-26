@@ -350,6 +350,9 @@ class TestWorkerScript:
         mock_uv.write_text(
             """#!/bin/bash
 echo "$*" >> "$COMMAND_LOG"
+# worker.sh first waits for the core schema and looks up the extensions' queues (none here).
+if [[ "$*" == *"alembic current"* ]]; then echo "abc123 (head)"; exit 0; fi
+if [[ "$*" == *extension_queues.py* ]]; then echo "EXTENSION_QUEUES="; exit 0; fi
 if [[ "$*" == *"cpu@%h"* ]]; then
   sleep 0.5
   exit 3
