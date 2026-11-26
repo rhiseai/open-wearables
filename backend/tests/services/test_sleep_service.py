@@ -9,6 +9,7 @@ Apple Watch sleep data patterns:
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -18,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
-from app.models import EventRecord, HealthScore
+from app.models import DataSource, EventRecord, HealthScore
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -36,8 +37,10 @@ from app.services.sdk.sleep_service import (
     handle_sleep_data,
     is_ready_to_finish,
     key,
+    load_source_sleep_states,
     persist_sleep,
 )
+from app.services.sleep_nap_marking import sleep_gap_minutes
 from tests.factories import UserFactory
 
 
@@ -1422,3 +1425,132 @@ class TestProviderSleepScore:
         session = db.get(EventRecord, score.event_record_id)
         assert session is not None
         assert session.category == "sleep"
+
+
+def _sleep_request(*samples: tuple[str, str, str, str], source: dict[str, str] | None = None) -> SyncRequest:
+    """Build an SDK sleep upload from (id, stage, start, end) tuples."""
+    source = source or {"name": "Apple Watch", "device_type": "watch", "device_model": "Watch7,1"}
+    return SyncRequest.model_validate(
+        {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": "2026-03-23T09:00:00Z",
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    {"id": sample_id, "stage": stage, "startDate": start, "endDate": end, "source": source}
+                    for sample_id, stage, start, end in samples
+                ],
+            },
+        }
+    )
+
+
+def _sleep_sessions(db: Session, user_id: object) -> list[EventRecord]:
+    return (
+        db.query(EventRecord)
+        .join(DataSource, EventRecord.data_source_id == DataSource.id)
+        .filter(DataSource.user_id == user_id, EventRecord.category == "sleep")
+        .order_by(EventRecord.start_datetime)
+        .all()
+    )
+
+
+class TestUploadOpeningWithAwake:
+    """A night uploaded in pieces keeps the awakening that opens a later piece (upstream #1904, #1899).
+
+    Uploaded hours after the night, every piece closes its Redis session at once, so the next piece starts a new
+    session: one that opens with awake used to drop that awake, and the night lost its interruption.
+    """
+
+    NIGHT_START = (
+        ("N1", "light", "2026-03-22T23:00:00Z", "2026-03-23T02:00:00Z"),
+        ("N2", "deep", "2026-03-23T02:00:00Z", "2026-03-23T03:00:00Z"),
+    )
+    # The second upload of the night starts at 03:00 with 40 minutes of awake.
+    AWAKENING = (("N3", "awake", "2026-03-23T03:00:00Z", "2026-03-23T03:40:00Z"),)
+    NIGHT_END = (
+        ("N4", "light", "2026-03-23T03:40:00Z", "2026-03-23T05:00:00Z"),
+        ("N5", "rem", "2026-03-23T05:00:00Z", "2026-03-23T07:00:00Z"),
+    )
+
+    @pytest.fixture(autouse=True)
+    def _no_stale_sleep_dispatch(self) -> Iterator[None]:
+        with patch("app.services.sdk.sleep_service.celery_app", autospec=True):
+            yield
+
+    def test_split_night_stores_one_session_with_its_awakening(self, db: Session) -> None:
+        user = UserFactory()
+
+        handle_sleep_data(db, _sleep_request(*self.NIGHT_START), str(user.id))
+        handle_sleep_data(db, _sleep_request(*self.AWAKENING, *self.NIGHT_END), str(user.id))
+
+        [session] = _sleep_sessions(db, user.id)
+        assert (session.start_datetime, session.end_datetime) == (
+            _dt("2026-03-22T23:00:00Z"),
+            _dt("2026-03-23T07:00:00Z"),
+        )
+        assert session.sleep_detail is not None
+        assert session.sleep_detail.sleep_awake_minutes == 40
+        # light 3h + deep 1h (first upload) + light 1h20 + rem 2h (second upload)
+        assert session.sleep_detail.sleep_total_duration_minutes == 440
+
+    def test_an_awake_only_upload_writes_nothing_and_waits_for_the_rest(self, db: Session) -> None:
+        user = UserFactory()
+
+        handle_sleep_data(db, _sleep_request(*self.NIGHT_START), str(user.id))
+        handle_sleep_data(db, _sleep_request(*self.AWAKENING), str(user.id))
+
+        [session] = _sleep_sessions(db, user.id)
+        assert session.end_datetime == _dt("2026-03-23T03:00:00Z")
+
+        handle_sleep_data(db, _sleep_request(*self.NIGHT_END), str(user.id))
+
+        [session] = _sleep_sessions(db, user.id)
+        assert session.end_datetime == _dt("2026-03-23T07:00:00Z")
+        assert session.sleep_detail is not None
+        assert session.sleep_detail.sleep_awake_minutes == 40
+
+    def test_awake_before_the_first_sleep_of_a_night_is_not_counted(self, db: Session) -> None:
+        user = UserFactory()
+        lying_awake = ("A1", "awake", "2026-03-22T22:20:00Z", "2026-03-22T23:00:00Z")
+
+        handle_sleep_data(db, _sleep_request(lying_awake, *self.NIGHT_START), str(user.id))
+
+        [session] = _sleep_sessions(db, user.id)
+        assert session.start_datetime == _dt("2026-03-22T23:00:00Z")
+        assert session.sleep_detail is not None
+        assert not session.sleep_detail.sleep_awake_minutes
+
+    def test_an_awake_only_session_is_dropped_when_its_writer_goes_quiet(self, db: Session) -> None:
+        user = UserFactory()
+
+        handle_sleep_data(db, _sleep_request(*self.AWAKENING), str(user.id))
+
+        assert _sleep_sessions(db, user.id) == []
+        # Its data ended long ago, but its writer is still uploading: it waits for the rest of the night.
+        [state] = load_source_sleep_states(str(user.id)).values()
+        assert state.last_received_at is not None
+        assert not is_ready_to_finish(state, state.last_received_at + timedelta(minutes=30))
+        quiet = state.last_received_at + timedelta(minutes=sleep_gap_minutes(ProviderName.APPLE))
+        assert is_ready_to_finish(state, quiet)
+
+        finish_sleep(db, str(user.id), state)
+
+        assert _sleep_sessions(db, user.id) == []
+        assert load_source_sleep_states(str(user.id)) == {}
+
+    @pytest.mark.parametrize(("stage", "has_sleep_stage"), [("light", True), ("in_bed", True), ("awake", False)])
+    def test_a_state_saved_before_the_flag_reads_it_from_its_stages(self, stage: str, has_sleep_stage: bool) -> None:
+        saved = {
+            "uuid": "N1",
+            "provider": "apple",
+            "start_time": "2026-03-23T03:00:00Z",
+            "end_time": "2026-03-23T03:40:00Z",
+            "last_start_timestamp": "2026-03-23T03:00:00Z",
+            "last_end_timestamp": "2026-03-23T03:40:00Z",
+            "stages": [{"stage": stage, "start_time": "2026-03-23T03:00:00Z", "end_time": "2026-03-23T03:40:00Z"}],
+        }
+
+        assert SleepState.model_validate(saved).has_sleep_stage is has_sleep_stage
