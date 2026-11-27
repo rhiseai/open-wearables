@@ -49,6 +49,7 @@ from app.repositories.local_day import utc_midnight
 from app.repositories.repositories import (
     CrudRepository,
     SourceRanking,
+    local_wall_clock,
     source_filter_conditions,
     utc_bucket_start,
 )
@@ -1332,6 +1333,7 @@ class EventRecordRepository(
         limit: int,
         ranking: SourceRanking,
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """Get daily sleep summaries: per date, the aggregate of its highest-priority source.
 
@@ -1355,8 +1357,7 @@ class EventRecordRepository(
         # date logic in fill_missing_sleep_scores_task so chart, score, and
         # session list all key on the same date.
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(EventRecord.end_datetime, EventRecord.zone_offset, fallback_timezone), Date
         )
 
         per_provider = source_selection == SummarySourceSelection.PER_PROVIDER
@@ -1549,7 +1550,14 @@ class EventRecordRepository(
         # Only the page's nights, not the one read to tell whether there is more.
         nights = [row.sleep_date for row in results[:limit]]
         sessions_by_key, main_sleeps_by_key = (
-            self._get_sleep_sessions(db_session, user_id, min(nights), max(nights), source_selection=source_selection)
+            self._get_sleep_sessions(
+                db_session,
+                user_id,
+                min(nights),
+                max(nights),
+                source_selection=source_selection,
+                fallback_timezone=fallback_timezone,
+            )
             if nights
             else ({}, {})
         )
@@ -1583,6 +1591,7 @@ class EventRecordRepository(
         first_night: date,
         last_night: date,
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> tuple[dict[tuple, list[dict]], dict[tuple, list[tuple[UUID, int]]]]:
         """Get individual sleep/nap sessions keyed by (sleep_date, provider, source, device_model),
         or by (sleep_date, data_source_id) with ``per_provider``, and per key the main sleeps' record
@@ -1595,8 +1604,7 @@ class EventRecordRepository(
         sorted by start time.
         """
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(EventRecord.end_datetime, EventRecord.zone_offset, fallback_timezone), Date
         )
         is_nap_expr = func.coalesce(SleepDetails.is_nap, False)
         duration_seconds = case(
@@ -1829,6 +1837,7 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """Get daily workout aggregates including elevation, distance, and energy.
 
@@ -1839,8 +1848,7 @@ class EventRecordRepository(
         - elevation_meters, distance_meters, energy_burned_kcal
         """
         local_workout_date = cast(
-            self.model.end_datetime + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
+            local_wall_clock(self.model.end_datetime, self.model.zone_offset, fallback_timezone), Date
         )
 
         results = (

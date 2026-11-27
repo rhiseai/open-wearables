@@ -58,6 +58,7 @@ from app.repositories.local_day import OFFSET_REACH
 from app.repositories.repositories import (
     CrudRepository,
     SourceRanking,
+    local_wall_clock,
     source_filter_conditions,
     timeline_key_column,
     utc_bucket_start,
@@ -1386,6 +1387,7 @@ class DataPointSeriesRepository(
         start_date: datetime,
         end_date: datetime,
         series_types: tuple[SeriesType, ...],
+        fallback_timezone: str | None = None,
     ) -> DailyMergedSampleSums:
         """Merge additive samples across devices without double-counting overlap.
 
@@ -1399,10 +1401,7 @@ class DataPointSeriesRepository(
             return {}
 
         series_type_ids = tuple(get_series_type_id(series_type) for series_type in series_types)
-        local_timestamp = self.model.recorded_at + cast(
-            func.coalesce(self.model.zone_offset, "+00:00"),
-            Interval,
-        )
+        local_timestamp = local_wall_clock(self.model.recorded_at, self.model.zone_offset, fallback_timezone)
         local_date = cast(local_timestamp, Date)
         local_hour = func.date_trunc(literal_column("'hour'"), local_timestamp)
 
@@ -1483,6 +1482,7 @@ class DataPointSeriesRepository(
         start_date: datetime,
         end_date: datetime,
         active_threshold: int = 30,
+        fallback_timezone: str | None = None,
     ) -> list[ActiveMinutesResult]:
         """Get daily active/sedentary minutes from step data.
 
@@ -1500,10 +1500,7 @@ class DataPointSeriesRepository(
         """
         steps_id = get_series_type_id(SeriesType.steps)
 
-        local_date = cast(
-            self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
-        )
+        local_date = cast(local_wall_clock(self.model.recorded_at, self.model.zone_offset, fallback_timezone), Date)
 
         # Create minute bucket expression using literal 'minute' text
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)
@@ -1588,6 +1585,7 @@ class DataPointSeriesRepository(
         light_max: int,
         moderate_max: int,
         vigorous_max: int,
+        fallback_timezone: str | None = None,
     ) -> list[IntensityMinutesResult]:
         """Get daily intensity minutes from heart rate data.
 
@@ -1606,10 +1604,7 @@ class DataPointSeriesRepository(
         """
         hr_id = get_series_type_id(SeriesType.heart_rate)
 
-        local_date = cast(
-            self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
-        )
+        local_date = cast(local_wall_clock(self.model.recorded_at, self.model.zone_offset, fallback_timezone), Date)
 
         # Create minute bucket expression
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)

@@ -274,6 +274,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> PaginatedResponse[SleepSummary]:
         """Get daily sleep summaries aggregated by date, provider, and device.
 
@@ -296,6 +297,7 @@ class SummariesService:
             limit,
             priority_service.get_source_ranking(db_session),
             source_selection=source_selection,
+            fallback_timezone=fallback_timezone,
         )
 
         # Check if there's more data
@@ -500,6 +502,7 @@ class SummariesService:
         limit: int,
         sort_order: str = "asc",
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -532,7 +535,7 @@ class SummariesService:
             cursor,
             limit,
             sort_order,
-            partial(self._activity_days, source_selection=source_selection),
+            partial(self._activity_days, source_selection=source_selection, fallback_timezone=fallback_timezone),
             source_selection=source_selection,
         )
 
@@ -561,7 +564,7 @@ class SummariesService:
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(
-            db_session, user_id, page_start, page_end
+            db_session, user_id, page_start, page_end, fallback_timezone
         )
 
         # Build lookup dict for workout data by (date, provider, source, device)
@@ -572,7 +575,12 @@ class SummariesService:
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
-            db_session, user_id, page_start, page_end, active_threshold=ACTIVE_STEPS_THRESHOLD
+            db_session,
+            user_id,
+            page_start,
+            page_end,
+            active_threshold=ACTIVE_STEPS_THRESHOLD,
+            fallback_timezone=fallback_timezone,
         )
 
         # Build lookup for activity minutes
@@ -591,6 +599,7 @@ class SummariesService:
             light_max=hr_zones["light_max"],
             moderate_max=hr_zones["moderate_max"],
             vigorous_max=hr_zones["vigorous_max"],
+            fallback_timezone=fallback_timezone,
         )
 
         # Build lookup for intensity minutes
@@ -700,14 +709,19 @@ class SummariesService:
         )
 
     def get_activity_totals(
-        self, db_session: DbSession, user_id: UUID, start_date: datetime, end_date: datetime
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        fallback_timezone: str | None = None,
     ) -> ActivityTotals:
         """The daily summaries' steps, distance and active energy, added up over the period.
 
         Only the daily sums: the per-day extras the summaries attach (workouts, active
         and intensity minutes) are most of their cost and none of a total.
         """
-        days = self._activity_days(db_session, user_id, start_date, end_date)
+        days = self._activity_days(db_session, user_id, start_date, end_date, fallback_timezone=fallback_timezone)
         steps = [float(day["steps_sum"]) for day in days if day.get("steps_sum") is not None]
         return ActivityTotals(
             days=len(days),
@@ -724,19 +738,33 @@ class SummariesService:
         start: datetime,
         end: datetime,
         source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """One row per day in [start, end) from the day aggregates, best source per date; with ``per_provider``
-        one row per day and provider."""
+        one row per day and provider.
+
+        The day rows are counted when a sample is written, on the day of its own offset (UTC without one), so
+        ``fallback_timezone`` moves only what is read from workouts and raw samples: workout-only days and the
+        per-provider merged sums. A sample needs its own offset to land on the user's day (RHISE-8334).
+        """
         results = daily_activity(db_session, user_id, start, end, days_from_samples(db_session))
         if source_selection == SummarySourceSelection.PER_PROVIDER:
-            return self._provider_days(db_session, user_id, start, end, results)
-        results = self._add_workout_only_days(db_session, user_id, start, end, results)
+            return self._provider_days(db_session, user_id, start, end, results, fallback_timezone)
+        results = self._add_workout_only_days(
+            db_session, user_id, start, end, results, fallback_timezone=fallback_timezone
+        )
         return self._filter_by_priority(
             db_session, user_id, results, date_key="activity_date", fill=ACTIVITY_METRIC_GROUPS
         )
 
     def _provider_days(
-        self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime, results: list
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start: datetime,
+        end: datetime,
+        results: list,
+        fallback_timezone: str | None = None,
     ) -> list[dict]:
         """One row per day and provider from that provider's devices alone: each metric group from its best-ranked
         device holding it, the additive sums raised to its devices' samples merged hour by hour.
@@ -745,9 +773,11 @@ class SummariesService:
         ``steps_source_key`` and ``heart_rate_source_key`` name the devices its workouts, steps and heart rate
         came from, for the per-day extras derived from them.
         """
-        results = self._add_workout_only_days(db_session, user_id, start, end, results, per_provider=True)
+        results = self._add_workout_only_days(
+            db_session, user_id, start, end, results, per_provider=True, fallback_timezone=fallback_timezone
+        )
         merged_sums = self.data_point_repo.get_daily_merged_sample_sums(
-            db_session, user_id, start, end, tuple(MERGED_ACTIVITY_SAMPLE_FIELDS)
+            db_session, user_id, start, end, tuple(MERGED_ACTIVITY_SAMPLE_FIELDS), fallback_timezone=fallback_timezone
         )
         results = self._raise_to_merged_sums(results, merged_sums)
 
@@ -894,6 +924,7 @@ class SummariesService:
         end: datetime,
         results: list,
         per_provider: bool = False,
+        fallback_timezone: str | None = None,
     ) -> list:
         """Add an empty row per source for dates that have workouts but no time-series data; ``per_provider``, for
         the dates the source's provider has none on."""
@@ -911,7 +942,9 @@ class SummariesService:
                 "device_type": wa["device_type"],
                 **dict.fromkeys(ACTIVITY_METRIC_KEYS),
             }
-            for wa in self.event_record_repo.get_daily_workout_aggregates(db_session, user_id, start, end)
+            for wa in self.event_record_repo.get_daily_workout_aggregates(
+                db_session, user_id, start, end, fallback_timezone
+            )
             if covers(wa, "workout_date") not in covered
         ]
         if not extra:

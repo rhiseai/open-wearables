@@ -4,7 +4,7 @@ from datetime import date, datetime
 from uuid import UUID
 
 from pydantic import BaseModel
-from sqlalchemy import ColumnElement, Date, case, cast, exists, func, literal, select
+from sqlalchemy import ColumnElement, Date, Interval, case, cast, exists, func, literal, select
 from sqlalchemy.orm import InstrumentedAttribute, Query
 
 from app.database import BaseDbModel, DbSession
@@ -25,6 +25,25 @@ def utc_bucket_start(
     session timezone and place the same row in a different bucket per connection.
     """
     return cast(func.date_trunc(bucket.value, func.timezone("UTC", column)), Date)
+
+
+def local_wall_clock(
+    instant: InstrumentedAttribute[datetime] | ColumnElement[datetime],
+    zone_offset: InstrumentedAttribute[str | None] | ColumnElement[str | None],
+    fallback_timezone: str | None = None,
+) -> ColumnElement[datetime]:
+    """An instant as the local clock showed it, for grouping rows into local days or hours.
+
+    A row's own ``zone_offset`` wins. A row without one (Apple Health sends none for most
+    samples) is read in ``fallback_timezone``, an IANA name such as ``America/New_York``,
+    so its day is the user's day; without a fallback it is read in UTC, as before.
+    """
+    if fallback_timezone is None:
+        return instant + cast(func.coalesce(zone_offset, "+00:00"), Interval)
+    return case(
+        (zone_offset.is_(None), func.timezone(fallback_timezone, instant)),
+        else_=func.timezone("UTC", instant + cast(zone_offset, Interval)),
+    )
 
 
 def source_filter_conditions(

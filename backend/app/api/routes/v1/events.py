@@ -17,7 +17,12 @@ from app.schemas.responses.activity import (
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep
 from app.services.event_record_service import event_record_service
-from app.utils.dates import DateTimeQueryParam, parse_query_datetime, parse_query_end_datetime
+from app.utils.dates import (
+    DateTimeQueryParam,
+    FallbackTimezoneQueryParam,
+    parse_query_datetime,
+    parse_query_end_datetime,
+)
 from app.utils.pagination import DEFAULT_PAGE_SIZE, PageLimitQueryParam
 
 router = APIRouter()
@@ -147,6 +152,9 @@ def list_sleep_sessions(
     is_nap: IsNapQuery = None,
     source_selection: SessionSourceSelectionQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    # Still accepted and validated for clients that send it (RHISE-8109). It dated a night to pick one source per
+    # date; sources are now compared by how much their sessions overlap, which needs no zone.
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> PaginatedResponse[SleepSession]:
     """Returns sleep sessions (including naps)."""
     params = EventRecordQueryParams(
@@ -179,6 +187,9 @@ def get_sleep_totals(
     is_nap: IsNapQuery = None,
     source_selection: SessionSourceSelectionQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    # Still accepted and validated for clients that send it (RHISE-8109). It dated a night to pick one source per
+    # date; sources are now compared by how much their sessions overlap, which needs no zone.
+    timezone: FallbackTimezoneQueryParam = None,
 ) -> SleepTotals:
     """Returns the count, naps, time asleep, time in bed and mean efficiency of the sessions.
 
