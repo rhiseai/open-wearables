@@ -23,7 +23,14 @@ def test_configures_only_exact_lucie_endpoints(monkeypatch: pytest.MonkeyPatch) 
         SimpleNamespace(id="ep_other", url="https://example.com/webhooks/ow"),
     ]
     updated = SimpleNamespace(
-        event_types=["connection.created", "sleep.updated", "sleep.created", "sync.completed", "workout.created"]
+        event_types=[
+            "body_composition.created",
+            "connection.created",
+            "sleep.updated",
+            "sleep.created",
+            "sync.completed",
+            "workout.created",
+        ]
     )
 
     monkeypatch.setattr(configure_lucie_webhook.svix_service, "is_enabled", MagicMock(return_value=True))
@@ -40,7 +47,14 @@ def test_configures_only_exact_lucie_endpoints(monkeypatch: pytest.MonkeyPatch) 
     patch_endpoint.assert_called_once_with(
         str(developer.id),
         "ep_lucie",
-        filter_types=["sleep.created", "sleep.updated", "connection.created", "sync.completed", "workout.created"],
+        filter_types=[
+            "sleep.created",
+            "sleep.updated",
+            "connection.created",
+            "sync.completed",
+            "workout.created",
+            "body_composition.created",
+        ],
     )
 
 
