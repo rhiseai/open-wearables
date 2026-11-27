@@ -12,7 +12,6 @@ from fastapi import HTTPException
 from jose import jwt
 
 from app.config import settings
-from app.services.sdk_token_service import create_sdk_user_token
 from app.utils import auth_diagnostics
 from app.utils.auth import get_combined_auth, get_sdk_auth
 from app.utils.auth_diagnostics import (
@@ -24,6 +23,7 @@ from app.utils.auth_diagnostics import (
 )
 from app.utils.config_utils import LogFormat, LogLevel
 from app.utils.context import trace_id_var
+from app.utils.security import create_access_token
 from app.utils.structured_logging import get_logger
 from tests.factories import ApiKeyFactory
 
@@ -267,7 +267,7 @@ async def test_api_key_exception_is_preserved_and_only_401_is_an_auth_rejection(
 async def test_sdk_precedence_and_optional_developer_probe_emit_no_rejections(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = create_sdk_user_token("private-app-fixture", USER_ID)
+    token = create_access_token(subject=USER_ID, scope="sdk", app_id="private-app-fixture")
     with patch("app.utils.auth.validate_api_key", side_effect=AssertionError("fallback must not run")):
         result = await get_sdk_auth(token, "invalid-unused-api-key")
         combined = await get_combined_auth(token, "invalid-unused-api-key")

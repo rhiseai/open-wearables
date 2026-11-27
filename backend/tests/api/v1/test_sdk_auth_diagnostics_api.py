@@ -17,10 +17,10 @@ from app.config import settings
 from app.models import RefreshToken
 from app.schemas.auth import SDKTokenOrigin
 from app.services.refresh_token_service import refresh_token_service
-from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.config_utils import LogFormat, LogLevel
 from app.utils.context import trace_id_var
 from app.utils.exceptions import status_code_name
+from app.utils.security import create_access_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -193,7 +193,7 @@ def test_expired_request_does_not_downgrade_a_subsequent_real_sync_500(
         failing_client = TestClient(client.app, raise_server_exceptions=False)
         response = failing_client.post(
             endpoint,
-            headers={"Authorization": f"Bearer {create_sdk_user_token('test-app', USER_ID)}"},
+            headers={"Authorization": f"Bearer {create_access_token(subject=USER_ID, scope='sdk', app_id='test-app')}"},
             json=ENDPOINTS[0][1],
         )
     assert response.status_code == 500
@@ -250,7 +250,7 @@ def test_subject_mismatch_stays_403_and_cannot_enqueue_or_store(
     payload: dict,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = create_sdk_user_token("private-app-fixture", OTHER_USER_ID)
+    token = create_access_token(subject=OTHER_USER_ID, scope="sdk", app_id="private-app-fixture")
     with (
         patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as task,
         patch("app.api.routes.v1.sdk_sync.store_raw_payload") as sync_store,
