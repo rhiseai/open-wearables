@@ -6,17 +6,26 @@ to database storage using mocked responses, making them deterministic
 and runnable without real credentials.
 """
 
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import DataSource, EventRecord, SeriesAggregate, SeriesSample, SeriesTypeDefinition, SleepDetails
-from app.schemas.enums.series_types import SeriesType
+from app.models.archival_setting import ArchivalSetting
+from app.repositories.series_aggregate_repository import LOCAL_DAY
+from app.schemas.enums import ComputedBy
+from app.schemas.enums.series_types import SeriesType, get_series_type_id
+from app.schemas.model_crud.activities import TimeSeriesSampleCreate
+from app.services.aggregate_backfill_service import aggregate_backfill_service
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.ultrahuman.data_247 import Ultrahuman247Data
+from app.services.timeseries_service import timeseries_service
+from app.utils.dates import iso_to_timezone
 from tests.factories import (
     DataSourceFactory,
     UserConnectionFactory,
@@ -480,6 +489,52 @@ class TestUltrahumanActivitySamplesIntegration:
         # The mock answers both requested days with the same day_start: one day, on the day the ring reports.
         assert [float(sample.sum if sample.sum is not None else sample.avg) for sample in samples] == [51]
         assert samples[0].period_start == datetime(2024, 1, 15, 0, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize("offset", ["+01:00", "+09:00", "-08:00"])
+    def test_sleep_rhr_lands_on_the_day_its_history_does(self, db: Session, offset: str) -> None:
+        """The ring's night lands on its local day, the day the backfill gives the same value stored as a sample
+        before the aggregate tables, east and west of UTC."""
+        day = date(2026, 11, 18)
+        local_midnight = datetime.combine(day, time(), iso_to_timezone(offset))
+        live, history = UserFactory(), UserFactory()
+        provider_impl = ProviderFactory().get_provider("ultrahuman").data_247
+        assert isinstance(provider_impl, Ultrahuman247Data)
+
+        provider_impl._save_daily_activity(
+            db, live.id, {"sleep_rhr": {"value": 49, "day_start_timestamp": int(local_midnight.timestamp())}}
+        )
+        # What the fork stored before the aggregate tables: the value at day_start, without an offset.
+        timeseries_service.bulk_create_samples(
+            db,
+            [
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=history.id,
+                    provider="ultrahuman",
+                    recorded_at=local_midnight,
+                    value=Decimal("49"),
+                    series_type=SeriesType.resting_heart_rate,
+                )
+            ],
+        )
+        db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
+        db.flush()
+        aggregate_backfill_service.run(db, budget_seconds=60)
+
+        rows = (
+            db.query(DataSource.user_id, SeriesAggregate.period_start, SeriesAggregate.zone_offset, LOCAL_DAY)
+            .join(DataSource, SeriesAggregate.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id.in_([live.id, history.id]),
+                SeriesAggregate.computed_by == ComputedBy.PROVIDER,
+                SeriesAggregate.series_type_definition_id == get_series_type_id(SeriesType.resting_heart_rate),
+            )
+            .all()
+        )
+        assert {user_id: (start, zone, local_day) for user_id, start, zone, local_day in rows} == {
+            live.id: (local_midnight, offset, day),
+            history.id: (local_midnight, offset, day),
+        }
 
     def test_active_minutes_saved_as_exercise_time(self, db: Session, sample_ultrahuman_api_response: dict) -> None:
         """Ultrahuman's active minutes are moderate to vigorous activity, not all non-sedentary time."""

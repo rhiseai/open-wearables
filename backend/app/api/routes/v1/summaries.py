@@ -116,15 +116,21 @@ def get_recovery_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
 ) -> PaginatedResponse[RecoverySummary]:
     """Returns daily recovery metrics (resting HR, HRV, SpO2, main sleep, recovery score).
 
     One row per day from the highest-priority source, for every provider that supplies the
     underlying data. The recovery score is set only where a recovery-score record exists.
+
+    `source_selection=per_provider` returns one row per day and provider instead, each from that
+    provider's own devices only.
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_end_datetime(end_date)
-    return summaries_service.get_recovery_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_recovery_summaries(
+        db, user_id, start_datetime, end_datetime, cursor, limit, source_selection=source_selection
+    )
 
 
 @router.get("/users/{user_id}/summaries/body")
@@ -163,7 +169,8 @@ def get_data_summary(
     """Returns per-user data counts grouped by series type, event type, and provider.
 
     Optionally scope the counts to a date window via `start_date` / `end_date` (data points are
-    filtered by `recorded_at`, events by their start time). Omitting both returns all-time counts.
+    filtered by `recorded_at`, a night's values by the night's start, events by their start time).
+    Omitting both returns all-time counts.
     """
     start_datetime = parse_query_datetime(start_date) if start_date is not None else None
     end_datetime = parse_query_end_datetime(end_date) if end_date is not None else None

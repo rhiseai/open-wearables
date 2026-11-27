@@ -9,12 +9,18 @@ Note: the total data-points count is served approximately (planner statistics / 
 an exact ``COUNT(*)``, so it is only asserted to be a valid non-negative integer.
 """
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import MagicMock, patch
+from uuid import UUID
 
+import pytest
 from sqlalchemy.orm import Session
 
-from app.schemas.enums import ProviderName, SeriesType
+from app.models import DataSource, EventRecord, EventRecordAggregate, SeriesTypeDefinition
+from app.schemas.enums import ComputedBy, ProviderName, SeriesType, get_series_type_id
+from app.services.providers.factory import ProviderFactory
+from app.services.providers.withings.data_247 import Withings247Data
 from app.services.system_info_service import system_info_service
 from tests.factories import (
     DataPointSeriesFactory,
@@ -23,7 +29,9 @@ from tests.factories import (
     SeriesTypeDefinitionFactory,
     UserConnectionFactory,
     UserFactory,
+    WorkoutDetailsFactory,
     provider_day,
+    roll_up_everything,
 )
 
 
@@ -146,3 +154,94 @@ class TestUserDataSummaryCountsDayValues:
 
         by_provider = {entry.provider: entry for entry in summary.by_provider}
         assert (by_provider["garmin"].data_points, by_provider["garmin"].series_counts) == (1, {"steps": 1})
+
+
+# A Withings night on a free plan, which sends no HRV: its lowest heart rate is its one heart value.
+_WITHINGS_NIGHT = {
+    "startdate": 1594159200,
+    "enddate": 1594188000,
+    "id": 12345,
+    "timezone": "Europe/Warsaw",
+    "data": {"total_timeinbed": 28800, "total_sleep_time": 25200, "hr_min": 48},
+}
+_NIGHT_START = datetime(2020, 7, 7, 22, tzinfo=timezone.utc)
+
+
+def _withings_night(db: Session) -> UUID:
+    """A user with one Withings night, saved the way the sync saves it: hr_min is the sleep's resting heart rate."""
+    user = UserFactory()
+    data_247 = ProviderFactory().get_provider("withings").data_247
+    assert isinstance(data_247, Withings247Data)
+    with (
+        patch("app.services.providers.withings.data_247.paginate", return_value=MagicMock(rows=[_WITHINGS_NIGHT])),
+        patch("app.services.providers.withings.data_247.withings_request", return_value={"series": []}),
+    ):
+        saved = data_247.save_sleep(db, user.id, _NIGHT_START - timedelta(days=1), _NIGHT_START + timedelta(days=1))
+    assert saved == 1
+    return user.id
+
+
+class TestUserDataSummaryCountsNightValues:
+    def test_a_withings_night_without_hrv_counts_its_resting_heart_rate(self, db: Session) -> None:
+        """hr_min was a sample before the aggregate tables and is now the sleep's provider value: it still counts,
+        so a reader that offers Withings for heart data from these counts still offers it."""
+        user_id = _withings_night(db)
+
+        summary = system_info_service.get_user_data_summary(db, user_id)
+
+        withings = {entry.provider: entry for entry in summary.by_provider}["withings"]
+        assert (withings.data_points, withings.series_counts, withings.sleep_count) == (
+            1,
+            {"resting_heart_rate": 1},
+            1,
+        )
+
+    @pytest.mark.parametrize(
+        ("start", "end", "counted"),
+        [
+            (_NIGHT_START, _NIGHT_START + timedelta(hours=1), 1),
+            (_NIGHT_START + timedelta(seconds=1), None, 0),
+            (None, _NIGHT_START, 0),
+        ],
+    )
+    def test_a_window_counts_the_nights_that_started_in_it(
+        self, db: Session, start: datetime | None, end: datetime | None, counted: int
+    ) -> None:
+        user_id = _withings_night(db)
+
+        summary = system_info_service.get_user_data_summary(db, user_id, start, end)
+
+        assert summary.series_type_counts.get("resting_heart_rate", 0) == counted
+
+    def test_our_rollup_of_a_nights_readings_is_not_counted_again(self, db: Session) -> None:
+        """The rollup keeps its own statistics of the night's readings on the sleep; the readings already count."""
+        user_id = _withings_night(db)
+        sleep = db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user_id).one()
+        rmssd = db.get(SeriesTypeDefinition, get_series_type_id(SeriesType.heart_rate_variability_rmssd))
+        DataPointSeriesFactory(
+            data_source=db.get(DataSource, sleep.data_source_id),
+            series_type=rmssd,
+            recorded_at=_NIGHT_START + timedelta(hours=2),
+            value=Decimal("40"),
+        )
+        roll_up_everything(db)
+        ours = db.query(EventRecordAggregate).filter(
+            EventRecordAggregate.record_id == sleep.id, EventRecordAggregate.computed_by == ComputedBy.OPEN_WEARABLES
+        )
+        assert ours.count() > 0
+
+        summary = system_info_service.get_user_data_summary(db, user_id)
+
+        assert summary.series_type_counts == {"resting_heart_rate": 1, "heart_rate_variability_rmssd": 1}
+
+    def test_a_workouts_own_statistics_are_not_counted(self, db: Session) -> None:
+        """A workout's heart rate and steps are its workout_details columns, kept as provider rows on the workout:
+        they never were samples, so they add no data points."""
+        source = DataSourceFactory(provider=ProviderName.GARMIN)
+        workout = EventRecordFactory(category="workout", data_source=source)
+        WorkoutDetailsFactory(event_record=workout)
+        assert db.query(EventRecordAggregate).filter(EventRecordAggregate.record_id == workout.id).count() > 0
+
+        summary = system_info_service.get_user_data_summary(db, source.user_id)
+
+        assert (summary.series_type_counts, summary.total_workouts) == ({}, 1)

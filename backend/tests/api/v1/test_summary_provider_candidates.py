@@ -8,7 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.schemas.enums import ProviderName, SeriesType
+from app.models import EventRecordAggregate
+from app.repositories import AggregateRepository
+from app.schemas.enums import ComputedBy, ProviderName, SeriesType, get_series_type_id
 from app.services.priority_service import priority_service
 from app.utils.pagination import decode_activity_cursor
 from tests.factories import (
@@ -185,6 +187,60 @@ def test_activity_provider_candidates_paginate_same_day_without_mixing(
     assert back.json()["data"] == candidates[:1]
 
 
+def test_recovery_candidates_keep_each_providers_day_and_night_values(client: TestClient, db: Session) -> None:
+    user = UserFactory()
+    garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin", device_type="watch")
+    oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_type="ring")
+    provider_day(db, garmin, SeriesType.resting_heart_rate, START.date(), avg=Decimal(55))
+    provider_day(db, garmin, SeriesType.heart_rate_variability_rmssd, START.date(), avg=Decimal(60))
+    # Oura's history sends the night's resting pulse on the sleep, not on the day.
+    night = _sleep(oura, START - timedelta(hours=1), 480)
+    AggregateRepository(EventRecordAggregate).upsert(
+        db,
+        [
+            {
+                "record_id": night.id,
+                "series_type_definition_id": get_series_type_id(SeriesType.resting_heart_rate),
+                "computed_by": ComputedBy.PROVIDER,
+                "avg": Decimal(48),
+                "count": 1,
+            }
+        ],
+    )
+    priority_service.update_provider_priority(db, ProviderName.GARMIN, 1)
+    priority_service.update_provider_priority(db, ProviderName.OURA, 2)
+    headers = api_key_headers(ApiKeyFactory().plain_key)
+    url = f"/api/v1/users/{user.id}/summaries/recovery"
+    legacy = client.get(url, headers=headers, params=_params())
+    assert legacy.status_code == 200
+    assert [(s["source"]["provider"], s["resting_heart_rate_bpm"]) for s in legacy.json()["data"]] == [("garmin", 55)]
+
+    candidates = []
+    pages = []
+    params = _params(source_selection="per_provider", limit=1)
+    while True:
+        response = client.get(url, headers=headers, params=params)
+        assert response.status_code == 200, response.text
+        page = response.json()
+        candidates.extend(page["data"])
+        pages.append(page)
+        if not page["pagination"]["next_cursor"]:
+            break
+        params["cursor"] = page["pagination"]["next_cursor"]
+    by_provider = {s["source"]["provider"]: s for s in candidates}
+    assert len(candidates) == 2
+    assert (by_provider["garmin"]["resting_heart_rate_bpm"], by_provider["garmin"]["avg_hrv_rmssd_ms"]) == (55, 60.0)
+    assert (by_provider["oura"]["resting_heart_rate_bpm"], by_provider["oura"]["avg_hrv_rmssd_ms"]) == (48, None)
+    assert by_provider["oura"]["sleep_duration_seconds"] == 480 * 60
+    back = client.get(
+        url,
+        headers=headers,
+        params=_params(source_selection="per_provider", limit=1, cursor=pages[1]["pagination"]["previous_cursor"]),
+    )
+    assert back.status_code == 200
+    assert back.json()["data"] == candidates[:1]
+
+
 def test_workout_only_provider_is_not_hidden_by_another_providers_steps(client: TestClient, db: Session) -> None:
     user = UserFactory()
     apple = DataSourceFactory(user=user, provider=ProviderName.APPLE)
@@ -211,7 +267,7 @@ def test_workout_only_provider_is_not_hidden_by_another_providers_steps(client: 
     assert by_provider["whoop"]["steps"] is None
 
 
-@pytest.mark.parametrize("kind", ["sleep", "activity"])
+@pytest.mark.parametrize("kind", ["sleep", "activity", "recovery"])
 def test_unknown_source_selection_is_rejected(client: TestClient, db: Session, kind: str) -> None:
     user = UserFactory()
     response = client.get(
@@ -264,6 +320,25 @@ def test_default_null_source_cursor_keeps_legacy_identity(client: TestClient, db
     second = client.get(url, headers=headers, params=_params(limit=1, cursor=cursor))
     assert second.status_code == 200
     assert [s["date"] for s in second.json()["data"]] == [(START + timedelta(days=1)).date().isoformat()]
+
+
+def test_recovery_priority_cursor_keeps_its_source_and_device(client: TestClient, db: Session) -> None:
+    """The default mode's cursor still names the row's source and device, so a cursor a client holds stays valid."""
+    user = UserFactory()
+    source = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin-connect", device_model="Fenix 7")
+    for day in (START.date(), (START + timedelta(days=1)).date()):
+        provider_day(db, source, SeriesType.resting_heart_rate, day, avg=Decimal(50))
+    headers = api_key_headers(ApiKeyFactory().plain_key)
+    url = f"/api/v1/users/{user.id}/summaries/recovery"
+    first = client.get(url, headers=headers, params=_params(limit=1))
+    assert first.status_code == 200
+    cursor = first.json()["pagination"]["next_cursor"]
+    assert decode_activity_cursor(cursor) == (START.date(), "garmin-connect", "Fenix 7", "next")
+    second = client.get(url, headers=headers, params=_params(limit=1, cursor=cursor))
+    assert second.status_code == 200
+    assert [(s["date"], s["source"]["device"]) for s in second.json()["data"]] == [
+        ((START + timedelta(days=1)).date().isoformat(), "Fenix 7")
+    ]
 
 
 def test_sleep_candidate_keeps_one_same_model_device_and_its_own_sessions(client: TestClient, db: Session) -> None:

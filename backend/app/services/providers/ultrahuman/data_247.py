@@ -597,8 +597,9 @@ class Ultrahuman247Data(Base247DataTemplate):
             value, day_start = scalar.get("value"), scalar.get("day_start_timestamp")
             if value is None or not day_start:
                 continue
-            # day_start is the local midnight as Ultrahuman reports it, stored as the UTC instant; the day row
-            # takes the same instant, so it and the sample read as one day everywhere.
+            # day_start is the instant of the local midnight Ultrahuman reports, without its offset; the day row
+            # takes the date and offset its history rule (LOCAL_MIDNIGHT_NO_OFFSET) gives the samples stored
+            # before the aggregate tables, so a live day and a backfilled one are the same day.
             recorded_at = datetime.fromtimestamp(day_start, tz=timezone.utc)
             samples.append(
                 TimeSeriesSampleCreate(
@@ -609,7 +610,7 @@ class Ultrahuman247Data(Base247DataTemplate):
                     value=Decimal(str(value)),
                     series_type=series_type,
                     is_daily_total=daily_total_flag(series_type, True),
-                    period=CalendarPeriod.local_day(recorded_at),
+                    period=CalendarPeriod.of_local_midnight(recorded_at),
                 )
             )
 

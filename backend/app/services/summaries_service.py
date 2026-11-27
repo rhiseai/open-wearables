@@ -187,6 +187,7 @@ class SummariesService:
         results: list[dict] | list,
         date_key: str = "activity_date",
         fill: tuple[tuple[str, ...], ...] = (),
+        per_provider: bool = False,
     ) -> list[dict] | list:
         """Filter results to highest priority source per date.
 
@@ -194,9 +195,10 @@ class SummariesService:
             results: List of dicts with date, source (provider), device_model
             date_key: Key name for date field (activity_date or sleep_date)
             fill: Groups of keys the winner lacks entirely, taken whole from the best entry that has any of them
+            per_provider: Pick per date and provider instead, filling only from the same provider's entries
 
         Returns:
-            Filtered list with only highest priority entry per date
+            Filtered list with only highest priority entry per date (per date and provider)
         """
         if not results:
             return results
@@ -207,10 +209,10 @@ class SummariesService:
             provider = entry.get("provider") or entry.get("source")
             return (*ranking.rank(provider, entry.get("device_type")), entry.get("device_model") or "")
 
-        # Group results by date
-        by_date: dict[date, list[dict]] = defaultdict(list)
+        # Group results by date, or by date and provider
+        by_date: dict[date | tuple[date, str], list[dict]] = defaultdict(list)
         for result in results:
-            dt = result[date_key]
+            dt = (result[date_key], result["provider"]) if per_provider else result[date_key]
             by_date[dt].append(result)
 
         # For each date, pick highest priority
@@ -422,10 +424,21 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
     ) -> PaginatedResponse[RecoverySummary]:
-        """Daily recovery summaries: the day's vitals, main sleep and recovery score, best source per date."""
+        """Daily recovery summaries: the day's vitals, main sleep and recovery score, best source per date;
+        with ``per_provider`` one row per date and provider, from that provider's own devices only."""
         results = self._page_days(
-            db_session, user_id, start_date, end_date, cursor, limit, "asc", self._recovery_days, "recovery_date"
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            cursor,
+            limit,
+            "asc",
+            partial(self._recovery_days, source_selection=source_selection),
+            "recovery_date",
+            source_selection=source_selection,
         )
 
         has_more = len(results) > limit
@@ -437,14 +450,12 @@ class SummariesService:
 
         if results:
             if has_more:
-                last = results[-1]
                 next_cursor = encode_activity_cursor(
-                    last["recovery_date"], last["source"] or "", last.get("device_model"), "next"
+                    *_activity_key(results[-1], "recovery_date", source_selection), "next"
                 )
             if cursor:
-                first = results[0]
                 previous_cursor = encode_activity_cursor(
-                    first["recovery_date"], first["source"] or "", first.get("device_model"), "prev"
+                    *_activity_key(results[0], "recovery_date", source_selection), "prev"
                 )
 
         data = [
@@ -827,9 +838,17 @@ class SummariesService:
                 result[field] = int(merged) if series_type in INTEGER_ACTIVITY_SAMPLE_FIELDS else merged
         return results
 
-    def _recovery_days(self, db_session: DbSession, user_id: UUID, start: datetime, end: datetime) -> list[dict]:
+    def _recovery_days(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start: datetime,
+        end: datetime,
+        source_selection: SummarySourceSelection = SummarySourceSelection.PRIORITY,
+    ) -> list[dict]:
         """One row per day in [start, end) from the vitals' day and night values, the main sleep and the
-        recovery score, best source per date."""
+        recovery score, best source per date; with ``per_provider`` one row per day and provider, naming no
+        source or device, as its groups may come from several of the provider's devices."""
         first_day, last_day = utc_date(start), utc_date(end - timedelta(microseconds=1))
         identity = ("recovery_date", "provider", "source", "device_model", "device_type")
 
@@ -883,9 +902,19 @@ class SummariesService:
             )
 
         results.sort(key=lambda r: _activity_key(r, "recovery_date"))
-        return self._filter_by_priority(
-            db_session, user_id, results, date_key="recovery_date", fill=RECOVERY_METRIC_GROUPS
+        per_provider = source_selection == SummarySourceSelection.PER_PROVIDER
+        picked = self._filter_by_priority(
+            db_session,
+            user_id,
+            results,
+            date_key="recovery_date",
+            fill=RECOVERY_METRIC_GROUPS,
+            per_provider=per_provider,
         )
+        if not per_provider:
+            return picked
+        picked = [{**row, "source": None, "device_model": None, "device_type": None} for row in picked]
+        return sorted(picked, key=lambda r: _activity_key(r, "recovery_date", source_selection))
 
     def _add_workout_only_days(
         self,
