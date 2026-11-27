@@ -8,10 +8,10 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import Engine, delete, text
+from sqlalchemy import Engine, delete, select, text
 from sqlalchemy.orm import Session
 
-from app.models import DataSource, EventRecord, HealthScore, SleepDetails, User
+from app.models import DataSource, EventRecord, HealthScore, ProviderPriority, SleepDetails, User
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate, SleepStage
 from app.services.event_record_service import event_record_service
@@ -392,6 +392,8 @@ def test_simultaneous_writers_hold_user_lock_through_creation_and_commit(engine:
     """Independent connections exercise the real transaction lock, not a Redis mock."""
     user_id = uuid4()
     with Session(engine) as setup:
+        # Creating the Apple data source adds Apple's provider priority; it is committed, so the cleanup removes it.
+        existing_priorities = setup.scalars(select(ProviderPriority.id)).all()
         setup.add(User(id=user_id, email=f"sleep-{user_id}@example.com"))
         setup.commit()
     first_ready, second_entered, release_first = Event(), Event(), Event()
@@ -450,4 +452,5 @@ def test_simultaneous_writers_hold_user_lock_through_creation_and_commit(engine:
         release_first.set()
         with Session(engine) as cleanup:
             cleanup.execute(delete(User).where(User.id == user_id))
+            cleanup.execute(delete(ProviderPriority).where(ProviderPriority.id.not_in(existing_priorities)))
             cleanup.commit()
