@@ -41,6 +41,7 @@ from app.services.sdk.sleep_service import (
     persist_sleep,
 )
 from app.services.sleep_nap_marking import sleep_gap_minutes
+from app.utils.security import create_access_token
 from tests.factories import UserFactory
 
 
@@ -1007,10 +1008,8 @@ class TestSDKSyncEndpointSleep:
         db: Session,
     ) -> None:
         """Endpoint should validate payload with 'sleeping' stage (older Apple Watch)."""
-        from app.services.sdk_token_service import create_sdk_user_token
-
         user_id = str(uuid4())
-        token = create_sdk_user_token("test_app", user_id)
+        token = create_access_token(subject=user_id, scope="sdk", app_id="test_app")
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
             mock_task.delay.return_value = None
@@ -1032,10 +1031,8 @@ class TestSDKSyncEndpointSleep:
         db: Session,
     ) -> None:
         """Endpoint should validate payload with detailed sleep stages."""
-        from app.services.sdk_token_service import create_sdk_user_token
-
         user_id = str(uuid4())
-        token = create_sdk_user_token("test_app", user_id)
+        token = create_access_token(subject=user_id, scope="sdk", app_id="test_app")
 
         with patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as mock_task:
             mock_task.delay.return_value = None

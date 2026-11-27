@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 from app.api.routes.v1.sdk_logs import submit_sdk_logs
 from app.api.routes.v1.sdk_sync import get_sdk_sync_status
 from app.database import _get_db_dependency
-from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.auth import get_sdk_auth
+from app.utils.security import create_access_token
 from tests.factories import ApiKeyFactory
 
 
@@ -42,7 +42,7 @@ class TestSdkAuthHoldsNoDbSession:
     @pytest.mark.asyncio
     async def test_sdk_token_needs_no_database(self) -> None:
         user_id = "123e4567-e89b-12d3-a456-426614174000"
-        token = create_sdk_user_token("app_123", user_id)
+        token = create_access_token(subject=user_id, scope="sdk", app_id="app_123")
 
         with patch("app.utils.auth.SessionLocal", side_effect=AssertionError("SDK token auth opened a session")):
             context = await get_sdk_auth(token=token, x_open_wearables_api_key=None)
