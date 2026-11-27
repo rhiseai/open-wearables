@@ -1,7 +1,6 @@
 """The reported sleep collision must not abort the rest of an Apple SDK import."""
 
 import json
-import logging
 from datetime import datetime
 from unittest.mock import patch
 
@@ -97,7 +96,7 @@ def _payload() -> str:
 def test_collision_import_saves_sleep_menstrual_events_and_sync_marker(db: Session) -> None:
     user, connection, own = _seed_collision()
     own_id = own.id
-    importer = ImportService(log=logging.getLogger("test.sleep-collision"))
+    importer = ImportService()
     with patch("app.services.sdk.sleep_service.celery_app"):
         for _ in range(2):
             result = importer.import_data_from_request(db, _payload(), "application/json", str(user.id))
@@ -126,20 +125,21 @@ def test_collision_import_saves_sleep_menstrual_events_and_sync_marker(db: Sessi
 
 def test_database_failure_rolls_back_sleep_and_reports_original_cause(db: Session) -> None:
     user, connection, _own = _seed_collision()
-    importer = ImportService(log=logging.getLogger("test.sleep-collision"))
+    importer = ImportService()
 
     def fail_detail(*args: object, **kwargs: object) -> None:
         db.execute(text("SELECT 1 / 0"))
 
     with (
         patch.object(event_record_service.event_record_detail_repo, "create_and_flush", side_effect=fail_detail),
-        patch("app.services.sdk.import_service.log_and_capture_error") as capture,
+        patch("app.services.sdk.import_service.logger") as logger,
     ):
         result = importer.import_data_from_request(db, _payload(), "application/json", str(user.id))
     assert result.status_code == 400
     assert "division by zero" in result.response
     assert "PendingRollback" not in result.response
-    assert "DivisionByZero" in str(capture.call_args.args[0])
+    # The error logged (and reported to Sentry) is the original cause, not the rollback it left
+    assert "DivisionByZero" in str(logger.error.call_args.kwargs["exc_info"])
     assert db.query(EventRecord).filter_by(category="sleep").count() == 2
     assert db.query(EventRecord).filter_by(category="menstrual_cycle").count() == 0
     db.refresh(connection)

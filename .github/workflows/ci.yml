@@ -7,6 +7,8 @@ on:
       - "backend/**"
       - "frontend/**"
       - "docs/openapi.json"
+      # make init; its tests run with the backend tests
+      - "scripts/**"
 
 jobs:
   # Detect which parts of the codebase changed
@@ -27,6 +29,7 @@ jobs:
           filters: |
             backend:
               - 'backend/**'
+              - 'scripts/**'
             frontend:
               - 'frontend/**'
             mcp:
@@ -100,7 +103,7 @@ jobs:
       - name: Check docs/openapi.json is up to date
         working-directory: backend
         env:
-          SECRET_KEY: ci-only-secret-key
+          SECRET_KEY: placeholder-not-a-real-secret-key-for-tooling
         run: uv run python scripts/export_openapi.py --check
 
   backend-test:
@@ -129,7 +132,7 @@ jobs:
       ENV: test
       TEST_DATABASE_URL: postgresql+psycopg://open-wearables:open-wearables@localhost:5432/open_wearables_test
       TEST_REDIS_URL: redis://localhost:6379/0
-      SECRET_KEY: test-secret-key-for-ci
+      SECRET_KEY: test-secret-key-for-ci-at-least-32-chars
       MASTER_KEY: dGVzdC1tYXN0ZXIta2V5LWZvci10ZXN0aW5nLW9ubHk=
     steps:
       - uses: actions/checkout@v4
@@ -146,12 +149,12 @@ jobs:
         run: uv sync --group dev --extra otel
       - name: Run tests with coverage
         working-directory: backend
-        run: uv run pytest -v --cov=app --cov-report=xml --cov-report=term-missing
+        run: uv run pytest --cov=app --cov-report=xml --cov-report=term-missing
       - name: Run OpenTelemetry tests without the otel extra
         working-directory: backend
         run: |
           uv sync --group dev
-          uv run pytest -v tests/utils_tests/test_otel_wiring.py tests/utils_tests/test_otel_export.py
+          uv run pytest tests/utils_tests/test_otel_wiring.py tests/utils_tests/test_otel_export.py
 
   backend-migrations:
     needs: changes

@@ -1,5 +1,4 @@
-from datetime import datetime, timedelta, timezone
-from logging import getLogger
+from datetime import datetime, timezone
 from typing import cast
 from uuid import UUID
 
@@ -13,16 +12,16 @@ from app.services.sdk.sleep_service import (
     active_users_key,
     delete_sleep_state,
     finish_sleep,
+    is_ready_to_finish,
     key,
     load_sleep_state,
     load_source_sleep_states,
     prune_sleep_state_registry,
     release_sleep_lock,
 )
-from app.services.sleep_naps import sleep_gap_minutes
-from app.utils.sentry_helpers import log_and_capture_error
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @shared_task(name=CeleryTask.FINALIZE_STALE_SLEEPS)
@@ -30,8 +29,9 @@ def finalize_stale_sleeps() -> None:
     """Housekeeping: close Redis sleep sessions that have gone quiet.
 
     Sessions are already flushed to Postgres on every SDK batch. This task only
-    needs to persist+close Redis state once :func:`sleep_gap_minutes` of quiet
-    time has elapsed (or re-flush if an earlier write failed).
+    needs to persist+close Redis state once :func:`is_ready_to_finish` says the
+    source's sleep gap has passed (or re-flush if an earlier write failed), and
+    to drop users whose states expired from the active set.
     """
     now = datetime.now(timezone.utc)
     redis_client = get_redis_client()
@@ -54,10 +54,7 @@ def finalize_stale_sleeps() -> None:
                         states[key(user_id)] = legacy
                     closed_keys = []
                     for storage_key, state in states.items():
-                        end_time = state.end_time
-                        if end_time.tzinfo is None:
-                            end_time = end_time.replace(tzinfo=timezone.utc)
-                        if now - end_time >= timedelta(minutes=sleep_gap_minutes(state.provider)):
+                        if is_ready_to_finish(state, now):
                             finish_sleep(db, user_id, state, commit=False)
                             closed_keys.append(storage_key)
                     db.commit()
@@ -69,9 +66,4 @@ def finalize_stale_sleeps() -> None:
 
             except Exception as e:
                 db.rollback()
-                log_and_capture_error(
-                    e,
-                    logger,
-                    "Error finalizing stale sleep",
-                    extra={"user_id": user_id},
-                )
+                logger.error("Error finalizing stale sleep", exc_info=e, user_id=user_id)

@@ -82,3 +82,33 @@ def test_deferred_sleep_is_retried_while_the_lock_is_busy(mock_session_local: Ma
     assert isinstance(retry.call_args.kwargs["exc"], SleepLockBusyError)
     assert 15 <= retry.call_args.kwargs["countdown"] <= 30
     assert _sleep_records(db, user.id) == []
+
+
+def _run_with_lock_busy(retries: int) -> tuple[object, MagicMock]:
+    """One attempt of the task at ``retries`` with the lock busy for the whole wait."""
+    with (
+        patch(f"{_MODULE}.SessionLocal", MagicMock()),
+        patch(f"{_MODULE}.handle_sleep_data", side_effect=SleepLockBusyError("busy")),
+        patch.object(process_sdk_sleep, "retry", side_effect=Retry()),
+        patch(f"{_MODULE}.logger") as logger,
+    ):
+        process_sdk_sleep.push_request(retries=retries)
+        try:
+            now = datetime.now(timezone.utc)
+            return process_sdk_sleep.run(
+                _sleep_json(now - timedelta(hours=1), now), "user-1", "deferred-batch", False
+            ), logger
+        finally:
+            process_sdk_sleep.pop_request()
+
+
+def test_a_busy_lock_before_the_last_attempt_is_retried() -> None:
+    with pytest.raises(Retry):
+        _run_with_lock_busy(process_sdk_sleep.max_retries - 1)
+
+
+def test_after_the_last_attempt_the_dropped_sleep_is_reported() -> None:
+    result, logger = _run_with_lock_busy(process_sdk_sleep.max_retries)
+
+    assert result == {"batch_id": "deferred-batch", "sleep_saved": 0, "sleep_dropped": 1}
+    assert logger.error.call_args.kwargs["alert"] is True

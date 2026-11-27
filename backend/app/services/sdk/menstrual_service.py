@@ -2,7 +2,7 @@
 
 HealthKit sends daily category samples (light/medium/heavy/…) plus optional
 ``HKMenstrualCycleStart`` metadata. That flag is stringified by the SDK and is
-**not** stored on ``DataPointSeries`` (no metadata column). Cycle-start
+**not** stored on ``SeriesSample`` (no metadata column). Cycle-start
 boundaries therefore come from the in-flight sync payload; historical
 re-grouping across syncs falls back to a gap > 1 day heuristic.
 
@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from logging import getLogger
 from uuid import UUID, uuid4
 
 from app.constants.series_types.sdk.category_types import (
@@ -23,15 +22,15 @@ from app.constants.series_types.sdk.category_types import (
 )
 from app.constants.series_types.sdk.metric_types import SDKMetricType
 from app.database import DbSession
-from app.models import DataPointSeries, DataSource, EventRecord
+from app.models import DataSource, EventRecord, SeriesSample
 from app.schemas.enums import EventCategory, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import EventRecordCreate, MenstrualCycleDetailCreate
 from app.schemas.providers.mobile_sdk import SyncRequest as SDKSyncRequest
 from app.services.event_record_service import event_record_service
 from app.services.sdk.device_resolution import extract_device_info
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 _LOOKBACK_DAYS = 45
 _EXTERNAL_ID_PREFIX = "apple-menstrual-"
@@ -89,9 +88,7 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
         )
         if orphans_deleted:
             db_session.commit()
-            log_structured(
-                logger,
-                "info",
+            logger.info(
                 "Apple menstrual cycle orphans cleared (no active flow)",
                 provider=request.provider or "apple",
                 action="apple_menstrual_assemble",
@@ -108,9 +105,9 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
         return 0
 
     # Device metadata from the first payload sample (best-effort).
-    device_model, software_version, original_source_name = extract_device_info(menstrual_records[0].source)
-    source_name = original_source_name or "Apple Health"
     provider = request.provider or "apple"
+    device_model, software_version, original_source_name = extract_device_info(menstrual_records[0].source, provider)
+    source_name = original_source_name or "Apple Health"
     now = datetime.now(timezone.utc)
 
     upserted = 0
@@ -177,9 +174,7 @@ def handle_menstrual_data(db_session: DbSession, request: SDKSyncRequest, user_i
 
     db_session.commit()
 
-    log_structured(
-        logger,
-        "info",
+    logger.info(
         "Apple menstrual cycle assembly completed",
         provider=provider,
         action="apple_menstrual_assemble",
@@ -238,15 +233,15 @@ def _load_flow_days(
     end_dt = datetime(window_end.year, window_end.month, window_end.day, tzinfo=timezone.utc) + timedelta(days=1)
 
     rows = (
-        db_session.query(DataPointSeries.recorded_at, DataPointSeries.value)
-        .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+        db_session.query(SeriesSample.recorded_at, SeriesSample.value)
+        .join(DataSource, SeriesSample.data_source_id == DataSource.id)
         .filter(
             DataSource.user_id == user_id,
-            DataPointSeries.series_type_definition_id == series_id,
-            DataPointSeries.recorded_at >= start_dt,
-            DataPointSeries.recorded_at < end_dt,
-            DataPointSeries.value >= 1,
-            DataPointSeries.value <= 4,
+            SeriesSample.series_type_definition_id == series_id,
+            SeriesSample.recorded_at >= start_dt,
+            SeriesSample.recorded_at < end_dt,
+            SeriesSample.value >= 1,
+            SeriesSample.value <= 4,
         )
         .all()
     )

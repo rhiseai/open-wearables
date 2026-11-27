@@ -26,7 +26,6 @@ class TestFinalizeStaleSleepsTask:
         mock_session_local: MagicMock,
         mock_redis_client_func: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task completes successfully when no active sleep sessions exist."""
         # Arrange
@@ -55,7 +54,6 @@ class TestFinalizeStaleSleepsTask:
         mock_load_state: MagicMock,
         mock_finish_sleep: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task finalizes sleep sessions older than threshold."""
         # Arrange
@@ -107,7 +105,6 @@ class TestFinalizeStaleSleepsTask:
         mock_load_state: MagicMock,
         mock_finish_sleep: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task does not finalize recent sleep sessions."""
         # Arrange
@@ -157,7 +154,6 @@ class TestFinalizeStaleSleepsTask:
         mock_redis_client_func: MagicMock,
         mock_load_state: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task gracefully handles users with no sleep state."""
         # Arrange
@@ -190,7 +186,6 @@ class TestFinalizeStaleSleepsTask:
         mock_load_state: MagicMock,
         mock_finish_sleep: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task processes multiple users with stale sessions."""
         # Arrange
@@ -258,7 +253,7 @@ class TestFinalizeStaleSleepsTask:
         mock_finish_sleep.assert_any_call(db, user_id_1, state_1, commit=False)
         mock_finish_sleep.assert_any_call(db, user_id_3, state_3, commit=False)
 
-    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.log_and_capture_error")
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.logger")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finish_sleep")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state")
     @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client")
@@ -271,7 +266,6 @@ class TestFinalizeStaleSleepsTask:
         mock_finish_sleep: MagicMock,
         mock_log_error: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task continues processing other users if one finalization fails."""
         # Arrange
@@ -331,7 +325,8 @@ class TestFinalizeStaleSleepsTask:
 
         # Assert
         assert mock_finish_sleep.call_count == 2
-        mock_log_error.assert_called_once()  # Error should be logged for user 1
+        # Error should be logged (and reported) for user 1
+        assert len([call for call in mock_log_error.error.call_args_list if call.kwargs.get("exc_info")]) == 1
 
         # Verify user 2 was still processed despite user 1 error
         mock_finish_sleep.assert_any_call(db, user_id_2, state_2, commit=False)
@@ -345,7 +340,6 @@ class TestFinalizeStaleSleepsTask:
         mock_redis_client_func: MagicMock,
         mock_load_state: MagicMock,
         db: Session,
-        mock_celery_app: MagicMock,
     ) -> None:
         """Verify task skips users whose sleep state cannot be parsed from Redis."""
         # Arrange

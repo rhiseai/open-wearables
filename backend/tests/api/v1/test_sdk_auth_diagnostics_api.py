@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
+from http import HTTPStatus
 from unittest.mock import patch
 
 import pytest
@@ -16,9 +17,10 @@ from app.config import settings
 from app.models import RefreshToken
 from app.schemas.auth import SDKTokenOrigin
 from app.services.refresh_token_service import refresh_token_service
-from app.services.sdk_token_service import create_sdk_user_token
 from app.utils.config_utils import LogFormat, LogLevel
 from app.utils.context import trace_id_var
+from app.utils.exceptions import status_code_name
+from app.utils.security import create_access_token
 from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
 
 USER_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -45,6 +47,13 @@ EVENT_KEYS = {
     "auth_reason",
     "auth_outcome",
 }
+SDK_CREDENTIALS_REQUIRED = "Authentication required: provide SDK token or API key"
+INVALID_REFRESH_TOKEN = "Invalid or revoked refresh token"
+
+
+def _problem(status: int, detail: str) -> dict:
+    """The RFC 9457 body app.main answers an error with."""
+    return {"title": HTTPStatus(status).phrase, "status": status, "detail": detail, "code": status_code_name(status)}
 
 
 @pytest.fixture(autouse=True)
@@ -131,7 +140,7 @@ def test_sdk_auth_reason_controls_real_access_log_without_changing_401(
     response = client.post(f"/api/v1/sdk/users/{USER_ID}/{endpoint}", headers=headers, json=payload)
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Authentication required: provide SDK token or API key"}
+    assert response.json() == _problem(401, SDK_CREDENTIALS_REQUIRED)
     assert "www-authenticate" not in response.headers
     output = capsys.readouterr().out
     [access] = _access_logs(output)
@@ -155,7 +164,7 @@ def test_expired_bearer_with_rejected_api_key_stays_error(
         json=ENDPOINTS[0][1],
     )
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid or missing API key"}
+    assert response.json() == _problem(401, "Invalid or missing API key")
     [access] = _access_logs(capsys.readouterr().out)
     assert access["level"] == "error"
     assert "auth_reason" not in access
@@ -184,7 +193,7 @@ def test_expired_request_does_not_downgrade_a_subsequent_real_sync_500(
         failing_client = TestClient(client.app, raise_server_exceptions=False)
         response = failing_client.post(
             endpoint,
-            headers={"Authorization": f"Bearer {create_sdk_user_token('test-app', USER_ID)}"},
+            headers={"Authorization": f"Bearer {create_access_token(subject=USER_ID, scope='sdk', app_id='test-app')}"},
             json=ENDPOINTS[0][1],
         )
     assert response.status_code == 500
@@ -224,11 +233,9 @@ def test_sdk_401_responses_and_safe_final_reasons(
     headers["X-Request-Id"] = PRIVATE_TRACE
     response = client.post(f"/api/v1/sdk/users/{USER_ID}/{endpoint}", headers=headers, json=payload)
     assert response.status_code == 401
-    assert response.json() == {
-        "detail": (
-            "Invalid or missing API key" if has_invalid_key else "Authentication required: provide SDK token or API key"
-        )
-    }
+    assert response.json() == _problem(
+        401, "Invalid or missing API key" if has_invalid_key else SDK_CREDENTIALS_REQUIRED
+    )
     assert "www-authenticate" not in response.headers
     output = capsys.readouterr().out
     [event] = _decisions(output)
@@ -243,7 +250,7 @@ def test_subject_mismatch_stays_403_and_cannot_enqueue_or_store(
     payload: dict,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    token = create_sdk_user_token("private-app-fixture", OTHER_USER_ID)
+    token = create_access_token(subject=OTHER_USER_ID, scope="sdk", app_id="private-app-fixture")
     with (
         patch("app.api.routes.v1.sdk_sync.process_sdk_upload") as task,
         patch("app.api.routes.v1.sdk_sync.store_raw_payload") as sync_store,
@@ -256,7 +263,7 @@ def test_subject_mismatch_stays_403_and_cannot_enqueue_or_store(
             json=payload,
         )
     assert response.status_code == 403
-    assert response.json() == {"detail": "Token does not match user_id"}
+    assert response.json() == _problem(403, "Token does not match user_id")
     assert "www-authenticate" not in response.headers
     task.delay.assert_not_called()
     sync_store.assert_not_called()
@@ -311,7 +318,7 @@ def test_rejected_refresh_credentials_preserve_401_and_bearer_challenge(
     capsys.readouterr()
     response = client.post("/api/v1/token/refresh", json={"refresh_token": token})
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid or revoked refresh token"}
+    assert response.json() == _problem(401, INVALID_REFRESH_TOKEN)
     assert response.headers["www-authenticate"] == "Bearer"
     output = capsys.readouterr().out
     [access] = _access_logs(output)
@@ -362,7 +369,7 @@ def test_rotation_logs_accepted_and_replay_recovers_until_the_successor_is_used(
     assert next_response.status_code == 200
     late_replay = client.post("/api/v1/token/refresh", json={"refresh_token": old})
     assert late_replay.status_code == 401
-    assert late_replay.json() == {"detail": "Invalid or revoked refresh token"}
+    assert late_replay.json() == _problem(401, INVALID_REFRESH_TOKEN)
     assert late_replay.headers["www-authenticate"] == "Bearer"
     output = capsys.readouterr().out
     first, recovered_replay, second, failed_replay = _decisions(output)
@@ -385,7 +392,8 @@ def test_rotation_logs_accepted_and_replay_recovers_until_the_successor_is_used(
 
 
 def test_unavailable_auth_stdout_preserves_http_401(client: TestClient) -> None:
-    with patch("app.utils.auth_diagnostics.log_structured", side_effect=OSError("unavailable output")):
+    with patch("app.utils.auth_diagnostics.logger.log", side_effect=OSError("unavailable output")) as decision_log:
         response = client.post(f"/api/v1/sdk/users/{USER_ID}/sync", json=ENDPOINTS[0][1])
+    decision_log.assert_called_once()
     assert response.status_code == 401
-    assert response.json() == {"detail": "Authentication required: provide SDK token or API key"}
+    assert response.json() == _problem(401, SDK_CREDENTIALS_REQUIRED)

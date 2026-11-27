@@ -25,7 +25,7 @@ from app.config import settings
 from app.constants.celery_tasks import CeleryTask
 from app.integrations.celery.tasks import process_sdk_upload_task
 from app.main import api, celery_app
-from app.models import ApiKey, DataPointSeries, DataSource, ProviderPriority, User, UserConnection
+from app.models import ApiKey, DataSource, ProviderPriority, SeriesSample, User, UserConnection
 from app.repositories.provider_priority_repository import ProviderPriorityRepository
 from app.schemas.enums import ProviderName
 from app.services.api_key_service import api_key_service
@@ -58,6 +58,8 @@ def _run_worker(
     redis_address = urlparse(redis_url)
     settings.redis_host = redis_address.hostname or "localhost"
     settings.redis_port = redis_address.port or 6379
+    # The xdist worker's own Redis database: database 0 is gw0's, whose rollup lock these workers would take.
+    settings.redis_db = int(redis_address.path.lstrip("/") or 0)
     settings.outgoing_webhooks_enabled = False
     settings.telemetry_enabled = False
     settings.persist_live_sync_runs = False
@@ -157,6 +159,8 @@ async def _probe_api(user_id: UUID, raw_key: str, start: datetime) -> None:
     assert timeseries.status_code == 200
 
 
+# Two spawned Celery workers take about 15 s to start, run and stop: past the suite's 10 s default.
+@pytest.mark.timeout(60)
 def test_historical_backlog_leaves_live_sdk_worker_available(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     redis_url = settings.redis_url
     producer = Celery("import-isolation-producer", broker=redis_url, backend=redis_url, set_as_current=False)
@@ -309,8 +313,8 @@ def test_historical_backlog_leaves_live_sdk_worker_available(engine: Engine, mon
 
         with sessions() as db:
             counts = db.execute(
-                select(DataSource.provider, func.count(DataPointSeries.id))
-                .join(DataPointSeries, DataPointSeries.data_source_id == DataSource.id)
+                select(DataSource.provider, func.count(SeriesSample.id))
+                .join(SeriesSample, SeriesSample.data_source_id == DataSource.id)
                 .where(DataSource.user_id == user_id)
                 .group_by(DataSource.provider)
             ).all()

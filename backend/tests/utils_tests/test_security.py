@@ -1,7 +1,7 @@
 """
 Tests for security utility functions.
 
-Tests JWT token creation, password hashing, and password verification.
+Tests JWT token creation (developer and SDK user tokens), password hashing, and password verification.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -139,40 +139,83 @@ class TestCreateAccessToken:
             jwt.decode(token, settings.secret_key, algorithms=["HS512"])
 
 
+class TestCreateAccessTokenExtraClaims:
+    """SDK user tokens are developer tokens plus `scope` and `app_id` claims."""
+
+    def test_sdk_token_carries_scope_and_app_id(self) -> None:
+        """SDK token should carry the subject, scope=sdk and the app_id claim."""
+        token = create_access_token(subject="user_456", scope="sdk", app_id="app_123")
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+
+        assert payload["sub"] == "user_456"
+        assert payload["scope"] == "sdk"
+        assert payload["app_id"] == "app_123"
+
+    def test_sdk_token_expires_after_configured_minutes(self) -> None:
+        """SDK token should expire after settings.access_token_expire_minutes."""
+        before = datetime.now(timezone.utc)
+        token = create_access_token(subject="user_456", scope="sdk", app_id="app_123")
+        after = datetime.now(timezone.utc)
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+
+        exp = datetime.fromtimestamp(payload["exp"], tz=timezone.utc)
+        assert before + timedelta(minutes=settings.access_token_expire_minutes - 1) < exp
+        assert exp < after + timedelta(minutes=settings.access_token_expire_minutes + 1)
+
+    def test_developer_token_has_no_extra_claims(self) -> None:
+        """Developer token without extra claims should only carry sub and exp."""
+        token = create_access_token(subject="developer_1")
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+
+        assert set(payload) == {"sub", "exp"}
+
+    def test_different_apps_and_users_get_distinct_claims(self) -> None:
+        """Different users and apps should get their own sub and app_id claims."""
+        token1 = create_access_token(subject="user_1", scope="sdk", app_id="app_1")
+        token2 = create_access_token(subject="user_2", scope="sdk", app_id="app_2")
+        payload1 = jwt.decode(token1, settings.secret_key, algorithms=[settings.algorithm])
+        payload2 = jwt.decode(token2, settings.secret_key, algorithms=[settings.algorithm])
+
+        assert (payload1["sub"], payload1["app_id"]) == ("user_1", "app_1")
+        assert (payload2["sub"], payload2["app_id"]) == ("user_2", "app_2")
+
+    def test_reserved_claims_cannot_be_overridden(self) -> None:
+        """Passing sub or exp as an extra claim should raise ValueError."""
+        with pytest.raises(ValueError, match="sub"):
+            create_access_token(subject="user_456", sub="forged")
+        with pytest.raises(ValueError, match="exp"):
+            create_access_token(subject="user_456", exp="forged")
+
+
 class TestPasswordHashing:
     """Test suite for password hashing and verification functions."""
 
     def test_get_password_hash_returns_bcrypt_format(self) -> None:
         """Test that password hash is in bcrypt format."""
-        # Note: This test is skipped in regular test runs because of fast_password_hashing fixture
-        # It's here to document expected behavior in production
         # Arrange
+        password = "test_password_123"
 
         # Act
-        # In production (without fast_password_hashing fixture) -> None:
-        # hashed = get_password_hash(password)
+        hashed = get_password_hash(password)
 
         # Assert
-        # assert hashed != password
-        # assert hashed.startswith("$2b$")  # bcrypt format
-        # assert len(hashed) == 60  # bcrypt hashes are 60 characters
-        pass
+        assert hashed != password
+        assert hashed.startswith("$2b$")
+        assert len(hashed) == 60
 
     def test_get_password_hash_different_for_same_password(self) -> None:
         """Test that hashing the same password twice produces different hashes."""
-        # Note: This behavior is important for bcrypt but not tested with fast_password_hashing
         # Arrange
+        password = "test_password_123"
 
         # Act
-        # In production (without fast_password_hashing fixture) -> None:
-        # hash1 = get_password_hash(password)
-        # hash2 = get_password_hash(password)
+        hash1 = get_password_hash(password)
+        hash2 = get_password_hash(password)
 
         # Assert
-        # assert hash1 != hash2  # Different salts produce different hashes
-        pass
+        assert hash1 != hash2  # Different salts produce different hashes
 
-    def test_verify_password_correct(self, fast_password_hashing: None) -> None:
+    def test_verify_password_correct(self) -> None:
         """Test verifying correct password."""
         # Arrange
         password = "correct_password_123"
@@ -184,7 +227,7 @@ class TestPasswordHashing:
         # Assert
         assert result is True
 
-    def test_verify_password_incorrect(self, fast_password_hashing: None) -> None:
+    def test_verify_password_incorrect(self) -> None:
         """Test verifying incorrect password."""
         # Arrange
         correct_password = "correct_password_123"
@@ -197,7 +240,7 @@ class TestPasswordHashing:
         # Assert
         assert result is False
 
-    def test_verify_password_empty_password(self, fast_password_hashing: None) -> None:
+    def test_verify_password_empty_password(self) -> None:
         """Test verifying empty password."""
         # Arrange
         hashed = get_password_hash("some_password")
@@ -208,7 +251,7 @@ class TestPasswordHashing:
         # Assert
         assert result is False
 
-    def test_verify_password_case_sensitive(self, fast_password_hashing: None) -> None:
+    def test_verify_password_case_sensitive(self) -> None:
         """Test that password verification is case-sensitive."""
         # Arrange
         password = "TestPassword123"
@@ -222,7 +265,7 @@ class TestPasswordHashing:
         assert result_uppercase is False
         assert result_lowercase is False
 
-    def test_verify_password_with_special_characters(self, fast_password_hashing: None) -> None:
+    def test_verify_password_with_special_characters(self) -> None:
         """Test password verification with special characters."""
         # Arrange
         password = "P@ssw0rd!#$%^&*()"
@@ -234,7 +277,7 @@ class TestPasswordHashing:
         # Assert
         assert result is True
 
-    def test_verify_password_with_unicode(self, fast_password_hashing: None) -> None:
+    def test_verify_password_with_unicode(self) -> None:
         """Test password verification with unicode characters."""
         # Arrange
         password = "пароль🔒密码"
@@ -246,7 +289,7 @@ class TestPasswordHashing:
         # Assert
         assert result is True
 
-    def test_get_password_hash_with_long_password(self, fast_password_hashing: None) -> None:
+    def test_get_password_hash_with_long_password(self) -> None:
         """Test hashing very long password gets truncated to 72 bytes."""
         # Arrange
         password = "a" * 100  # 100 character password exceeds bcrypt's 72 byte limit
@@ -273,7 +316,7 @@ class TestPasswordHashing:
         # Assert
         assert hashed is not None
 
-    def test_get_password_hash_truncates_over_limit(self, fast_password_hashing: None) -> None:
+    def test_get_password_hash_truncates_over_limit(self) -> None:
         """Test that passwords over 72 bytes are truncated."""
         # Arrange
         password_73 = "x" * 73
@@ -294,7 +337,7 @@ class TestPasswordHashing:
 class TestPasswordWorkflow:
     """Integration tests for password hashing and verification workflow."""
 
-    def test_full_password_workflow(self, fast_password_hashing: None) -> None:
+    def test_full_password_workflow(self) -> None:
         """Test complete workflow: hash -> store -> verify."""
         # Arrange
         original_password = "user_password_123"
@@ -317,7 +360,7 @@ class TestPasswordWorkflow:
         # Assert
         assert incorrect_verification is False
 
-    def test_multiple_users_same_password(self, fast_password_hashing: None) -> None:
+    def test_multiple_users_same_password(self) -> None:
         """Test that same password for different users produces different hashes."""
         # Arrange
         password = "common_password_123"
@@ -327,9 +370,7 @@ class TestPasswordWorkflow:
         user2_hash = get_password_hash(password)
 
         # Assert - Hashes should be different (due to salt)
-        # Note: With fast_password_hashing fixture, they might be the same
-        # This test documents expected production behavior
-        # In production with bcrypt: assert user1_hash != user2_hash
+        assert user1_hash != user2_hash
 
         # Both should verify successfully
         assert verify_password(password, user1_hash) is True

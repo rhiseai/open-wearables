@@ -3,18 +3,22 @@
 import math
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
-from logging import getLogger
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy.orm import Session
 
-from app.models import ProviderPriority
-from app.repositories import ProviderPriorityRepository
-from app.schemas.enums import HealthScoreCategory, ProviderName
+from app.integrations import rollup_queue
+from app.integrations.rollup_queue import requeue_dirty_days
+from app.models import DataSource, EventRecordAggregate, ProviderPriority
+from app.models.archival_setting import ArchivalSetting
+from app.repositories import AggregateRepository, EventRecordRepository, ProviderPriorityRepository
+from app.repositories.data_migration_repository import DataMigrationRepository
+from app.schemas.enums import ComputedBy, HealthScoreCategory, ProviderName, SeriesType, SummarySourceSelection
 from app.services.priority_service import priority_service
 from app.services.summaries_service import SummariesService
+from app.utils.exceptions import InvalidCursorError
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
@@ -25,16 +29,24 @@ from tests.factories import (
     SleepDetailsFactory,
     UserFactory,
     WorkoutDetailsFactory,
+    provider_day,
+    roll_up_everything,
 )
 
 
 @pytest.fixture
 def service() -> SummariesService:
-    return SummariesService(log=getLogger(__name__))
+    return SummariesService()
 
 
 def _dt(iso: str) -> datetime:
     return datetime.fromisoformat(iso)
+
+
+def _rollup_reached_the_history(db: Session) -> None:
+    db.merge(ArchivalSetting(id=1, rollup_enabled=True, delete_after_days=None))
+    DataMigrationRepository().mark_completed(db, "aggregate_backfill:rollup_all")
+    db.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +82,25 @@ class TestFilterByPriority:
         ]
         result = service._filter_by_priority(db, uuid4(), entries, date_key="sleep_date")
         assert len(result) == 1
+
+    def test_fills_metrics_the_winner_lacks_from_the_next_source(self, db: Session, service: SummariesService) -> None:
+        """A phone's steps and a watch's heart rate show on one day; a group the winner has part of stays its own."""
+        day = date(2026, 1, 1)
+        watch = {"activity_date": day, "provider": "garmin", "device_type": "watch", "steps_sum": 4000}
+        watch |= {"active_energy_sum": 300.0, "basal_energy_sum": None, "hr_avg": None}
+        band = {"activity_date": day, "provider": "garmin", "device_type": "band", "steps_sum": 9000}
+        band |= {"active_energy_sum": 500.0, "basal_energy_sum": 1500.0, "hr_avg": 60, "hr_max": 120, "hr_min": 50}
+
+        [result] = service._filter_by_priority(
+            db,
+            uuid4(),
+            [band, watch],
+            fill=(("steps_sum",), ("active_energy_sum", "basal_energy_sum"), ("hr_avg", "hr_max", "hr_min")),
+        )
+
+        assert (result["device_type"], result["steps_sum"]) == ("watch", 4000)
+        assert (result["active_energy_sum"], result["basal_energy_sum"]) == (300.0, None)
+        assert (result["hr_avg"], result["hr_max"], result["hr_min"]) == (60, 120, 50)
 
 
 # ---------------------------------------------------------------------------
@@ -111,8 +142,12 @@ class TestGetUserMaxHr:
 class TestGetSleepSummaries:
     def _make_sleep_record(self, user: Any, start: str, end: str) -> Any:
         ds = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        return self._make_session(ds, start, end)
+
+    @staticmethod
+    def _make_session(data_source: Any, start: str, end: str) -> Any:
         return EventRecordFactory(
-            data_source=ds,
+            data_source=data_source,
             category="sleep",
             type="sleep",
             start_datetime=_dt(start),
@@ -120,6 +155,27 @@ class TestGetSleepSummaries:
             duration_seconds=int((_dt(end) - _dt(start)).total_seconds()),
             zone_offset="+00:00",
         )
+
+    def test_activity_totals_cut_by_the_bounds_utc_dates_like_the_rest_of_the_summary(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """end=today at noon excludes today, as the workout and sleep queries of the same summary do."""
+        source = DataSourceFactory(provider=ProviderName.GARMIN, source="garmin")
+        provider_day(db, source, SeriesType.steps, date(2026, 3, 1), sum=Decimal("1000"))
+        provider_day(db, source, SeriesType.steps, date(2026, 3, 2), sum=Decimal("2000"))
+
+        totals = service.get_activity_totals(
+            db, source.user_id, _dt("2026-03-01T00:00:00+00:00"), _dt("2026-03-02T12:00:00+00:00")
+        )
+
+        assert (totals.days, totals.steps) == (1, 1000)
+
+    def test_a_bad_cursor_is_the_clients_error(self, db: Session, service: SummariesService) -> None:
+        with pytest.raises(InvalidCursorError) as raised:
+            service.get_sleep_summaries(
+                db, uuid4(), _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-07T00:00:00+00:00"), cursor="?", limit=10
+            )
+        assert raised.value.status_code == 400
 
     def test_returns_empty_when_no_data(self, db: Session, service: SummariesService) -> None:
         user = UserFactory()
@@ -152,6 +208,20 @@ class TestGetSleepSummaries:
         assert summary.duration_minutes == 8 * 60
         assert summary.source.provider == "garmin"
 
+    def test_a_day_value_sent_inside_the_sleep_counts_as_before(self, db: Session, service: SummariesService) -> None:
+        """Oura sends the night's SpO2 as a day value at 00:00 UTC, inside the sleep."""
+        user = UserFactory()
+        record = self._make_sleep_record(user, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(event_record=record)
+        source = db.get(DataSource, record.data_source_id)
+        provider_day(db, source, SeriesType.oxygen_saturation, date(2026, 1, 2), avg=Decimal("96.5"))
+
+        result = service.get_sleep_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-03T00:00:00+00:00"), cursor=None, limit=10
+        )
+
+        assert [night.avg_spo2_percent for night in result.data] == [96.5]
+
     def test_does_not_return_other_users_data(self, db: Session, service: SummariesService) -> None:
         user_a = UserFactory()
         user_b = UserFactory()
@@ -168,7 +238,7 @@ class TestGetSleepSummaries:
         assert result.data == []
 
     def test_physio_averages_within_sleep_window(self, db: Session, service: SummariesService) -> None:
-        """avg_heart_rate_bpm/avg_hrv_sdnn_ms are computed from data_point_series
+        """avg_heart_rate_bpm/avg_hrv_sdnn_ms are computed from series_sample
         samples within [min_start_time, max_end_time), independently per series
         type, and samples outside the window are excluded."""
         user = UserFactory()
@@ -208,6 +278,8 @@ class TestGetSleepSummaries:
             recorded_at=_dt("2026-01-02T12:00:00+00:00"),
         )
 
+        roll_up_everything(db)
+
         result = service.get_sleep_summaries(
             db,
             user.id,
@@ -220,6 +292,111 @@ class TestGetSleepSummaries:
         summary = result.data[0]
         assert summary.avg_heart_rate_bpm == 60
         assert summary.avg_hrv_sdnn_ms == 45
+
+    def test_a_night_takes_its_own_sleeps_values_the_providers_first(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """The ring's own night value wins over ours; the watch worn the same night fills only what the ring lacks."""
+        user = UserFactory()
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+        watch = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple")
+        record = EventRecordFactory(
+            data_source=ring,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T23:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T07:00:00+00:00"),
+            duration_seconds=8 * 3600,
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=record)
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        hrv_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate_variability_sdnn()
+        for hour, value in enumerate([60, 62]):
+            DataPointSeriesFactory(
+                data_source=ring, series_type=hr_type, value=value, recorded_at=_dt(f"2026-01-02T0{hour}:00:00+00:00")
+            )
+        DataPointSeriesFactory(
+            data_source=watch, series_type=hrv_type, value=45, recorded_at=_dt("2026-01-02T02:00:00+00:00")
+        )
+        roll_up_everything(db)
+        AggregateRepository(EventRecordAggregate).upsert(
+            db,
+            [
+                {
+                    "record_id": record.id,
+                    "series_type_definition_id": hr_type.id,
+                    "computed_by": ComputedBy.PROVIDER,
+                    "avg": Decimal("52"),
+                    "count": 1,
+                }
+            ],
+        )
+
+        summary = service.get_sleep_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-03T00:00:00+00:00"), cursor=None, limit=10
+        ).data[0]
+
+        assert (summary.avg_heart_rate_bpm, summary.avg_hrv_sdnn_ms) == (52, 45.0)
+
+    def test_a_night_not_rolled_up_yet_reads_its_own_devices_samples_first(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Before the 15-minute rollup has reached the night, the sleep's own watch is read, not the phone."""
+        user = UserFactory()
+        watch = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="Apple Watch")
+        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="iPhone")
+        record = EventRecordFactory(
+            data_source=watch,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T23:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T07:00:00+00:00"),
+            duration_seconds=8 * 3600,
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=record)
+        hrv_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate_variability_sdnn()
+        for source, value in ((watch, 50), (phone, 30)):
+            DataPointSeriesFactory(
+                data_source=source, series_type=hrv_type, value=value, recorded_at=_dt("2026-01-02T02:00:00+00:00")
+            )
+
+        summary = service.get_sleep_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-03T00:00:00+00:00"), cursor=None, limit=10
+        ).data[0]
+
+        assert summary.avg_hrv_sdnn_ms == 50
+
+    def test_per_provider_reads_only_the_sleeps_own_source(self, db: Session, service: SummariesService) -> None:
+        """Per provider, a night's physiology is its own source's: the phone's samples don't fill the ring's night."""
+        user = UserFactory()
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="iPhone")
+        record = self._make_session(ring, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(event_record=record)
+        at = _dt("2026-01-02T02:00:00+00:00")
+        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
+        hrv_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate_variability_sdnn()
+        DataPointSeriesFactory(data_source=ring, series_type=hr_type, value=55, recorded_at=at)
+        DataPointSeriesFactory(data_source=phone, series_type=hrv_type, value=30, recorded_at=at)
+
+        def night(selection: SummarySourceSelection) -> Any:
+            [summary] = service.get_sleep_summaries(
+                db,
+                user.id,
+                _dt("2026-01-01T00:00:00+00:00"),
+                _dt("2026-01-03T00:00:00+00:00"),
+                cursor=None,
+                limit=10,
+                source_selection=selection,
+            ).data
+            return summary
+
+        priority, per_provider = night(SummarySourceSelection.PRIORITY), night(SummarySourceSelection.PER_PROVIDER)
+
+        assert (priority.avg_hrv_sdnn_ms, per_provider.avg_hrv_sdnn_ms) == (30.0, None)
+        assert (per_provider.avg_heart_rate_bpm, per_provider.source.data_source_id) == (55, ring.id)
 
     def test_physio_averages_none_without_physio_data(self, db: Session, service: SummariesService) -> None:
         user = UserFactory()
@@ -312,6 +489,133 @@ class TestGetSleepSummaries:
         assert sorted(summary.date for summary in back.data) == nights[3:6]
         assert back.pagination.has_more is True
 
+    @staticmethod
+    def _timeline(start: str, *blocks: tuple[str, int]) -> list[dict[str, str]]:
+        """Back-to-back stage dicts from (stage, minutes) pairs."""
+        stages = []
+        current = _dt(start)
+        for stage, minutes in blocks:
+            end = current + timedelta(minutes=minutes)
+            stages.append({"stage": stage, "start_time": current.isoformat(), "end_time": end.isoformat()})
+            current = end
+        return stages
+
+    def _sleep_summary(self, db: Session, service: SummariesService, user: Any) -> Any:
+        result = service.get_sleep_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-03T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+        assert len(result.data) == 1
+        return result.data[0]
+
+    def test_interruptions_count_from_stage_timeline(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        record = self._make_sleep_record(user, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=record,
+            sleep_stages=self._timeline(
+                "2026-01-01T23:00:00+00:00",
+                ("awake", 15),
+                ("light", 60),
+                ("awake", 3),
+                ("light", 20),
+                ("awake", 5),
+                ("deep", 60),
+                ("awake", 10),
+                ("rem", 45),
+                ("awake", 6),
+                ("light", 30),
+                ("awake", 20),
+            ),
+        )
+
+        assert self._sleep_summary(db, service, user).interruptions_count == 2
+
+    def test_interruptions_count_is_none_without_main_sleep(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        nap = self._make_session(ds, "2026-01-02T14:00:00+00:00", "2026-01-02T15:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=nap,
+            is_nap=True,
+            sleep_stages=self._timeline("2026-01-02T14:00:00+00:00", ("light", 20), ("awake", 10), ("light", 30)),
+        )
+
+        assert self._sleep_summary(db, service, user).interruptions_count is None
+
+    def test_interruptions_count_is_none_without_stage_timeline(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        record = self._make_sleep_record(user, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(event_record=record)
+
+        assert self._sleep_summary(db, service, user).interruptions_count is None
+
+    def test_interruptions_count_is_none_without_a_sleep_stage_in_the_timeline(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        user = UserFactory()
+        record = self._make_sleep_record(user, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=record,
+            sleep_stages=self._timeline("2026-01-01T23:00:00+00:00", ("in_bed", 120), ("awake", 60), ("in_bed", 300)),
+        )
+
+        assert self._sleep_summary(db, service, user).interruptions_count is None
+
+    def test_interruptions_count_ignores_naps(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        night = self._make_session(ds, "2026-01-01T23:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=night,
+            sleep_stages=self._timeline("2026-01-01T23:00:00+00:00", ("light", 60), ("awake", 10), ("deep", 60)),
+        )
+        nap = self._make_session(ds, "2026-01-02T14:00:00+00:00", "2026-01-02T15:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=nap,
+            is_nap=True,
+            sleep_stages=self._timeline("2026-01-02T14:00:00+00:00", ("light", 20), ("awake", 10), ("light", 30)),
+        )
+
+        assert self._sleep_summary(db, service, user).interruptions_count == 1
+
+    def test_interruptions_count_sums_main_sessions(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        first = self._make_session(ds, "2026-01-01T22:00:00+00:00", "2026-01-02T02:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=first,
+            sleep_stages=self._timeline("2026-01-01T22:00:00+00:00", ("light", 60), ("awake", 10), ("deep", 60)),
+        )
+        second = self._make_session(ds, "2026-01-02T03:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=second,
+            sleep_stages=self._timeline(
+                "2026-01-02T03:00:00+00:00", ("light", 30), ("awake", 8), ("rem", 30), ("awake", 12), ("light", 30)
+            ),
+        )
+
+        assert self._sleep_summary(db, service, user).interruptions_count == 3
+
+    def test_interruptions_count_is_none_when_a_main_session_has_no_timeline(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        first = self._make_session(ds, "2026-01-01T22:00:00+00:00", "2026-01-02T02:00:00+00:00")
+        SleepDetailsFactory(
+            event_record=first,
+            sleep_stages=self._timeline("2026-01-01T22:00:00+00:00", ("light", 60), ("awake", 10), ("deep", 60)),
+        )
+        second = self._make_session(ds, "2026-01-02T03:00:00+00:00", "2026-01-02T07:00:00+00:00")
+        SleepDetailsFactory(event_record=second)
+
+        assert self._sleep_summary(db, service, user).interruptions_count is None
+
 
 class TestSleepPagingPerDate:
     """A page holds `limit` nights, however many sources recorded each one."""
@@ -385,6 +689,56 @@ class TestSleepPagingPerDate:
         ]
         assert back.pagination.has_more is True
 
+    def test_loads_sessions_for_the_page_nights_only(
+        self, db: Session, service: SummariesService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        user = self._two_sources_per_night(db)
+        loaded: list[tuple[date, date]] = []
+        load = EventRecordRepository._get_sleep_sessions
+
+        def spy(
+            repo: EventRecordRepository, db_session: Session, user_id: UUID, first: date, last: date, **kwargs: Any
+        ) -> Any:
+            loaded.append((first, last))
+            return load(repo, db_session, user_id, first, last, **kwargs)
+
+        monkeypatch.setattr(EventRecordRepository, "_get_sleep_sessions", spy)
+        page = service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
+
+        # The page's nights only: not the one read to tell whether there is more, not the whole range
+        assert loaded == [(self.NIGHTS[0], self.NIGHTS[1])]
+        assert [[s.end_time.date() for s in summary.sessions or []] for summary in page.data] == [
+            [night] for night in self.NIGHTS[:2]
+        ]
+
+    def test_reads_stage_timelines_for_the_page_main_sleeps_only(
+        self, db: Session, service: SummariesService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        user = self._two_sources_per_night(db)
+        garmin = db.query(DataSource).filter_by(user_id=user.id, provider=ProviderName.GARMIN).one()
+        nap = EventRecordFactory(
+            data_source=garmin,
+            category="sleep",
+            type="sleep",
+            start_datetime=datetime(2026, 1, 2, 14, tzinfo=timezone.utc),
+            end_datetime=datetime(2026, 1, 2, 15, tzinfo=timezone.utc),
+            duration_seconds=3600,
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=nap, is_nap=True)
+        read: list[UUID] = []
+        load = EventRecordRepository._sleep_stages
+
+        def spy(db_session: Session, record_ids: list[UUID]) -> Any:
+            read.extend(record_ids)
+            return load(db_session, record_ids)
+
+        monkeypatch.setattr(EventRecordRepository, "_sleep_stages", staticmethod(spy))
+        service.get_sleep_summaries(db, user.id, self.START, self.END, cursor=None, limit=2)
+
+        # Garmin's main sleeps on the page's two nights: not Oura's, not the nap
+        assert sorted(read) == [UUID(f"ffffffff-0000-0000-0000-{n:012d}") for n in range(2)]
+
 
 # ---------------------------------------------------------------------------
 # get_recovery_summaries
@@ -392,37 +746,65 @@ class TestSleepPagingPerDate:
 
 
 class TestGetRecoverySummaries:
-    def test_rmssd_input_is_exposed_as_rmssd_not_sdnn(
-        self, service: SummariesService, monkeypatch: pytest.MonkeyPatch
+    def test_days_without_a_recovery_score_come_from_the_series_and_sleep(
+        self, db: Session, service: SummariesService
     ) -> None:
-        row = {
-            "recovery_date": date(2026, 1, 2),
-            "provider": "whoop",
-            "source": "whoop",
-            "device_model": "WHOOP",
-            "device_type": "band",
-            "record_id": uuid4(),
-            "recorded_at": _dt("2026-01-02T00:00:00+00:00"),
-            "recovery_score": 74,
-            "resting_heart_rate": 51,
-            "hrv_rmssd_milli": 63.2,
-            "spo2_percentage": 98.4,
-        }
-        monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_: [row])
-        monkeypatch.setattr(service, "_priority_orders", lambda *_: ({}, {}))
+        user = UserFactory()
+        garmin = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        apple = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        provider_day(db, garmin, SeriesType.resting_heart_rate, date(2026, 1, 2), avg=Decimal("52"))
+        provider_day(db, garmin, SeriesType.heart_rate_variability_rmssd, date(2026, 1, 2), avg=Decimal("65"))
+        night = EventRecordFactory(
+            data_source=garmin,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T23:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T07:00:00+00:00"),
+            duration_seconds=28800,
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(event_record=night, sleep_efficiency_score=Decimal("95"))
+        provider_day(db, apple, SeriesType.heart_rate_variability_sdnn, date(2026, 1, 3), avg=Decimal("48"))
 
         result = service.get_recovery_summaries(
-            db_session=None,
-            user_id=uuid4(),
-            start_date=_dt("2026-01-01T00:00:00+00:00"),
-            end_date=_dt("2026-01-03T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
         )
 
-        summary = result.data[0]
-        assert summary.avg_hrv_sdnn_ms is None
-        assert summary.avg_hrv_rmssd_ms == 63.2
+        garmin_day, apple_day = result.data
+        assert (garmin_day.date, garmin_day.source.provider) == (date(2026, 1, 2), "garmin")
+        assert garmin_day.resting_heart_rate_bpm == 52
+        assert garmin_day.avg_hrv_rmssd_ms == 65.0
+        assert garmin_day.avg_hrv_sdnn_ms is None
+        assert garmin_day.sleep_duration_seconds == 28800
+        assert garmin_day.sleep_efficiency_percent == 95.0
+        assert garmin_day.recovery_score is None
+        assert (apple_day.date, apple_day.source.provider) == (date(2026, 1, 3), "apple")
+        assert apple_day.avg_hrv_sdnn_ms == 48.0
+        assert apple_day.avg_hrv_rmssd_ms is None
+
+    def test_a_score_lands_on_its_local_day_beside_that_days_vitals(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """23:30 UTC at +02:00 is the next local day, the one the vitals and the night are read on."""
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop", device_type="band")
+        provider_day(db, whoop, SeriesType.resting_heart_rate, date(2026, 1, 3), avg=Decimal("50"))
+        HealthScoreFactory(
+            data_source=whoop,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.RECOVERY,
+            recorded_at=_dt("2026-01-02T23:30:00+00:00"),
+            zone_offset="+02:00",
+            value=Decimal("70"),
+        )
+
+        result = service.get_recovery_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
+        )
+
+        assert [(day.date, day.resting_heart_rate_bpm, day.recovery_score) for day in result.data] == [
+            (date(2026, 1, 3), 50, 70)
+        ]
 
     def test_pages_whole_days_when_two_providers_score_each_day(self, db: Session, service: SummariesService) -> None:
         # As with sleep: two scores a day halved a page counted in scores and split a day.
@@ -563,6 +945,8 @@ class TestGetActivitySummaries:
                 recorded_at=_dt(f"2026-01-01T10:0{i}:00+00:00"),
             )
 
+        roll_up_everything(db)
+
         result = service.get_activity_summaries(
             db,
             user.id,
@@ -574,130 +958,60 @@ class TestGetActivitySummaries:
         assert len(result.data) == 1
         assert result.data[0].steps == 3000
 
-    def test_fills_watch_gaps_from_phone_hours(self, db: Session, service: SummariesService) -> None:
-        user = UserFactory()
-        watch = DataSourceFactory(
-            user=user,
-            provider=ProviderName.APPLE,
-            source="watch",
-            device_model="Watch7,1",
-            device_type="watch",
-        )
-        phone = DataSourceFactory(
-            user=user,
-            provider=ProviderName.APPLE,
-            source="phone",
-            device_model="iPhone15,2",
-            device_type="phone",
-        )
+    def _apple_steps(self, user: Any, values: list[int]) -> Any:
+        ds = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
         steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        for i, value in enumerate(values):
+            DataPointSeriesFactory(
+                data_source=ds, series_type=steps_type, value=value, recorded_at=_dt(f"2026-01-01T10:0{i}:00+00:00")
+            )
+        return ds
+
+    def _day(self, db: Session, service: SummariesService, user: Any) -> list:
+        return service.get_activity_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-02T00:00:00+00:00"), cursor=None, limit=10
+        ).data
+
+    def test_a_day_without_a_day_row_is_counted_from_the_samples(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        self._apple_steps(user, [1000, 250])
+
+        assert [day.steps for day in self._day(db, service, user)] == [1250]
+
+    def test_a_day_row_wins_over_the_samples(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        ds = self._apple_steps(user, [1000, 250])
+        provider_day(db, ds, SeriesType.steps, date(2026, 1, 1), sum=Decimal("9000"))
+
+        assert [day.steps for day in self._day(db, service, user)] == [9000]
+
+    def test_once_the_rollup_reached_the_history_the_samples_are_not_read(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        user = UserFactory()
+        self._apple_steps(user, [1000, 250])
+        _rollup_reached_the_history(db)
+
+        assert self._day(db, service, user) == []
+
+    def test_a_queued_day_is_counted_from_its_samples_not_its_old_row(
+        self, db: Session, service: SummariesService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Samples newer than the last rollup run: the summary follows them, as the day reads do."""
+        user = UserFactory()
+        ds = self._apple_steps(user, [1000, 250])
+        roll_up_everything(db)
+        _rollup_reached_the_history(db)
         DataPointSeriesFactory(
-            data_source=watch,
-            series_type=steps_type,
+            data_source=ds,
+            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
             value=500,
-            recorded_at=_dt("2026-01-01T08:00:00+00:00"),
+            recorded_at=_dt("2026-01-01T12:00:00+00:00"),
         )
-        DataPointSeriesFactory(
-            data_source=phone,
-            series_type=steps_type,
-            value=6000,
-            recorded_at=_dt("2026-01-01T15:00:00+00:00"),
-        )
+        requeue_dirty_days([(ds.id, date(2026, 1, 1))])
+        monkeypatch.setattr(rollup_queue, "QUEUED_DAYS_TIMEOUT_SECONDS", 5)
 
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
-
-        assert result.data[0].source.device == "Watch7,1"
-        assert result.data[0].steps == 6500
-
-    def test_does_not_double_count_devices_in_the_same_hour(self, db: Session, service: SummariesService) -> None:
-        user = UserFactory()
-        watch = DataSourceFactory(
-            user=user,
-            provider=ProviderName.APPLE,
-            source="watch",
-            device_model="Watch7,1",
-            device_type="watch",
-        )
-        phone = DataSourceFactory(
-            user=user,
-            provider=ProviderName.APPLE,
-            source="phone",
-            device_model="iPhone15,2",
-            device_type="phone",
-        )
-        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
-        DataPointSeriesFactory(
-            data_source=watch,
-            series_type=steps_type,
-            value=500,
-            recorded_at=_dt("2026-01-01T08:00:00+00:00"),
-        )
-        DataPointSeriesFactory(
-            data_source=phone,
-            series_type=steps_type,
-            value=6000,
-            recorded_at=_dt("2026-01-01T08:30:00+00:00"),
-        )
-
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
-
-        assert result.data[0].steps == 6000
-
-    def test_keeps_a_larger_provider_daily_total(self, db: Session, service: SummariesService) -> None:
-        user = UserFactory()
-        watch = DataSourceFactory(
-            user=user,
-            provider=ProviderName.GARMIN,
-            source="garmin_daily",
-            device_model="Fenix 8",
-            device_type="watch",
-        )
-        phone = DataSourceFactory(
-            user=user,
-            provider=ProviderName.GARMIN,
-            source="garmin_samples",
-            device_model="Android phone",
-            device_type="phone",
-        )
-        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
-        DataPointSeriesFactory(
-            data_source=watch,
-            series_type=steps_type,
-            value=10000,
-            is_daily_total=True,
-            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
-        )
-        DataPointSeriesFactory(
-            data_source=phone,
-            series_type=steps_type,
-            value=6000,
-            recorded_at=_dt("2026-01-01T15:00:00+00:00"),
-        )
-
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
-
-        assert result.data[0].steps == 10000
+        assert [day.steps for day in self._day(db, service, user)] == [1750]
 
     def _ring_and_watch(self, db: Session, user: Any, top: ProviderName = ProviderName.OURA) -> tuple[Any, Any]:
         """A top-ranked ring or band without a device model, and an Apple Watch ranked below it."""
@@ -736,58 +1050,29 @@ class TestGetActivitySummaries:
                 recorded_at=_dt("2026-01-01T10:00:00+00:00") + timedelta(minutes=minute),
             )
 
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
+        day = self._day(db, service, user)[0]
 
-        day = result.data[0]
-        assert day.steps == 3600
-        assert (day.source.provider, day.source.device) == ("apple", "Watch7,1")
+        # The row is the top provider's; the steps it lacks come from the watch.
+        assert (day.steps, day.source.provider) == (3600, "oura")
         assert day.heart_rate is not None
         assert day.heart_rate.avg_bpm == 130
-        # The derived minutes follow the samples they are derived from: the step
-        # threshold runs over the watch, the heart-rate zones over the ring.
-        assert day.active_minutes == 3
-        assert day.intensity_minutes is not None
-        assert day.intensity_minutes.moderate == 2
 
     def test_an_energy_only_provider_does_not_hide_steps(self, db: Session, service: SummariesService) -> None:
         """Whoop stores a daily total energy and no steps; the steps still come from the next provider."""
         user = UserFactory()
         band, watch = self._ring_and_watch(db, user, top=ProviderName.WHOOP)
-        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
-        total_type = SeriesTypeDefinitionFactory.get_or_create_total_energy()
-        energy_type = SeriesTypeDefinitionFactory.get_or_create_energy()
-        basal_type = SeriesTypeDefinitionFactory.get_or_create_basal_energy()
-        DataPointSeriesFactory(
-            data_source=band,
-            series_type=total_type,
-            value=2500,
-            is_daily_total=True,
-            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
-        )
+        provider_day(db, band, SeriesType.total_energy, date(2026, 1, 1), sum=Decimal("2500"))
         at = _dt("2026-01-01T10:00:00+00:00")
-        DataPointSeriesFactory(data_source=watch, series_type=steps_type, value=3600, recorded_at=at)
-        DataPointSeriesFactory(data_source=watch, series_type=energy_type, value=400, recorded_at=at)
-        DataPointSeriesFactory(data_source=watch, series_type=basal_type, value=1700, recorded_at=at)
+        for series_type, value in (
+            (SeriesTypeDefinitionFactory.get_or_create_steps(), 3600),
+            (SeriesTypeDefinitionFactory.get_or_create_energy(), 400),
+            (SeriesTypeDefinitionFactory.get_or_create_basal_energy(), 1700),
+        ):
+            DataPointSeriesFactory(data_source=watch, series_type=series_type, value=value, recorded_at=at)
 
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
+        day = self._day(db, service, user)[0]
 
-        day = result.data[0]
-        assert day.steps == 3600
-        assert day.source.provider == "apple"
+        assert (day.steps, day.source.provider) == (3600, "whoop")
         # Energy comes whole from the band: its total is not replaced by the watch's
         # active and basal energy.
         assert day.active_calories_kcal is None
@@ -799,51 +1084,43 @@ class TestGetActivitySummaries:
         """The top provider keeps the metrics it has; only the ones it lacks fall through."""
         user = UserFactory()
         ring, watch = self._ring_and_watch(db, user)
+        provider_day(db, ring, SeriesType.steps, date(2026, 1, 1), sum=Decimal("2128"))
+        at = _dt("2026-01-01T10:00:00+00:00")
         steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
         flights_type = SeriesTypeDefinitionFactory.get_or_create_flights_climbed()
-        DataPointSeriesFactory(
-            data_source=ring,
-            series_type=steps_type,
-            value=2128,
-            is_daily_total=True,
-            recorded_at=_dt("2026-01-01T00:00:00+00:00"),
-        )
-        at = _dt("2026-01-01T10:00:00+00:00")
         DataPointSeriesFactory(data_source=watch, series_type=steps_type, value=3600, recorded_at=at)
         DataPointSeriesFactory(data_source=watch, series_type=flights_type, value=12, recorded_at=at)
 
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
+        day = self._day(db, service, user)[0]
 
-        day = result.data[0]
         assert (day.steps, day.source.provider) == (2128, "oura")
         assert day.floors_climbed == 12
+
+    def test_a_heart_rate_only_day_row_has_no_step_or_energy_sum(self, db: Session, service: SummariesService) -> None:
+        """A day only its row holds (its samples archived or deleted) with heart rate alone has no steps, not zero."""
+        user = UserFactory()
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_model=None)
+        provider_day(db, ring, SeriesType.heart_rate, date(2026, 1, 1), avg=Decimal("62"))
+
+        [day] = self._day(db, service, user)
+
+        assert (day.steps, day.active_calories_kcal, day.total_calories_kcal) == (None, None, None)
+        assert day.heart_rate is not None
+        assert day.heart_rate.avg_bpm == 62
 
     def test_a_day_without_steps_from_any_source_has_null_steps(self, db: Session, service: SummariesService) -> None:
         """Heart rate alone is a day with no step count, not a day of zero steps and zero calories."""
         user = UserFactory()
         ring, _watch = self._ring_and_watch(db, user)
-        hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
         DataPointSeriesFactory(
-            data_source=ring, series_type=hr_type, value=62, recorded_at=_dt("2026-01-01T09:00:00+00:00")
+            data_source=ring,
+            series_type=SeriesTypeDefinitionFactory.get_or_create_heart_rate(),
+            value=62,
+            recorded_at=_dt("2026-01-01T09:00:00+00:00"),
         )
 
-        result = service.get_activity_summaries(
-            db,
-            user.id,
-            _dt("2026-01-01T00:00:00+00:00"),
-            _dt("2026-01-02T00:00:00+00:00"),
-            cursor=None,
-            limit=10,
-        )
+        day = self._day(db, service, user)[0]
 
-        day = result.data[0]
         assert (day.steps, day.active_calories_kcal, day.total_calories_kcal) == (None, None, None)
         assert day.heart_rate is not None
         assert day.heart_rate.avg_bpm == 62
@@ -871,6 +1148,10 @@ class TestGetActivitySummaries:
         assert [(d.date, d.source.provider, d.steps) for d in result.data] == [(date(2026, 1, 1), "strava", None)]
 
     def test_takes_elevation_from_the_winning_provider_only(self, db: Session, service: SummariesService) -> None:
+        # Without a ranking both tie, and the winner would be whichever row the database returned first.
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.GARMIN, 1)
+        priorities.upsert(db, ProviderName.STRAVA, 2)
         user = UserFactory()
         steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
         elevations = {ProviderName.GARMIN: "100", ProviderName.STRAVA: "900"}
@@ -921,6 +1202,122 @@ class TestGetActivitySummaries:
         assert result.data == []
 
 
+class TestActivityPerProvider:
+    """``per_provider``: one row per day and provider, from that provider's own devices only."""
+
+    @staticmethod
+    def _apple(user: Any) -> tuple[Any, Any]:
+        watch = DataSourceFactory(
+            user=user, provider=ProviderName.APPLE, source="watch", device_model="Watch7,1", device_type="watch"
+        )
+        phone = DataSourceFactory(
+            user=user, provider=ProviderName.APPLE, source="phone", device_model="iPhone15,2", device_type="phone"
+        )
+        return watch, phone
+
+    @staticmethod
+    def _steps(source: Any, value: int, at: str) -> None:
+        DataPointSeriesFactory(
+            data_source=source,
+            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
+            value=value,
+            recorded_at=_dt(at),
+        )
+
+    @staticmethod
+    def _days(db: Session, service: SummariesService, user: Any) -> list:
+        return service.get_activity_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-02T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+            source_selection=SummarySourceSelection.PER_PROVIDER,
+        ).data
+
+    def test_fills_watch_gaps_from_phone_hours(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch, phone = self._apple(user)
+        self._steps(watch, 500, "2026-01-01T08:00:00+00:00")
+        self._steps(phone, 6000, "2026-01-01T15:00:00+00:00")
+
+        [day] = self._days(db, service, user)
+
+        assert (day.source.provider, day.source.device, day.steps) == ("apple", None, 6500)
+
+    def test_does_not_double_count_devices_in_the_same_hour(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch, phone = self._apple(user)
+        self._steps(watch, 500, "2026-01-01T08:00:00+00:00")
+        self._steps(phone, 6000, "2026-01-01T08:30:00+00:00")
+
+        assert [day.steps for day in self._days(db, service, user)] == [6000]
+
+    def test_keeps_a_larger_provider_daily_total(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch = DataSourceFactory(
+            user=user, provider=ProviderName.GARMIN, source="garmin", device_model="Fenix 8", device_type="watch"
+        )
+        phone = DataSourceFactory(
+            user=user, provider=ProviderName.GARMIN, source="garmin", device_model="Android", device_type="phone"
+        )
+        provider_day(db, watch, SeriesType.steps, date(2026, 1, 1), sum=Decimal("10000"))
+        self._steps(phone, 6000, "2026-01-01T15:00:00+00:00")
+
+        assert [day.steps for day in self._days(db, service, user)] == [10000]
+
+    def test_each_provider_keeps_its_own_metrics_and_derived_minutes(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """No fill across providers; the minutes follow the samples they are derived from."""
+        user = UserFactory()
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_type="ring")
+        watch, _phone = self._apple(user)
+        priority_service.update_provider_priority(db, ProviderName.OURA, 1)
+        priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
+        for minute in range(2):
+            DataPointSeriesFactory(
+                data_source=ring,
+                series_type=SeriesTypeDefinitionFactory.get_or_create_heart_rate(),
+                value=130,
+                recorded_at=_dt("2026-01-01T09:00:00+00:00") + timedelta(minutes=minute),
+            )
+        for minute in range(3):
+            self._steps(watch, 1200, f"2026-01-01T10:0{minute}:00+00:00")
+
+        by_provider = {day.source.provider: day for day in self._days(db, service, user)}
+
+        assert set(by_provider) == {"oura", "apple"}
+        oura, apple = by_provider["oura"], by_provider["apple"]
+        assert (oura.steps, apple.steps) == (None, 3600)
+        assert oura.heart_rate is not None
+        assert oura.heart_rate.avg_bpm == 130
+        assert apple.heart_rate is None
+        assert (oura.active_minutes, apple.active_minutes) == (None, 3)
+        assert oura.intensity_minutes is not None
+        assert oura.intensity_minutes.moderate == 2
+        assert apple.intensity_minutes is None
+
+    def test_a_workout_only_provider_gets_its_own_row(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        watch, _phone = self._apple(user)
+        self._steps(watch, 3600, "2026-01-01T10:00:00+00:00")
+        strava = DataSourceFactory(user=user, provider=ProviderName.STRAVA, source="strava")
+        EventRecordFactory(
+            data_source=strava,
+            category="workout",
+            type="running",
+            start_datetime=_dt("2026-01-01T10:00:00+00:00"),
+            end_datetime=_dt("2026-01-01T11:00:00+00:00"),
+            zone_offset="+00:00",
+        )
+
+        days = self._days(db, service, user)
+
+        assert sorted((day.source.provider, day.steps) for day in days) == [("apple", 3600), ("strava", None)]
+
+
 class TestActivityPagingWindow:
     """Each page aggregates only a window of days around it, widened as needed."""
 
@@ -944,6 +1341,7 @@ class TestActivityPagingWindow:
             cursor = None
             pages = []
             while True:
+                roll_up_everything(db)
                 page = service.get_activity_summaries(db, user.id, start, end, cursor=cursor, limit=3, sort_order=order)
                 pages.append(page)
                 seen += [summary.date for summary in page.data]
@@ -972,6 +1370,8 @@ class TestActivityTotals:
             )
         end = _dt("2026-02-01T00:00:00+00:00")
 
+        roll_up_everything(db)
+
         totals = service.get_activity_totals(db, user.id, start, end)
         days = service.get_activity_summaries(db, user.id, start, end, cursor=None, limit=100).data
 
@@ -983,12 +1383,9 @@ class TestActivityTotals:
         """A day the ring only synced heart rate for counts as a day, but not as zero steps in the average."""
         user = UserFactory()
         ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura", device_model=None)
-        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
         hr_type = SeriesTypeDefinitionFactory.get_or_create_heart_rate()
         start = _dt("2026-01-01T00:00:00+00:00")
-        DataPointSeriesFactory(
-            data_source=ring, series_type=steps_type, value=4000, is_daily_total=True, recorded_at=start
-        )
+        provider_day(db, ring, SeriesType.steps, start.date(), sum=Decimal("4000"))
         DataPointSeriesFactory(
             data_source=ring, series_type=hr_type, value=60, recorded_at=start + timedelta(days=1, hours=9)
         )
@@ -1017,6 +1414,8 @@ class TestActivityTotals:
         )
         end = _dt("2026-01-03T00:00:00+00:00")
 
+        roll_up_everything(db)
+
         days = service.get_activity_summaries(db, user.id, start, end, cursor=None, limit=10).data
         totals = service.get_activity_totals(db, user.id, start, end)
 
@@ -1028,3 +1427,123 @@ class TestActivityTotals:
             db, UserFactory().id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-02-01T00:00:00+00:00")
         )
         assert (totals.days, totals.steps, totals.avg_steps) == (0, 0, None)
+
+
+class TestBodySummaryAverages:
+    def test_a_resting_pulse_sent_on_the_sleep_counts_beside_the_day_values(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Oura, Whoop, Suunto and Withings send the night's resting pulse on the sleep, not on the day."""
+        user = UserFactory()
+        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+        yesterday = date.today() - timedelta(days=1)
+        provider_day(db, watch, SeriesType.resting_heart_rate, yesterday, avg=Decimal("60"))
+        night = EventRecordFactory(
+            data_source=ring,
+            category="sleep",
+            type="sleep",
+            start_datetime=datetime.combine(yesterday, datetime.min.time(), timezone.utc) - timedelta(hours=1),
+            end_datetime=datetime.combine(yesterday, datetime.min.time(), timezone.utc) + timedelta(hours=7),
+            zone_offset="+00:00",
+        )
+        rhr = SeriesTypeDefinitionFactory.get_or_create_resting_heart_rate()
+        AggregateRepository(EventRecordAggregate).upsert(
+            db,
+            [
+                {
+                    "record_id": night.id,
+                    "series_type_definition_id": rhr.id,
+                    "computed_by": ComputedBy.PROVIDER,
+                    "avg": Decimal("52"),
+                    "count": 1,
+                }
+            ],
+        )
+
+        body = service.get_body_summary(db, user.id, 7, 24)
+
+        assert body is not None
+        assert body.averaged.resting_heart_rate_bpm == 56
+
+    def test_a_resting_pulse_without_a_day_row_is_counted_from_the_samples(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        user = UserFactory()
+        phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        rhr = SeriesTypeDefinitionFactory.get_or_create_resting_heart_rate()
+        noon = datetime.combine(date.today() - timedelta(days=1), datetime.min.time(), timezone.utc) + timedelta(
+            hours=12
+        )
+        for minutes, value in ((0, 50), (30, 54)):
+            DataPointSeriesFactory(
+                data_source=phone, series_type=rhr, value=value, recorded_at=noon + timedelta(minutes=minutes)
+            )
+
+        body = service.get_body_summary(db, user.id, 7, 24)
+
+        assert body is not None
+        assert body.averaged.resting_heart_rate_bpm == 52
+
+    def test_a_day_takes_the_preferred_sources_value_not_the_mean_of_all(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Sources measure a vital differently; a day is the preferred one's, never a blend across ranks."""
+        user = UserFactory()
+        watch = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        ring = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.OURA, 1)
+        priorities.upsert(db, ProviderName.GARMIN, 2)
+        yesterday, before = date.today() - timedelta(days=1), date.today() - timedelta(days=2)
+        provider_day(db, watch, SeriesType.resting_heart_rate, yesterday, avg=Decimal("60"))
+        provider_day(db, ring, SeriesType.resting_heart_rate, yesterday, avg=Decimal("50"))
+        provider_day(db, watch, SeriesType.resting_heart_rate, before, avg=Decimal("62"))
+
+        body = service.get_body_summary(db, user.id, 7, 24)
+
+        assert body is not None
+        assert body.averaged.resting_heart_rate_bpm == 56  # the ring's 50, and the watch's 62 on its own day
+
+
+class TestBodySummarySlowChanging:
+    def _reading(self, source: object, series: object, at: datetime, value: str) -> None:
+        DataPointSeriesFactory(mapping=source, series_type=series, recorded_at=at, value=Decimal(value))
+
+    def test_the_preferred_source_wins_a_day_both_reported(self, db: Session, service: SummariesService) -> None:
+        """Oura's height a second newer than Whoop's must not show under Whoop's name."""
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop")
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source="oura")
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.WHOOP, 1)
+        priorities.upsert(db, ProviderName.OURA, 2)
+        height = SeriesTypeDefinitionFactory.get_or_create_height()
+        at = datetime.now(timezone.utc) - timedelta(hours=1)
+        self._reading(whoop, height, at, "177.8")
+        self._reading(oura, height, at + timedelta(seconds=1), "180")
+
+        body = service.get_body_summary(db, user.id, 7, 24)
+
+        assert body is not None
+        assert (body.slow_changing.height_cm, body.source.provider) == (177.8, "whoop")
+
+    def test_a_preferred_sources_old_value_does_not_beat_a_newer_day(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Priority decides on the newest day only: a weight typed in a year ago is not today's weight."""
+        user = UserFactory()
+        apple = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="apple_health_sdk")
+        withings = DataSourceFactory(user=user, provider=ProviderName.WITHINGS, source="withings")
+        priorities = ProviderPriorityRepository(ProviderPriority)
+        priorities.upsert(db, ProviderName.APPLE, 1)
+        priorities.upsert(db, ProviderName.WITHINGS, 2)
+        weight = SeriesTypeDefinitionFactory.get_or_create_weight()
+        now = datetime.now(timezone.utc)
+        self._reading(apple, weight, now - timedelta(days=365), "90")
+        self._reading(withings, weight, now - timedelta(hours=1), "78.4")
+
+        body = service.get_body_summary(db, user.id, 7, 24)
+
+        assert body is not None
+        assert (body.slow_changing.weight_kg, body.source.provider) == (78.4, "withings")

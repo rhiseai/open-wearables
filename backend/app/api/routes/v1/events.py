@@ -1,10 +1,10 @@
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.database import DbSession
-from app.schemas.enums import EventCategory, ProviderName, WorkoutType
+from app.schemas.enums import EventCategory, ProviderName, SourceSelection, WorkoutType
 from app.schemas.model_crud.activities import EventRecordQueryParams, SleepInclude, WorkoutInclude
 from app.schemas.responses.activity import (
     Meal,
@@ -36,13 +36,22 @@ IsNapQuery = Annotated[
     bool | None,
     Query(description="When true, return only naps; when false, only main sleep. Omit to return both."),
 ]
-FilterByPriorityQuery = Annotated[
-    bool,
+SessionSourceSelectionQuery = Annotated[
+    Literal[SourceSelection.ALL, SourceSelection.PER_SESSION] | None,
     Query(
-        description="When true, keep only the highest-priority source's sessions per sleep date "
-        "(provider/device priority, same ranking as summaries). Defaults to false for backwards compatibility."
+        description="`all` returns every source's sessions. `per_session` drops a session when the sessions of one "
+        "source ranked higher by provider, then device type priority, cover at least `SESSION_DUPLICATE_OVERLAP` of "
+        "it (default 0.5); sessions nothing better covers stay, and equally ranked sources never hide each other. "
+        "Source filters narrow which sessions compete. Defaults to `all`."
     ),
 ]
+FilterByPriorityQuery = Annotated[bool, Query(deprecated=True, description="Same as source_selection=per_session.")]
+
+
+def _session_selection(source_selection: SourceSelection | None, filter_by_priority: bool) -> SourceSelection:
+    if source_selection is not None:
+        return source_selection
+    return SourceSelection.PER_SESSION if filter_by_priority else SourceSelection.ALL
 
 
 @router.get("/users/{user_id}/events/workouts")
@@ -61,6 +70,7 @@ def list_workouts(
     source: str | None = None,
     device_model: str | None = None,
     data_source_id: UUID | None = None,
+    source_selection: SessionSourceSelectionQuery = None,
 ) -> PaginatedResponse[Workout]:
     """Returns workout sessions."""
     params = EventRecordQueryParams(
@@ -75,7 +85,9 @@ def list_workouts(
         device_model=device_model,
         data_source_id=data_source_id,
     )
-    return event_record_service.get_workouts(db, user_id, params, include=include)
+    return event_record_service.get_workouts(
+        db, user_id, params, include=include, source_selection=source_selection or SourceSelection.ALL
+    )
 
 
 @router.get("/users/{user_id}/events/workouts/types")
@@ -101,6 +113,7 @@ def get_workout_totals(
     source: str | None = None,
     device_model: str | None = None,
     data_source_id: UUID | None = None,
+    source_selection: SessionSourceSelectionQuery = None,
 ) -> WorkoutTotals:
     """Returns the count, duration, energy and distance of the workouts the same filters would list.
 
@@ -117,7 +130,9 @@ def get_workout_totals(
         device_model=device_model,
         data_source_id=data_source_id,
     )
-    return event_record_service.get_workout_totals(db, user_id, params)
+    return event_record_service.get_workout_totals(
+        db, user_id, params, source_selection=source_selection or SourceSelection.ALL
+    )
 
 
 @router.get("/users/{user_id}/events/sleep")
@@ -135,7 +150,10 @@ def list_sleep_sessions(
     device_model: str | None = None,
     data_source_id: UUID | None = None,
     is_nap: IsNapQuery = None,
+    source_selection: SessionSourceSelectionQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    # Still accepted and validated for clients that send it (RHISE-8109). It dated a night to pick one source per
+    # date; sources are now compared by how much their sessions overlap, which needs no zone.
     timezone: FallbackTimezoneQueryParam = None,
 ) -> PaginatedResponse[SleepSession]:
     """Returns sleep sessions (including naps)."""
@@ -151,7 +169,7 @@ def list_sleep_sessions(
         is_nap=is_nap,
     )
     return event_record_service.get_sleep_sessions(
-        db, user_id, params, filter_by_priority=filter_by_priority, include=include, fallback_timezone=timezone
+        db, user_id, params, source_selection=_session_selection(source_selection, filter_by_priority), include=include
     )
 
 
@@ -167,7 +185,10 @@ def get_sleep_totals(
     device_model: str | None = None,
     data_source_id: UUID | None = None,
     is_nap: IsNapQuery = None,
+    source_selection: SessionSourceSelectionQuery = None,
     filter_by_priority: FilterByPriorityQuery = False,
+    # Still accepted and validated for clients that send it (RHISE-8109). It dated a night to pick one source per
+    # date; sources are now compared by how much their sessions overlap, which needs no zone.
     timezone: FallbackTimezoneQueryParam = None,
 ) -> SleepTotals:
     """Returns the count, naps, time asleep, time in bed and mean efficiency of the sessions.
@@ -187,7 +208,7 @@ def get_sleep_totals(
         is_nap=is_nap,
     )
     return event_record_service.get_sleep_totals(
-        db, user_id, params, filter_by_priority=filter_by_priority, fallback_timezone=timezone
+        db, user_id, params, source_selection=_session_selection(source_selection, filter_by_priority)
     )
 
 

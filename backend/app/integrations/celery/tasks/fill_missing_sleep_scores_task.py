@@ -1,6 +1,5 @@
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from logging import getLogger
 from uuid import UUID
 
 from celery import shared_task
@@ -13,10 +12,9 @@ from app.schemas.enums import EventCategory, HealthScoreCategory
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.scores.sleep_service import sleep_score_service
-from app.utils.sentry_helpers import log_and_capture_error
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 # Find all non-nap sleep sessions that have no corresponding OW sleep score.
 # The match is on event_record_id (direct FK) so each session gets exactly one
@@ -75,11 +73,11 @@ def fill_missing_sleep_scores() -> dict:
         for user_id, data_source_id, record_id, wake_date, local_end in rows:
             records_by_user[user_id].append((record_id, data_source_id, wake_date, local_end))
 
-        log_structured(
-            logger,
-            "info",
-            f"Found {len(rows)} session(s) missing scores across {len(records_by_user)} user(s)",
+        logger.info(
+            "Found sleep sessions missing scores",
             task="fill_missing_sleep_scores",
+            missing_count=len(rows),
+            user_count=len(records_by_user),
         )
 
         total_saved = 0
@@ -102,17 +100,15 @@ def fill_missing_sleep_scores() -> dict:
                 except Exception as e:
                     user_db.rollback()
                     total_skipped += len(discovered)
-                    log_and_capture_error(
-                        e,
-                        logger,
+                    logger.error(
                         "Failed to fill sleep scores",
-                        extra={"user_id": str(uid), "task": "fill_missing_sleep_scores"},
+                        exc_info=e,
+                        user_id=str(uid),
+                        task="fill_missing_sleep_scores",
                     )
 
-        log_structured(
-            logger,
-            "info",
-            f"Sleep score fill complete: {total_saved} saved, {total_skipped} skipped",
+        logger.info(
+            "Sleep score fill complete",
             task="fill_missing_sleep_scores",
             saved=total_saved,
             skipped=total_skipped,

@@ -14,8 +14,8 @@ from app.models import ApiKey, Developer
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.repositories.developer_repository import DeveloperRepository
 from app.schemas.auth import SDKAuthContext
-from app.utils.auth_diagnostics import AuthOutcome, AuthReason, log_auth_decision
-from app.utils.exceptions import SDKAuthenticationError
+from app.utils.auth_diagnostics import AuthOutcome, AuthReason, SDKAuthenticationError, log_auth_decision
+from app.utils.connect_token import decode_connect_token
 from app.utils.security import hash_api_key
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
@@ -136,7 +136,9 @@ async def get_sdk_auth(
     - SDK token (Bearer token with scope="sdk")
     - API key (X-Open-Wearables-API-Key header)
 
-    Returns SDKAuthContext with auth_type and relevant identifiers.
+    Returns SDKAuthContext with auth_type and relevant identifiers. An SDK token needs no
+    database; the API key is validated in a worker thread on a session opened and closed
+    there, so neither blocks the event loop nor keeps a pooled connection for the request.
     """
     reason = AuthReason.CREDENTIALS_MISSING
     # Try SDK user token first
@@ -197,3 +199,23 @@ async def get_combined_auth(
 
 
 CombinedAuthDep = Annotated[SDKAuthContext, Depends(get_combined_auth)]
+
+
+async def get_connect_auth(
+    token: Annotated[str | None, Depends(oauth2_scheme)] = None,
+    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+    x_open_wearables_connect_token: str | None = Header(None, alias="X-Open-Wearables-Connect-Token"),
+) -> SDKAuthContext:
+    """``get_combined_auth`` plus the connect token a shareable pairing link carries.
+
+    ``sdk_token`` and ``connect_token`` callers speak only for their own user.
+    """
+    if x_open_wearables_connect_token:
+        if not (user_id := decode_connect_token(x_open_wearables_connect_token)):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired connect token")
+        return SDKAuthContext(auth_type="connect_token", user_id=user_id)
+
+    return await get_combined_auth(token, x_open_wearables_api_key)
+
+
+ConnectAuthDep = Annotated[SDKAuthContext, Depends(get_connect_auth)]

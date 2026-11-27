@@ -1,12 +1,13 @@
 """Bounded auth decisions without credentials, identifiers, or request context."""
 
+import logging
 from contextlib import suppress
 from enum import StrEnum
-from logging import getLogger
 
-from app.utils.structured_logging import log_structured
+from app.utils.exceptions import AuthenticationError
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class AuthReason(StrEnum):
@@ -33,6 +34,20 @@ class AuthBoundary(StrEnum):
     REFRESH = "refresh"
 
 
+class SDKAuthenticationError(AuthenticationError):
+    """SDK credential rejection with an internal, bounded reason.
+
+    The response is the one any missing SDK credential gets (401 ``UNAUTHORIZED``, no bearer
+    challenge); ``reason`` stays on the server, for the access log.
+    """
+
+    headers = None
+
+    def __init__(self, reason: AuthReason) -> None:
+        self.reason = reason
+        super().__init__("Authentication required: provide SDK token or API key")
+
+
 def log_auth_decision(
     reason: AuthReason,
     outcome: AuthOutcome,
@@ -42,9 +57,8 @@ def log_auth_decision(
     """Record the final decision at an auth boundary using fixed values only."""
     # A closed/unavailable log stream must not change authentication behavior.
     with suppress(OSError, ValueError):
-        log_structured(
-            logger,
-            "warning" if outcome is AuthOutcome.REJECTED else "info",
+        logger.log(
+            logging.WARNING if outcome is AuthOutcome.REJECTED else logging.INFO,
             "auth_decision",
             inherit_trace_id=False,
             action="auth_decision",

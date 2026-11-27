@@ -65,13 +65,14 @@ class TestSleepPriorityOnTheUsersDay:
 
         assert [s["id"] for s in listed] == [str(garmin_night.id)]
 
-    def test_without_a_zone_the_night_still_falls_on_its_utc_dates(self, client: TestClient, db: Session) -> None:
+    def test_without_a_zone_the_night_keeps_only_the_top_source_too(self, client: TestClient, db: Session) -> None:
+        """Sources are compared by how much their sessions overlap, so a night on two UTC dates is still one."""
         user = UserFactory()
-        garmin_night, oura_night = _night(user, db)
+        garmin_night, _ = _night(user, db)
 
         listed = _get(client, f"/api/v1/users/{user.id}/events/sleep")["data"]
 
-        assert {s["id"] for s in listed} == {str(garmin_night.id), str(oura_night.id)}
+        assert [s["id"] for s in listed] == [str(garmin_night.id)]
 
     def test_the_totals_add_up_the_same_night(self, client: TestClient, db: Session) -> None:
         user = UserFactory()

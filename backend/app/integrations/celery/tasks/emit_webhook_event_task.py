@@ -6,7 +6,6 @@ request / ingestion path is never blocked by webhook delivery.
 
 from __future__ import annotations
 
-from logging import getLogger
 from typing import Any
 
 from celery import shared_task
@@ -18,8 +17,9 @@ from app.services import developer_service
 from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.payloads import validate_webhook_payload
 from app.services.outgoing_webhooks.routing import webhook_queue_for
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # No ``queue=`` here: a task-level queue would override the per-event router in celery/core.py.
@@ -48,11 +48,11 @@ def emit_webhook_event(
     try:
         payload = validate_webhook_payload(event_type, payload)
     except ValueError as exc:
-        logger.error("Dropping invalid webhook task event=%s: %s", event_type, exc)
+        logger.error("Dropping invalid webhook task", exc_info=exc, event_type=event_type)
         return {"event_type": event_type, "sent": 0, "errors": ["invalid_payload"]}
 
     if not svix_service.is_enabled():
-        logger.debug("Svix is not configured — skipping webhook dispatch for event %s", event_type)
+        logger.debug("Svix is not configured — skipping webhook dispatch for event", event_type=event_type)
         return {"event_type": event_type, "sent": 0, "errors": []}
 
     with SessionLocal() as db:
@@ -89,9 +89,10 @@ def emit_webhook_event(
             f"[event={event_type}, failed={errors}]"
         )
         logger.error(
-            "Webhook delivery failed for %d developer(s) on event %s; scheduling retry",
-            len(errors),
-            event_type,
+            "Webhook delivery failed for some developers; scheduling retry",
+            alert=True,
+            event_type=event_type,
+            failed_count=len(errors),
         )
         raise self.retry(exc=exc, queue=webhook_queue_for(event_type))
 

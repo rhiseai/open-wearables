@@ -20,7 +20,7 @@ from app import database
 from app.config import settings
 from app.integrations.celery.tasks import process_sdk_upload_task
 from app.main import api
-from app.models import ApiKey, DataPointSeries, DataSource, ProviderPriority, User
+from app.models import ApiKey, DataSource, ProviderPriority, SeriesSample, User
 from app.repositories.data_point_series_repository import DataPointSeriesRepository, WriteCounts
 from app.schemas.enums import ProviderName
 from app.services.api_key_service import api_key_service
@@ -156,8 +156,8 @@ async def test_healthz_serves_while_api_auth_waits_during_wearable_imports(
 
         with session_factory() as db:
             counts = db.execute(
-                select(DataSource.provider, func.count(DataPointSeries.id))
-                .join(DataPointSeries, DataPointSeries.data_source_id == DataSource.id)
+                select(DataSource.provider, func.count(SeriesSample.id))
+                .join(SeriesSample, SeriesSample.data_source_id == DataSource.id)
                 .where(DataSource.user_id == user_id)
                 .group_by(DataSource.provider)
             ).all()

@@ -7,6 +7,10 @@ class CeleryTask(StrEnum):
     """Registered Celery task names. Must stay import-free so any layer can use it."""
 
     RUN_DAILY_ARCHIVAL = f"{_PREFIX}.archival_task.run_daily_archival"
+    ROLL_UP_QUEUED_DAYS = f"{_PREFIX}.archival_task.roll_up_queued_days"
+    DROP_RECONCILED_DAYS = f"{_PREFIX}.archival_task.drop_reconciled_days"
+    RUN_AGGREGATE_BACKFILL = f"{_PREFIX}.aggregate_backfill_task.run_aggregate_backfill"
+    REPAIR_CONDENSED_SERIES = f"{_PREFIX}.repair_condensed_series_task.repair_condensed_series"
     BACKFILL_DATA_TYPE_COVERAGE = f"{_PREFIX}.backfill_data_type_coverage_task.backfill_data_type_coverage"
     CLOSE_STALE_SYNC_RUNS = f"{_PREFIX}.close_stale_sync_runs_task.close_stale_sync_runs"
     DELETE_USER_WEBHOOK_PAYLOADS = f"{_PREFIX}.delete_user_webhook_payloads_task.delete_user_webhook_payloads"
@@ -29,6 +33,7 @@ class CeleryTask(StrEnum):
     REFRESH_DASHBOARD_TOTAL_DATA_POINTS = f"{_PREFIX}.refresh_dashboard_stats_task.refresh_dashboard_total_data_points"
     RENEW_OURA_WEBHOOKS = f"{_PREFIX}.renew_oura_webhooks_task.renew_oura_webhooks"
     GENERATE_SEED_DATA = f"{_PREFIX}.seed_data_task.generate_seed_data"
+    RETRY_STRAVA_STREAM_INGEST = f"{_PREFIX}.strava_stream_retry_task.retry_strava_stream_ingest"
     SEND_INVITATION_EMAIL = f"{_PREFIX}.send_email_task.send_invitation_email_task"
     SYNC_VENDOR_DATA = f"{_PREFIX}.sync_vendor_data_task.sync_vendor_data"
     SEND_TELEMETRY_PING = f"{_PREFIX}.telemetry_task.send_telemetry_ping"

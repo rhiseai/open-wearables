@@ -8,12 +8,12 @@ happens in the worker process.
 from __future__ import annotations
 
 import hashlib
-import logging
 import re
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
+from kombu.exceptions import EncodeError
 
 from app.constants.celery_tasks import CeleryTask
 from app.constants.devices_map import resolve_device_name
@@ -23,13 +23,15 @@ from app.services.outgoing_webhooks import svix as svix_service
 from app.services.outgoing_webhooks.batching import current_sdk_webhook_batch
 from app.services.outgoing_webhooks.payloads import split_samples_by_payload_bytes, validate_webhook_payload
 from app.services.outgoing_webhooks.subscriptions import timeseries_event_enabled
+from app.utils.structured_logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Svix eventId must match [a-zA-Z0-9\-_.] — colons, plus-signs, and other
 # characters in ISO 8601 timestamps are not allowed.
 _SVIX_ID_SAFE = re.compile(r"[^a-zA-Z0-9\-_.]")
 _SVIX_EVENT_ID_MAX_LENGTH = 128
+_SVIX_ID_MAX = 256  # Svix answers 422 for a longer eventId
 
 
 def _safe_key(raw: str) -> str:
@@ -54,7 +56,7 @@ def _enqueue_dispatch(
     try:
         validate_webhook_payload(event_type, payload)
     except ValueError as exc:
-        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        logger.warning("Dropping invalid webhook event", event_type=event_type, error=str(exc))
         return False
     try:
         celery_app.send_task(
@@ -63,8 +65,12 @@ def _enqueue_dispatch(
             kwargs={"channels": channels, "idempotency_key": idempotency_key},
         )
         return True
+    except EncodeError as e:
+        # A bug in the emitter, not an outage
+        logger.error("Webhook event payload can't be serialized", event_type=event_type, exc_info=e)
+        return False
     except Exception:
-        logger.warning("Could not enqueue webhook event %s", event_type, exc_info=True)
+        logger.warning("Could not enqueue webhook event", event_type=event_type, exc_info=True)
         return False
 
 
@@ -87,7 +93,7 @@ def _dispatch(
     try:
         validate_webhook_payload(event_type, payload)
     except ValueError as exc:
-        logger.warning("Dropping invalid webhook event %s: %s", event_type, exc)
+        logger.warning("Dropping invalid webhook event", event_type=event_type, error=str(exc))
         return
     batch = current_sdk_webhook_batch()
     if batch is not None:
@@ -394,7 +400,7 @@ def _emit_timeseries_batch_now(
     try:
         chunks = split_samples_by_payload_bytes(event_type, base_data, samples)
     except ValueError as exc:
-        logger.warning("Dropping oversized/invalid timeseries webhook %s: %s", series_type, exc)
+        logger.warning("Dropping oversized/invalid timeseries webhook", series_type=series_type, error=str(exc))
         return 0
 
     # Two runs can write the same window with different provenance. Without the run in
@@ -623,4 +629,23 @@ def on_sync_data_type_finished(
         },
         idempotency_key=_safe_key(f"{event_type}.{run_id}.{data_type}"),
         channels=[f"user.{user_id}"],
+    )
+
+
+def on_extension_event(
+    event_type: str, data: dict[str, Any], *, user_id: UUID | None, idempotency_key: str | None
+) -> None:
+    """An extension's own event; app.extensions.webhooks.emit checks that the extension declares it."""
+    # Set before enqueueing: a retry re-sends to every developer, and only the same event id stops a second delivery.
+    key = idempotency_key or uuid4().hex
+    # A type has no "-", so no other type and key give the same id.
+    event_id = f"{event_type}-{key}"
+    if _SVIX_ID_SAFE.search(key) or len(event_id) > _SVIX_ID_MAX:
+        # Not _safe_key: rec:1 and rec/1 would share an id, and Svix would drop the second event as a duplicate.
+        event_id = hashlib.sha256(event_id.encode()).hexdigest()
+    _dispatch(
+        event_type,
+        {"type": event_type, "data": {**data, "user_id": str(user_id)} if user_id else data},
+        channels=[f"user.{user_id}"] if user_id else None,
+        idempotency_key=event_id,
     )

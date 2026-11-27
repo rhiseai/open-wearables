@@ -5,15 +5,18 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
+from inline_snapshot import snapshot
 from sqlalchemy.orm import Session
 
 from app.constants.workout_types.oura import get_unified_workout_type
-from app.models import DataSource, EventRecord
+from app.models import DataSource, EventRecord, WorkoutDetails
 from app.schemas.enums import EntrySource, WorkoutIntensity, WorkoutType
 from app.schemas.providers.oura import OuraWorkoutJSON
+from app.services.event_record_service import event_record_service
 from app.services.providers.oura.strategy import OuraStrategy
 from app.services.providers.oura.workouts import OuraWorkouts
 from tests.factories import UserFactory
+from tests.providers.factories import OuraWorkoutFactory
 
 
 class TestOuraWorkoutTypeMapping:
@@ -58,17 +61,14 @@ class TestOuraWorkoutsNormalization:
 
     @pytest.fixture
     def sample_oura_workout(self) -> OuraWorkoutJSON:
-        return OuraWorkoutJSON(
+        return OuraWorkoutFactory.build(
             id="oura-workout-abc123",
             activity="running",
             calories=350.5,
-            day="2024-01-15",
             distance=5000.0,
-            end_datetime="2024-01-15T09:00:00+00:00",
             intensity="moderate",
             label="Morning Run",
             source="autodetected",
-            start_datetime="2024-01-15T08:00:00+00:00",
         )
 
     def test_normalize_workout_creates_records(
@@ -77,13 +77,34 @@ class TestOuraWorkoutsNormalization:
         user_id = uuid4()
         record, detail = workouts._normalize_workout(sample_oura_workout, user_id)
 
-        assert record.category == "workout"
-        assert record.type == WorkoutType.RUNNING.value
-        assert record.source_name == "Oura"
-        assert record.source == "oura"
         assert record.user_id == user_id
-        assert record.external_id == "oura-workout-abc123"
-        assert record.duration_seconds == 3600
+        assert detail.record_id == record.id
+        assert {
+            "record": record.model_dump(mode="json", exclude={"id", "user_id"}, exclude_none=True),
+            "detail": detail.model_dump(mode="json", exclude={"record_id"}, exclude_none=True),
+        } == snapshot(
+            {
+                "record": {
+                    "category": "workout",
+                    "type": "running",
+                    "source_name": "Oura",
+                    "duration_seconds": 3600,
+                    "start_datetime": "2024-01-15T08:00:00Z",
+                    "end_datetime": "2024-01-15T09:00:00Z",
+                    "zone_offset": "+00:00",
+                    "external_id": "oura-workout-abc123",
+                    "source": "oura",
+                },
+                "detail": {
+                    "energy_burned": "350.5",
+                    "distance": "5000.0",
+                    "moving_time_seconds": 3600,
+                    "entry_source": "automatic",
+                    "intensity": "moderate",
+                    "label": "Morning Run",
+                },
+            }
+        )
 
     def test_normalize_workout_metrics(self, workouts: OuraWorkouts, sample_oura_workout: OuraWorkoutJSON) -> None:
         user_id = uuid4()
@@ -152,12 +173,13 @@ class TestOuraWorkoutsNormalization:
 
 
 OURA_WORKOUT_ID = "oura-workout-abc123"
+OTHER_OURA_WORKOUT_ID = "oura-workout-def456"
 
 
-def _oura_workout_payload(activity: str, start: str, end: str) -> dict[str, Any]:
+def _oura_workout_payload(activity: str, start: str, end: str, workout_id: str = OURA_WORKOUT_ID) -> dict[str, Any]:
     """Oura ``GET /v2/usercollection/workout/{id}`` response for a single workout."""
     return {
-        "id": OURA_WORKOUT_ID,
+        "id": workout_id,
         "activity": activity,
         "calories": 350.5,
         "day": "2024-01-15",
@@ -199,7 +221,8 @@ class TestOuraSaveById:
         assert records[0].type == WorkoutType.WALKING.value
         assert records[0].duration_seconds == 1800
 
-    def test_insert_failure_keeps_original_record(self, db: Session, workouts: OuraWorkouts) -> None:
+    def test_write_failure_keeps_original_record(self, db: Session, workouts: OuraWorkouts) -> None:
+        """A failure after the workout's refresh rolls the refresh back: never the edit's times on the old detail."""
         user = UserFactory()
         original = _oura_workout_payload("running", "2024-01-15T08:00:00+00:00", "2024-01-15T09:00:00+00:00")
         edited = _oura_workout_payload("walking", "2024-01-15T08:00:00+00:00", "2024-01-15T08:30:00+00:00")
@@ -210,7 +233,11 @@ class TestOuraSaveById:
 
         with (
             patch.object(workouts, "get_workout_detail_from_api", return_value=edited),
-            patch.object(workouts.workout_repo, "create_and_flush", side_effect=RuntimeError("insert exploded")),
+            patch.object(
+                event_record_service.event_record_detail_repo,
+                "_upsert",
+                side_effect=RuntimeError("detail write exploded"),
+            ),
             pytest.raises(RuntimeError),
         ):
             workouts.save_by_id(db, user.id, OURA_WORKOUT_ID)
@@ -220,3 +247,31 @@ class TestOuraSaveById:
         assert records[0].id == original_record_id
         assert records[0].type == WorkoutType.RUNNING.value
         assert records[0].duration_seconds == 3600
+        detail = db.get(WorkoutDetails, original_record_id)
+        assert detail is not None
+        assert detail.moving_time_seconds == 3600
+
+    def test_time_window_taken_by_another_workout_keeps_both(self, db: Session, workouts: OuraWorkouts) -> None:
+        """An edit moved onto an unrelated workout's time window is skipped, not half-applied."""
+        user = UserFactory()
+        original = _oura_workout_payload("running", "2024-01-15T08:00:00+00:00", "2024-01-15T09:00:00+00:00")
+        unrelated = _oura_workout_payload(
+            "cycling", "2024-01-15T08:00:00+00:00", "2024-01-15T08:30:00+00:00", workout_id=OTHER_OURA_WORKOUT_ID
+        )
+        edited = _oura_workout_payload("walking", "2024-01-15T08:00:00+00:00", "2024-01-15T08:30:00+00:00")
+
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=original):
+            assert workouts.save_by_id(db, user.id, OURA_WORKOUT_ID) == 1
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=unrelated):
+            assert workouts.save_by_id(db, user.id, OTHER_OURA_WORKOUT_ID) == 1
+        with patch.object(workouts, "get_workout_detail_from_api", return_value=edited):
+            assert workouts.save_by_id(db, user.id, OURA_WORKOUT_ID) == 0
+
+        records = {r.external_id: r for r in _user_records(db, user.id)}
+        assert set(records) == {OURA_WORKOUT_ID, OTHER_OURA_WORKOUT_ID}
+        assert records[OURA_WORKOUT_ID].type == WorkoutType.RUNNING.value
+        assert records[OURA_WORKOUT_ID].duration_seconds == 3600
+        assert records[OTHER_OURA_WORKOUT_ID].type == WorkoutType.CYCLING.value
+        detail = db.get(WorkoutDetails, records[OURA_WORKOUT_ID].id)
+        assert detail is not None
+        assert detail.moving_time_seconds == 3600

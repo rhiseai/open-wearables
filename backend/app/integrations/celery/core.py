@@ -12,13 +12,22 @@ from celery.schedules import crontab
 
 from app.config import settings
 from app.constants.celery_tasks import CeleryQueue, CeleryTask
-from app.extensions import collect_beat_schedule, collect_event_handlers, events, get_active_extensions
+from app.extensions import (
+    collect_beat_schedule,
+    collect_celery_queues,
+    collect_event_handlers,
+    events,
+    get_active_extensions,
+)
 from app.integrations.celery.routing import route_historical_task
 from app.integrations.otel import init_otel, shutdown_otel
 from app.services import raw_payload_storage
 from app.services.outgoing_webhooks.routing import route_webhook_task
 from app.utils.config_utils import LogFormat
 from app.utils.logging_setup import configure_logging
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class _WebhookTraceFilter(logging.Filter):
@@ -79,7 +88,7 @@ _worker_service_name = "open-wearables-worker"
 
 
 def _worker_service_name_for(hostname: str | None) -> str:
-    # scripts/start/worker.sh names its workers io@%h, webhook@%h and cpu@%h.
+    # scripts/start/worker.sh names its workers io@%h, webhook@%h, cpu@%h and ext@%h.
     prefix = (hostname or "").split("@", 1)[0]
     return f"open-wearables-worker-{prefix}" if prefix and prefix != "celery" else "open-wearables-worker"
 
@@ -143,7 +152,7 @@ def enqueue_startup_telemetry_ping(sender: Any, **kwargs) -> None:
             queue=CeleryQueue.DEFAULT,
         )
     except Exception:
-        getLogger(__name__).debug("Could not enqueue startup telemetry ping", exc_info=True)
+        logger.debug("Could not enqueue startup telemetry ping", exc_info=True)
 
 
 @signals.worker_init.connect
@@ -186,10 +195,11 @@ def create_celery() -> Celery:
         enable_utc=True,
         task_default_queue=CeleryQueue.DEFAULT,
         task_default_exchange="default",
-        result_expires=3 * 24 * 3600,
+        # Nothing reads task results, and they share the broker's Redis
+        result_expires=3600,
         control_queue_ttl=300,
         control_queue_expires=300,
-        task_queues={queue: {} for queue in CeleryQueue},
+        task_queues={queue: {} for queue in (*CeleryQueue, *collect_celery_queues())},
         task_routes=(
             route_historical_task,
             # emit_webhook_event: webhook_priority or webhook_outgoing, picked per event type.
@@ -251,6 +261,20 @@ def create_celery() -> Celery:
             "args": (),
             "kwargs": {},
         },
+        # TODO: Remove after ~2027-05-01, with the task. Picks a lost run up again; a no-op once it is done.
+        "repair-condensed-series": {
+            "task": CeleryTask.REPAIR_CONDENSED_SERIES,
+            "schedule": crontab(minute="*/15"),
+            "args": (),
+            "kwargs": {},
+        },
+        # Safety net: picks the one-off aggregate backfill up again if a run was lost; a no-op once it is done.
+        "run-aggregate-backfill": {
+            "task": CeleryTask.RUN_AGGREGATE_BACKFILL,
+            "schedule": crontab(minute="*/15"),
+            "args": (),
+            "kwargs": {},
+        },
         "renew-oura-webhooks-monthly": {
             "task": CeleryTask.RENEW_OURA_WEBHOOKS,
             "schedule": crontab(day_of_month=1, hour=0, minute=0),  # 1st of each month at 00:00 UTC
@@ -259,6 +283,14 @@ def create_celery() -> Celery:
         },
     }
 
+    # Summaries, day reads and our sleep and workout statistics are served from the rollup's rows,
+    # so it runs on every instance; the lifecycle flag only governs retention and its tab.
+    celery_app.conf.beat_schedule["roll-up-queued-days"] = {
+        "task": CeleryTask.ROLL_UP_QUEUED_DAYS,
+        "schedule": crontab(minute="*/15"),
+        "args": (),
+        "kwargs": {},
+    }
     if settings.data_lifecycle_enabled:
         celery_app.conf.beat_schedule["run-daily-archival"] = {
             "task": CeleryTask.RUN_DAILY_ARCHIVAL,

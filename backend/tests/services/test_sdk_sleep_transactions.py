@@ -3,7 +3,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from redis.exceptions import LockNotOwnedError
@@ -235,14 +235,14 @@ def test_importer_rolls_back_and_reports_original_database_error() -> None:
     failure = RuntimeError("original integrity failure")
     with (
         patch.object(import_service, "load_data", side_effect=failure),
-        patch("app.services.sdk.import_service.log_and_capture_error") as capture,
+        patch("app.services.sdk.import_service.logger") as logger,
     ):
         result = import_service.import_data_from_request(
             db, json.dumps({"provider": "apple", "data": {}}), "application/json", str(uuid4())
         )
     assert result.status_code == 400
     assert result.response == "Import failed: original integrity failure"
-    assert capture.call_args[0][0] is failure
+    assert logger.error.call_args.kwargs["exc_info"] is failure
     db.rollback.assert_called_once()
 
 
@@ -289,11 +289,11 @@ def test_finalizer_busy_lease_defers_without_reporting_an_error() -> None:
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.get_redis_client", return_value=redis_client),
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.SessionLocal"),
         patch("app.integrations.celery.tasks.finalize_stale_sleep_task.load_sleep_state") as load,
-        patch("app.integrations.celery.tasks.finalize_stale_sleep_task.log_and_capture_error") as capture,
+        patch("app.integrations.celery.tasks.finalize_stale_sleep_task.logger") as logger,
     ):
         finalize_stale_sleeps()
     load.assert_not_called()
-    capture.assert_not_called()
+    logger.error.assert_not_called()
     redis_client.lock.return_value.release.assert_not_called()
 
 
@@ -318,3 +318,50 @@ def test_an_hour_and_three_quarters_awake_ends_an_apple_sleep(
     stored = db.query(EventRecord).join(DataSource).filter(DataSource.user_id == user.id).all()
     assert len(stored) == records
     assert sum(bool(record.sleep_detail and record.sleep_detail.is_nap) for record in stored) == naps
+
+
+def _sessions(db: Session, user_id: UUID) -> list[tuple[str, str, bool]]:
+    db.expire_all()
+    records = (
+        db.query(EventRecord)
+        .join(DataSource)
+        .filter(DataSource.user_id == user_id)
+        .order_by(EventRecord.start_datetime)
+        .all()
+    )
+    return [
+        (
+            record.start_datetime.strftime("%d %H:%M"),
+            record.end_datetime.strftime("%d %H:%M"),
+            bool(record.sleep_detail and record.sleep_detail.is_nap),
+        )
+        for record in records
+    ]
+
+
+@patch("app.services.sdk.sleep_service.celery_app")
+def test_a_samsung_evening_nap_is_its_own_session_and_joins_the_night_that_follows(
+    mock_finalize: MagicMock, db: Session
+) -> None:
+    """Samsung sends no nap flag: the rule makes a separate evening sleep a nap, and a night starting
+    90 minutes after it in a later upload joins it, as for Apple, Withings and Ultrahuman."""
+    user = UserFactory()
+    day = datetime(2026, 11, 15, tzinfo=timezone.utc)
+    handle_sleep_data(
+        db,
+        _request(
+            _sample(day - timedelta(hours=1), day + timedelta(hours=7)),
+            _sample(day + timedelta(hours=17), day + timedelta(hours=18)),
+            provider="samsung",
+        ),
+        str(user.id),
+    )
+    assert _sessions(db, user.id) == [("14 23:00", "15 07:00", False), ("15 17:00", "15 18:00", True)]
+
+    handle_sleep_data(
+        db,
+        _request(_sample(day + timedelta(hours=19, minutes=30), day + timedelta(days=1, hours=7)), provider="samsung"),
+        str(user.id),
+    )
+
+    assert _sessions(db, user.id) == [("14 23:00", "15 07:00", False), ("15 17:00", "16 07:00", False)]

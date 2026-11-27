@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-import logging
 from collections import OrderedDict
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterator
+from typing import Any
 from uuid import UUID
 
-logger = logging.getLogger(__name__)
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 MAX_REALTIME_EVENTS_PER_SDK_BATCH = 64
 RECENT_SESSION_WINDOW = timedelta(days=3)
@@ -154,7 +156,7 @@ class SDKWebhookBatch:
             "coalesced": self.coalesced,
             "suppressed": self.suppressed,
         }
-        logger.info("SDK webhook batch completed", extra={"batch_id": self.batch_id, **summary})
+        logger.info("SDK webhook batch completed", batch_id=self.batch_id, **summary)
         return summary
 
 
@@ -166,7 +168,7 @@ def current_sdk_webhook_batch() -> SDKWebhookBatch | None:
 
 
 @contextmanager
-def collect_sdk_webhooks(batch_id: str, *, historical: bool) -> Iterator[SDKWebhookBatch]:
+def collect_sdk_webhooks(batch_id: str, *, historical: bool) -> Generator[SDKWebhookBatch]:
     batch = SDKWebhookBatch(batch_id, historical=historical)
     token = _CURRENT_SDK_BATCH.set(batch)
     try:

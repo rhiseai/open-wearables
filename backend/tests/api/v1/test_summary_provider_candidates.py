@@ -3,15 +3,12 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeriesArchive
-from app.models.archival_setting import ArchivalSetting
-from app.schemas.enums import AggregationMethod, ProviderName
+from app.schemas.enums import ProviderName, SeriesType
 from app.services.priority_service import priority_service
 from app.utils.pagination import decode_activity_cursor
 from tests.factories import (
@@ -23,6 +20,7 @@ from tests.factories import (
     SleepDetailsFactory,
     UserFactory,
     WorkoutDetailsFactory,
+    provider_day,
 )
 from tests.utils import api_key_headers
 
@@ -134,13 +132,7 @@ def test_activity_provider_candidates_paginate_same_day_without_mixing(
     for provider, steps, hr in [(ProviderName.OURA, 2128, 150), (ProviderName.APPLE, 3600, 90)]:
         source = DataSourceFactory(user=user, provider=provider, source="same-writer", device_model="same-model")
         sources[provider.value] = source
-        DataPointSeriesFactory(
-            data_source=source,
-            series_type=steps_type,
-            value=steps,
-            recorded_at=START + timedelta(hours=12),
-            is_daily_total=True,
-        )
+        provider_day(db, source, SeriesType.steps, START.date(), sum=Decimal(steps))
         DataPointSeriesFactory(
             data_source=source,
             series_type=steps_type,
@@ -148,13 +140,7 @@ def test_activity_provider_candidates_paginate_same_day_without_mixing(
             recorded_at=START + timedelta(hours=10),
         )
         DataPointSeriesFactory(data_source=source, value=hr, recorded_at=START + timedelta(hours=10))
-    DataPointSeriesFactory(
-        data_source=sources["oura"],
-        series_type=SeriesTypeDefinitionFactory.get_or_create_energy(),
-        value=500,
-        recorded_at=START + timedelta(hours=12),
-        is_daily_total=True,
-    )
+    provider_day(db, sources["oura"], SeriesType.active_energy, START.date(), sum=Decimal(500))
     priority_service.update_provider_priority(db, ProviderName.OURA, 1)
     priority_service.update_provider_priority(db, ProviderName.APPLE, 2)
     headers = api_key_headers(ApiKeyFactory().plain_key)
@@ -203,13 +189,7 @@ def test_workout_only_provider_is_not_hidden_by_another_providers_steps(client: 
     user = UserFactory()
     apple = DataSourceFactory(user=user, provider=ProviderName.APPLE)
     whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop")
-    DataPointSeriesFactory(
-        data_source=apple,
-        series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
-        value=3600,
-        recorded_at=START + timedelta(hours=12),
-        is_daily_total=True,
-    )
+    provider_day(db, apple, SeriesType.steps, START.date(), sum=Decimal(3600))
     record = EventRecordFactory(
         mapping=whoop,
         category="workout",
@@ -239,10 +219,10 @@ def test_unknown_source_selection_is_rejected(client: TestClient, db: Session, k
         headers=api_key_headers(ApiKeyFactory().plain_key),
         params=_params(source_selection="unrecognised"),
     )
-    assert response.status_code == 400
+    assert response.status_code == 422
 
 
-def test_candidates_preserve_sibling_device_merge_and_archived_provider(client: TestClient, db: Session) -> None:
+def test_candidates_merge_sibling_devices_and_keep_a_day_row_without_samples(client: TestClient, db: Session) -> None:
     user = UserFactory()
     watch = DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Watch", device_type="watch")
     phone = DataSourceFactory(user=user, provider=ProviderName.APPLE, device_model="Phone", device_type="phone")
@@ -253,19 +233,8 @@ def test_candidates_preserve_sibling_device_merge_and_archived_provider(client: 
         DataPointSeriesFactory(
             data_source=source, series_type=steps_type, value=steps, recorded_at=START + timedelta(hours=hour)
         )
-    db.add(ArchivalSetting(id=1, archive_after_days=30, delete_after_days=None))
-    db.add(
-        DataPointSeriesArchive(
-            id=uuid4(),
-            data_source_id=oura.id,
-            series_type_definition_id=steps_type.id,
-            bucket_start_at=START,
-            aggregation_type=AggregationMethod.SUM,
-            value=Decimal("2128"),
-            sample_count=1,
-        )
-    )
-    db.flush()
+    # A day only its row holds, as once retention has deleted the samples behind it.
+    provider_day(db, oura, SeriesType.steps, START.date(), sum=Decimal("2128"))
     headers = api_key_headers(ApiKeyFactory().plain_key)
     url = f"/api/v1/users/{user.id}/summaries/activity"
     response = client.get(url, headers=headers, params=_params(source_selection="per_provider"))
@@ -285,13 +254,7 @@ def test_default_null_source_cursor_keeps_legacy_identity(client: TestClient, db
     user = UserFactory()
     source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source=None, device_model="Watch")
     for offset in (0, 1):
-        DataPointSeriesFactory(
-            data_source=source,
-            series_type=SeriesTypeDefinitionFactory.get_or_create_steps(),
-            value=100,
-            recorded_at=START + timedelta(days=offset, hours=12),
-            is_daily_total=True,
-        )
+        provider_day(db, source, SeriesType.steps, (START + timedelta(days=offset)).date(), sum=Decimal(100))
     headers = api_key_headers(ApiKeyFactory().plain_key)
     url = f"/api/v1/users/{user.id}/summaries/activity"
     first = client.get(url, headers=headers, params=_params(limit=1))

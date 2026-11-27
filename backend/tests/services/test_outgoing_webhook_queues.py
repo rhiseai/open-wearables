@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 from collections.abc import Generator
@@ -309,14 +310,14 @@ class TestQueueDepthMonitor:
         redis.llen.side_effect = lambda name: {WEBHOOK_PRIORITY_QUEUE: 3, WEBHOOK_BULK_QUEUE: 44306}[name]
         with (
             patch.object(webhook_queue_monitor_task, "get_redis_client", return_value=redis),
-            patch.object(webhook_queue_monitor_task, "log_structured") as log,
+            patch.object(webhook_queue_monitor_task.logger, "log") as log,
             patch.object(settings, "webhook_queue_depth_warn_threshold", 1000),
         ):
             result = webhook_queue_monitor_task.report_webhook_queue_depth()
 
         assert result == {WEBHOOK_PRIORITY_QUEUE: 3, WEBHOOK_BULK_QUEUE: 44306}
-        levels = {c.kwargs["queue"]: c.args[1] for c in log.call_args_list}
-        assert levels == {WEBHOOK_PRIORITY_QUEUE: "info", WEBHOOK_BULK_QUEUE: "warning"}
+        levels = {c.kwargs["queue"]: c.args[0] for c in log.call_args_list}
+        assert levels == {WEBHOOK_PRIORITY_QUEUE: logging.INFO, WEBHOOK_BULK_QUEUE: logging.WARNING}
         assert all(c.kwargs["action"] == "webhook_queue_depth" for c in log.call_args_list)
 
     def test_is_scheduled_by_beat_on_the_priority_queue(self) -> None:
@@ -349,6 +350,9 @@ class TestWorkerScript:
         mock_uv.write_text(
             """#!/bin/bash
 echo "$*" >> "$COMMAND_LOG"
+# worker.sh first waits for the core schema and looks up the extensions' queues (none here).
+if [[ "$*" == *"alembic current"* ]]; then echo "abc123 (head)"; exit 0; fi
+if [[ "$*" == *extension_queues.py* ]]; then echo "EXTENSION_QUEUES="; exit 0; fi
 if [[ "$*" == *"cpu@%h"* ]]; then
   sleep 0.5
   exit 3

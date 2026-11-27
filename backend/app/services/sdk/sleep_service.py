@@ -3,12 +3,11 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from logging import getLogger
 from typing import Any
 from uuid import UUID, uuid4
 
 from celery import current_app as celery_app
-from redis.exceptions import LockNotOwnedError
+from redis.exceptions import LockError, LockNotOwnedError
 
 from app.config import settings
 from app.constants.celery_tasks import CeleryTask
@@ -28,6 +27,7 @@ from app.schemas.model_crud.activities import (
     SleepStage,
 )
 from app.schemas.providers.mobile_sdk import (
+    SLEEP_START_STAGES,
     SLEEP_START_STATES,
     SleepState,
     SleepStateStage,
@@ -38,11 +38,13 @@ from app.schemas.providers.mobile_sdk import (
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
-from app.services.sleep_naps import sleep_gap_minutes
+from app.services.sleep_nap_marking import sleep_gap_minutes
 from app.services.sleep_reconciliation import merge_sleep_stages
-from app.utils.structured_logging import log_structured
+from app.utils.dates import as_utc
+from app.utils.sleep_stages import measured_stages
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 _STAGE_TO_METRIC: dict[str, str] = {
     "awake": "awake_seconds",
@@ -59,8 +61,12 @@ SLEEP_SCORE_VALUE_TYPE = "sleepScore"
 SLEEP_LOCK_WAIT_SECONDS = 15
 
 
-class SleepLockBusyError(RuntimeError):
-    """Another worker held this user's sleep lock for the whole wait; nothing was written."""
+class SleepLockBusyError(LockError):
+    """Another worker held this user's sleep lock for the whole wait; nothing was written.
+
+    A ``LockError``, as upstream raises for it (#1916). Callers catch this narrower type: the SDK import
+    hands the batch's sleep to the ``process_sdk_sleep`` task, which retries it.
+    """
 
 
 def _extract_sleep_score(values: list[dict[str, Any]] | None) -> float | None:
@@ -164,15 +170,31 @@ def prune_sleep_state_registry(user_id: str) -> None:
         redis_client.srem(active_users_key(), user_id)
 
 
+def is_ready_to_finish(state: SleepState, now: datetime) -> bool:
+    """True once the source's sleep gap has passed since the session's last sleep sample.
+
+    The session is already in Postgres (every upload writes it), so this only decides when its Redis state
+    closes; app.services.sleep_finality reads the same gap for ``is_final``. A session of only awake is in no
+    upload yet: it waits for the rest of its night until its writer has uploaded nothing for that gap.
+    """
+    gap = timedelta(minutes=sleep_gap_minutes(state.provider))
+    if _holds_only_awake(state):
+        return state.last_received_at is None or now - as_utc(state.last_received_at) >= gap
+    return now - as_utc(state.end_time) >= gap
+
+
+def _holds_only_awake(state: SleepState) -> bool:
+    """A session opened by awake that no sleep stage has joined yet."""
+    return bool(state.stages) and not state.has_sleep_stage
+
+
 def release_sleep_lock(lock: Any, user_id: str) -> None:
     try:
         lock.release()
     except LockNotOwnedError:
         # PostgreSQL is authoritative if the Redis lease expired while writing.
         # Never release a lease another worker acquired in the meantime.
-        log_structured(
-            logger, "warning", "Sleep processing lease expired", action="sleep_lock_expired", user_id=user_id
-        )
+        logger.warning("Sleep processing lease expired", action="sleep_lock_expired", user_id=user_id)
 
 
 def _create_new_sleep_state(
@@ -295,6 +317,9 @@ def _apply_transition(
         case _:
             stage_label = SleepStageType.UNKNOWN
 
+    if stage_label in SLEEP_START_STAGES:
+        state.has_sleep_stage = True
+
     if end_time > state.end_time:
         state.end_time = end_time
     if start_time < state.start_time:
@@ -342,12 +367,16 @@ def handle_sleep_data(
         request: Parsed SDKSyncRequest containing sleep records
         user_id: User identifier for associating sleep data
 
+    Raises:
+        SleepLockBusyError: another worker held the user's sleep lock for the whole wait;
+            nothing was written, so the caller can hand the sleep to ``process_sdk_sleep``.
+
     Flow:
         - Acquire a per-user Redis lock to prevent concurrent state corruption
         - Deduplicate incoming data based on start/end/stage/source
-        - If no active session exists: Create new session in Redis (only for valid start states)
+        - If no active session exists: Create new session in Redis (valid start states or `awake`)
         - If active session exists: Check gap between new sample and the session window
-          * Gap > 2 hours: Persist+close existing session, start new one
+          * Gap > the source's sleep gap: Persist+close existing session, start new one
           * Otherwise: Accumulate sleep stage durations in existing session
         - Commit all sleep and provider-score writes before publishing Redis state
         - Dispatch the stale-sleep housekeeping task
@@ -377,9 +406,10 @@ def handle_sleep_data(
             current_states[identity] = state
 
         seen = set()
+        received_at = datetime.now(timezone.utc)
         for sample in sorted(request.data.sleep, key=lambda item: item.startDate):
-            device_model, _, source_name = extract_device_info(sample.source)
-            device_type = extract_device_type(sample.source)
+            device_model, _, source_name = extract_device_info(sample.source, request.provider)
+            device_type = extract_device_type(sample.source, request.provider)
             device_id, source_app_id, device_manufacturer = extract_device_ids(sample.source)
             identity = _state_identity(request.provider, source_name, device_model)
             sample_key = (identity, sample.startDate, sample.endDate, sample.stage)
@@ -392,7 +422,8 @@ def handle_sleep_data(
 
             state = current_states.get(identity)
             if state is None:
-                if sleep_phase not in SLEEP_START_STATES:
+                # Awake can open the next upload of a night; persist_sleep writes nothing until sleep arrives.
+                if sleep_phase not in SLEEP_START_STATES and sleep_phase is not SleepPhase.AWAKE:
                     continue
                 state = _create_new_sleep_state(
                     sample.startDate,
@@ -428,14 +459,13 @@ def handle_sleep_data(
             sleep_score = _extract_sleep_score(sample.values)
             if sleep_score is not None:
                 state.sleep_score = sleep_score
+            state.last_received_at = received_at
             current_states[identity] = state
 
         to_publish: list[tuple[SleepState, bool]] = []
+        now = datetime.now(timezone.utc)
         for state in current_states.values():
-            session_end = state.end_time
-            if session_end.tzinfo is None:
-                session_end = session_end.replace(tzinfo=timezone.utc)
-            close = datetime.now(timezone.utc) - session_end >= timedelta(minutes=sleep_gap_minutes(state.provider))
+            close = is_ready_to_finish(state, now)
             persist_sleep(db_session, user_id, state, close=close, commit=False)
             to_publish.append((state, close))
 
@@ -460,6 +490,47 @@ def handle_sleep_data(
     # Dispatch the stale-sleep task so sessions that have gone quiet (including
     # other users' sessions) are finalised promptly without waiting for the next beat.
     celery_app.send_task(CeleryTask.FINALIZE_STALE_SLEEPS)
+
+
+def _drop_leading_awake(
+    stages: list[SleepStateStage],
+    protect_from: datetime | None = None,
+) -> list[SleepStateStage]:
+    """Drop `awake` stages recorded before the night's first sleep stage.
+
+    Awake only counts once sleep has begun. ``protect_from`` keeps stages at or after that moment: the start of
+    the stored night an upload continues, so the awakening that opens the upload stays in that night.
+    """
+    ordered = sorted(stages, key=lambda stage: stage.start_time)
+    for index, stage in enumerate(ordered):
+        if stage.stage in SLEEP_START_STAGES:
+            # Cut by time, so awake that starts with the first sleep stage is kept in either order
+            return [kept for kept in ordered if kept.start_time >= stage.start_time]
+        if protect_from is not None and stage.start_time >= protect_from:
+            return ordered[index:]
+    return []
+
+
+def _night_stages(db_session: DbSession, user_id: str, state: SleepState) -> list[SleepStateStage]:
+    """The state's stages without the awake before its first sleep stage, unless that awake continues a night
+    this writer already stored (a night uploaded in pieces: the next piece can open with the awakening)."""
+    own_stages = _drop_leading_awake(state.stages)
+    if len(own_stages) == len(state.stages) or not own_stages:
+        return own_stages
+    # The lookup spans the state's own sleep, so its leading awake cannot bridge it to an unrelated session.
+    stored = event_record_service.find_adjacent_sleep_record(
+        db_session,
+        UUID(user_id),
+        own_stages[0].start_time,
+        max(stage.end_time for stage in own_stages),
+        sleep_gap_minutes(state.provider),
+        source=state.source_name if state.source_name != "unknown" else None,
+        provider=state.provider,
+        source_app_id=state.source_app_id,
+    )
+    if stored is None:
+        return own_stages
+    return _drop_leading_awake(state.stages, protect_from=stored.start_datetime)
 
 
 def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[SleepStage]]:
@@ -579,8 +650,16 @@ def persist_sleep(
             boundary / quiet-gap finalization). When False, Redis keeps accumulating
             stages for the next batch.
         commit: When False, the caller owns the transaction and Redis publication.
+
+    A state that holds only awake writes nothing: it waits for the writer's next upload, and is dropped with the
+    rest of the Redis state once the writer's sleep gap has passed.
     """
-    metrics, cleaned_stages = _calculate_final_metrics(state.stages)
+    if _holds_only_awake(state):
+        if commit and close:
+            delete_sleep_state(user_id, storage_key=key(user_id, state))
+        return
+    stages = _night_stages(db_session, user_id, state)
+    metrics, cleaned_stages = _calculate_final_metrics(stages)
 
     if cleaned_stages:
         start_time = cleaned_stages[0].start_time
@@ -589,7 +668,7 @@ def persist_sleep(
         # all of it (e.g. a Whoop night relayed through Apple Health with asleep
         # stages for a sub-window only).  Widen the event window to the in-bed union
         # so the record is never shorter than the time-in-bed it reports.
-        in_bed_bounds = _in_bed_bounds(state.stages)
+        in_bed_bounds = _in_bed_bounds(stages)
         if in_bed_bounds:
             start_time = min(start_time, in_bed_bounds[0])
             end_time = max(end_time, in_bed_bounds[1])
@@ -607,6 +686,8 @@ def persist_sleep(
     sleep_efficiency = (
         Decimal(str(total_sleep_seconds / time_in_bed_seconds * 100)) if time_in_bed_seconds > 0 else None
     )
+    # A hypnogram of only asleep or in-bed segments measures no phases: those minutes are unknown (#1953)
+    has_phases, has_awake = measured_stages(cleaned_stages)
 
     sleep_record = EventRecordCreate(
         id=uuid4(),
@@ -632,12 +713,12 @@ def persist_sleep(
         record_id=sleep_record.id,
         sleep_total_duration_minutes=int(total_sleep_seconds // 60),
         sleep_time_in_bed_minutes=int(time_in_bed_seconds // 60),
-        sleep_deep_minutes=int(metrics["deep_seconds"] // 60),
-        sleep_rem_minutes=int(metrics["rem_seconds"] // 60),
-        sleep_light_minutes=int(metrics["light_seconds"] // 60),
-        sleep_awake_minutes=int(metrics["awake_seconds"] // 60),
+        sleep_deep_minutes=int(metrics["deep_seconds"] // 60) if has_phases else None,
+        sleep_rem_minutes=int(metrics["rem_seconds"] // 60) if has_phases else None,
+        sleep_light_minutes=int(metrics["light_seconds"] // 60) if has_phases else None,
+        sleep_awake_minutes=int(metrics["awake_seconds"] // 60) if has_awake else None,
         sleep_efficiency_score=sleep_efficiency,
-        is_nap=False,
+        is_nap=False,  # flagged by create_or_merge_sleep after the write
         sleep_stages=cleaned_stages or None,
     )
 
